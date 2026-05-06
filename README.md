@@ -12,10 +12,10 @@
 
 ## Project Information
 
-Tangent Exchange is a decentralized trading platform on the Tangent Protocol blockchain, offering a trustless, peer-to-peer infrastructure. It combines a sophisticated order book with automated liquidity pools, enabling seamless cross-chain trading through a unified interface.
+Tangent Exchange is a decentralized trading analytics system on the Tangent Protocol blockchain, offering a trustless, peer-to-peer infrastructure. It combines a sophisticated order book with automated liquidity pools, enabling seamless cross-chain trading through a unified interface. This project does not faciliate any actual trading and it doesn't hold or process user funds/payments, instead it builds a reliable data source for UI apps by analyzing the data from deployed smart contracts present in **src/abi** directory.
 
 ### Order Book & Trading Logic
-The platform supports a diverse range of order types, including market, limit, stop, stop-limit, and trailing orders. Execution strategies are flexible, allowing users to configure policies like **Deferred**, **DeferredAll**, **Immediate**, and **ImmediateAll**. Users also gain access to real-time market depth with iceberg order support and historical price series.
+The platform supports a diverse range of order types, including market, limit, stop, stop-limit, and trailing orders. Execution strategies are flexible, allowing users to configure policies like **GTC**, **AON**, **IOC**, and **FOK**. Users also gain access to real-time market depth with iceberg order support and historical price series.
 
 ### Liquidity & Asset Management
 Complementing the order book are **Automated Market Making (AMM)** pools featuring concentrated liquidity, where providers can define custom min/max price ranges. The system tracks real-time balances, distinguishing between available funds and those locked in orders or pools. Users can discover assets via handles, chains, or checksums, with support for poly-assets (synthetic representations of external assets) to bridge multiple blockchains.
@@ -30,7 +30,9 @@ Tangent Exchange prioritizes speed and reliability through a robust technical st
 
 ### Interoperability & Security
 
-The exchange acts as a relay server, monitoring specific blockchain events (Config, Order, Pool, Swap, AssetTier) to maintain state. It enforces strict **input validation** and **asset whitelisting** for oracle queries, ensuring only trusted assets participate. All transactions benefit from blockchain-secured finality, while the database utilizes foreign key constraints to maintain integrity.
+The exchange acts as a relay server, monitoring specific blockchain events (Config, Order, Pool, Swap, AssetTier) to maintain state. It enforces strict **input validation** and **asset whitelisting** for oracle queries, ensuring only trusted assets receive automated off-chain pricing while all other assets may build their price charts only from the on-chain data. All transactions benefit from blockchain-secured finality, while the database utilizes foreign key constraints to maintain integrity.
+
+_Oracle data is used to build the pricing charts and is available only on the running instance and is not synced between the peers_
 
 ### Key Trading Features
 *   **Dynamic Routing:** Multi-hop pathfinding with slippage constraints.
