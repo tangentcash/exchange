@@ -1,7 +1,7 @@
 import { randomBytes } from 'crypto';
 import { AssetId, ByteUtil, DEX, Readability, Signing, Uint256 } from 'tangentsdk';
 import { Log } from '../logging';
-import { Connection, Cursor, Notification, Exchange, PriceDescriptors, RouterPath } from './exchange';
+import { Connection, Cursor, Notification, Exchange, PriceDescriptors, RouterPath, TimeCursor } from './exchange';
 import { FastifyInstance } from 'fastify/types/instance';
 import { Blockchain, BlockchainInfo } from './blockchain';
 import { AggregatedMatch, AggregatedPair, Order, OrderSide, Pool } from '../types';
@@ -392,14 +392,10 @@ export namespace Router {
             if (!page)
                 throw new Error('page is required');
 
-            const results = 512;
-            const time = new Date().getTime();
-            const maxTime = time + interval - time % interval;
-            const fromTime = interval * page;
-            const toTime = Math.min(interval * (page + results), maxTime);
-            const result = await Exchange.getAggregatedTradesByPairId(pairId, fromTime, toTime, interval);
+            const cursor = TimeCursor.page(interval, page);
+            const result = await Exchange.getAggregatedTradesByPairId(pairId, cursor);
             const compressedResult = result.map((item) => [item.timepoint, item.side == OrderSide.Buy ? 1 : -1, item.volume, item.open, item.low, item.high, item.close]);
-            if (reply != null && toTime < maxTime) {
+            if (reply != null && cursor.toTime < cursor.maxTime) {
                 const expiration = new Date();
                 expiration.setDate(expiration.getDate() + 90);
                 reply.header('Cache-Control', 'public, max-age=7776000');

@@ -87,6 +87,25 @@ export class Cursor {
     }
 }
 
+export class TimeCursor {
+    interval: number = 0;
+    fromTime: number = 0;
+    toTime: number = 0;
+    maxTime: number = 0;
+    page: number = 0;
+
+    static page(interval: number, number: number, count: number = 512): TimeCursor {
+        const result = new TimeCursor();
+        const time = new Date().getTime();
+        result.interval = interval;
+        result.maxTime = time + interval - time % interval;
+        result.fromTime = interval * number;
+        result.toTime = Math.min(interval * (number + count), result.maxTime);
+        result.page = number;
+        return result;
+    }
+}
+
 export class Exchange {
     static listeners: Record<string, pq.ListenMeta> = { };
     static connection: pq.Sql;
@@ -2055,7 +2074,7 @@ export class Exchange {
             return null;
         }
     }
-    static async getAggregatedTradesByPairId(pairId: Uint256, from: number, to: number, interval: number, connection?: pq.TransactionSql): Promise<AggregatedTrade[]> {
+    static async getAggregatedTradesByPairId(pairId: Uint256, cursor: TimeCursor, connection?: pq.TransactionSql): Promise<AggregatedTrade[]> {
         const sql = connection || this.connection;
         const bindings = await this.resultOf(sql`
         SELECT
@@ -2074,7 +2093,7 @@ export class Exchange {
         const trades = await this.resultOf(sql`
         SELECT
             pair_id,
-            time_bucket(${interval}, time + ${interval}) - ${interval} AS timepoint,
+            time_bucket(${cursor.interval}, time + ${cursor.interval}) - ${cursor.interval} AS timepoint,
             AVG(side) AS side,
             SUM(quantity) AS volume,
             FIRST(price, time) AS open,
@@ -2082,7 +2101,7 @@ export class Exchange {
             MAX(price) AS high,
             LAST(price, time) AS close
         FROM trades
-        WHERE ${pairings.secondary != null && pairings.tertiary != null ? sql`pair_id IN (${pairings.primary}, ${pairings.secondary}, ${pairings.tertiary})` : sql`pair_id = ${pairings.primary}`} AND time BETWEEN ${from} AND ${to}
+        WHERE ${pairings.secondary != null && pairings.tertiary != null ? sql`pair_id IN (${pairings.primary}, ${pairings.secondary}, ${pairings.tertiary})` : sql`pair_id = ${pairings.primary}`} AND time BETWEEN ${cursor.fromTime} AND ${cursor.toTime}
         GROUP BY pair_id, timepoint
         ORDER BY timepoint`);
         if (!trades.length)
@@ -2138,7 +2157,7 @@ export class Exchange {
             const item = primary[i];
             item.side = item.side > 0.5 ? OrderSide.Sell : OrderSide.Buy;
         }
-        return this.toFixedSeries(primary, from, to, interval, (base: AggregatedTrade) => ({
+        return this.toFixedSeries(primary, cursor.fromTime, cursor.toTime, cursor.interval, (base: AggregatedTrade) => ({
             ...base,
             side: OrderSide.Buy,
             volume: new BigNumber(0),

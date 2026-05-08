@@ -115,7 +115,7 @@ export class Quotes {
                     throw exception;
                 }
                 if (!response.ok) {
-                    networkError = response.status == 429 || response.status > (source == 'realtime' ? 499 : 500);
+                    networkError = source == 'realtime' ? true : (response.status == 429 || response.status > 500);
                     throw new Error(response.status + ' - ' + response.statusText);
                 }
 
