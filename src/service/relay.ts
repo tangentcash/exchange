@@ -4,7 +4,7 @@ import { Log } from '../logging';
 import { Connection, Cursor, Notification, Exchange, PriceDescriptors, RouterPath, TimeCursor } from './exchange';
 import { FastifyInstance } from 'fastify/types/instance';
 import { Blockchain, BlockchainInfo } from './blockchain';
-import { AggregatedMatch, AggregatedPair, Order, OrderSide, Pool } from '../types';
+import { AggregatedMatch, AggregatedPair, Order, OrderSide, Pool, Market as MarketT } from '../types';
 import fastify, { FastifyReply, FastifyRequest } from 'fastify';
 import fastifyWebsocket, { WebSocket } from '@fastify/websocket';
 import cors from '@fastify/cors';
@@ -288,11 +288,7 @@ export namespace Router {
 
             return pool;
         }
-        static async getPolyAssets(args: { marketId?: string | number, assetHash?: string, liquidity?: boolean }): Promise<(AssetId & { liquidity?: BigNumber })[]> {
-            const marketId = typeof args.marketId == 'string' || typeof args.marketId == 'number' ? new Uint256(args.marketId) : null;
-            if (!marketId)
-                throw new Error('Market id is required');
-
+        static async getPolyAssets(args: { assetHash?: string, liquidity?: boolean }): Promise<(AssetId & { liquidity?: BigNumber })[]> {
             if (typeof args.assetHash != 'string')
                 throw new Error('Asset hash is required');
 
@@ -300,15 +296,18 @@ export namespace Router {
             if (!assetIdIn)
                 throw new Error('Asset hash in not found');
 
-            const result: (AssetId & { liquidity?: BigNumber })[] = await Exchange.getAggregatedPolyAssetIdsByMarket(marketId, assetIdIn);
+            const result: (AssetId & { marketId?: Uint256, liquidity?: BigNumber })[] = await Exchange.getAggregatedPolyAssetIdsByMarket(assetIdIn);
             if (args.liquidity) {
-                const market = await Exchange.getMarketById(marketId);
-                if (market != null && market.account) {
-                    const balances = await Account.balancesOf({ id: market.accountId, address: market.account });
-                    for (let i = 0; i < result.length; i++) {
-                        const asset = result[i];
-                        const balance = balances.find(x => x.asset.id == asset.id);
-                        asset.liquidity = balance?.available || new BigNumber(0);
+                const markets: Record<string, MarketT | null> = { };
+                const accounts: Record<string, Balance[] | null> = { };
+                for (let i = 0; i < result.length; i++) {
+                    const asset = result[i];
+                    let market = markets[asset.marketId?.toString() || ''];
+                    market = (market || !asset.marketId ? market : (markets[asset.marketId?.toString() || ''] = await Exchange.getMarketById(asset.marketId)));
+                    if (market != null && market.account != null) {
+                        let balances = accounts[market.account];
+                        balances = (balances ? balances : (accounts[market.account] = await Account.balancesOf({ id: market.accountId, address: market.account })))
+                        asset.liquidity = balances?.find(x => x.asset.id == asset.id)?.available || new BigNumber(0);
                     }
                 }
             }

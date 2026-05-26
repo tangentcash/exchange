@@ -2273,14 +2273,18 @@ export class Exchange {
         }
         return { primary: primary, secondary: secondary };
     }
-    static async getAggregatedPolyAssetIdsByMarket(marketId: Uint256, assetId: Uint256, connection?: pq.TransactionSql): Promise<AssetId[]> {
+    static async getAggregatedPolyAssetIdsByMarket(assetId: Uint256, connection?: pq.TransactionSql): Promise<(AssetId & { marketId?: Uint256 })[]> {
         const sql = connection || this.connection;
-        const result = await this.resultOf(sql`SELECT asset_id FROM poly_assets WHERE market_id = ${marketId.toString()} AND (asset_id = ${assetId.toString()} OR poly_asset_id = ${assetId.toString()})`);
-        const assets: AssetId[] = [];
+        const result = await this.resultOf(sql`SELECT asset_id, market_id FROM poly_assets WHERE asset_id = ${assetId.toString()} OR poly_asset_id = ${assetId.toString()}`);
+        const assets: (AssetId & { marketId?: Uint256 })[] = [];
         for (let i = 0; i < result.length; i++) {
-            const asset = await this.getAssetHashById(Common.u256(result[i]['asset_id']) || new Uint256(), connection);
-            if (asset != null)
+            const assetId = Common.u256(result[i]['asset_id']) || new Uint256();
+            const marketId = Common.u256(result[i]['market_id']) || new Uint256();
+            const asset: (AssetId & { marketId?: Uint256 }) | null = await this.getAssetHashById(assetId, connection);
+            if (asset != null) {
+                asset.marketId = marketId;
                 assets.push(asset);
+            }
         }
         return assets;
     }
