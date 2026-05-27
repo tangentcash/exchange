@@ -110,8 +110,8 @@ export class Quotes {
                 let response: Response;
                 try {
                     response = await fetch(new URL(patchUrl), headers ? { headers: headers } : undefined);
-                } catch (exception) {
-                    networkError = true;
+                } catch (exception: any) {
+                    networkError = exception.message == 'fetch failed' ? (source == 'realtime') : true;
                     throw exception;
                 }
                 if (!response.ok) {

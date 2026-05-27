@@ -51,6 +51,16 @@ export type PseudoOrder = {
     trailingDistance?: BigNumber;
 }
 
+export type PseudoPool = {
+    transaction: TransactionInfo,
+    primaryAsset: AssetId,
+    secondaryAsset: AssetId,
+    price: BigNumber;
+    minPrice?: BigNumber;
+    maxPrice?: BigNumber;
+    feeRate: BigNumber;
+}
+
 export type Options = {
     host?: string;
     port?: number;
@@ -385,39 +395,40 @@ export class Exchange {
                 await this.cleanupTrades(market.id, blockNumber, connection);
         }
         
-        const orders: Record<string, { orderId: Uint256, pseudoOrder: PseudoOrder | null, primaryQuantity: BigNumber, secondaryQuantity: BigNumber }> = { };
-        const pools: Record<string, { poolId: Uint256, primaryQuantity: BigNumber, secondaryQuantity: BigNumber }> = { };
+        const orders: Record<string, { orderId: Uint256, pseudoRef: PseudoOrder | null, primaryQuantity: BigNumber, secondaryQuantity: BigNumber }> = { };
+        const pools: Record<string, { poolId: Uint256, pseudoRef: PseudoPool | null, primaryQuantity: BigNumber, secondaryQuantity: BigNumber }> = { };
         const trades: { makerOrderOrPoolId: Uint256, makerOrderId: Uint256 | null, makerPoolId: Uint256 | null, takerOrderId: Uint256, side: OrderSide, price: BigNumber, quantity: BigNumber }[] = [];
         for (let i = 0; i < transactions.length; i++) {
             const transaction = transactions[i];
             let pseudoOrder: PseudoOrder | null = null;
+            let pseudoPool: PseudoPool | null = null;
             try {
-                const parameters = {
+                const orderParameters = () => ({
                     transaction: transaction,
                     primaryAsset: new AssetId(transaction.args[0]),
                     secondaryAsset: new AssetId(transaction.args[1]),
                     side: parseInt(transaction.args[2].toString()) as OrderSide,
                     policy: parseInt(transaction.args[3].toString()) as OrderPolicy,
                     value: transaction.pays.reduce((x, y) => x.plus(y.value), new BigNumber(0))
-                };
+                });
                 switch (Readability.toFunction(transaction.method)) {
                     case Readability.toFunction(DEX.Spot.marketOrder):
                         pseudoOrder = {
-                            ...parameters,
+                            ...orderParameters(),
                             condition: OrderCondition.Market,
                             slippage: Common.bn(transaction.args[4]),
                         };
                         break;
                     case Readability.toFunction(DEX.Spot.limitOrder):
                         pseudoOrder = {
-                            ...parameters,
+                            ...orderParameters(),
                             condition: OrderCondition.Limit,
                             price: Common.bn(transaction.args[4]),
                         };
                         break;
                     case Readability.toFunction(DEX.Spot.stopOrder):
                         pseudoOrder = {
-                            ...parameters,
+                            ...orderParameters(),
                             condition: OrderCondition.Stop,
                             stopPrice: Common.bn(transaction.args[4]),
                             slippage: Common.bn(transaction.args[5])
@@ -425,7 +436,7 @@ export class Exchange {
                         break;
                     case Readability.toFunction(DEX.Spot.stopLimitOrder):
                         pseudoOrder = {
-                            ...parameters,
+                            ...orderParameters(),
                             condition: OrderCondition.StopLimit,
                             stopPrice: Common.bn(transaction.args[4]),
                             price: Common.bn(transaction.args[5])
@@ -433,7 +444,7 @@ export class Exchange {
                         break;
                     case Readability.toFunction(DEX.Spot.trailingStopOrder):
                         pseudoOrder = {
-                            ...parameters,
+                            ...orderParameters(),
                             condition: OrderCondition.TrailingStop,
                             stopPrice: Common.bn(transaction.args[4]),
                             slippage: Common.bn(transaction.args[5]),
@@ -443,7 +454,7 @@ export class Exchange {
                         break;
                     case Readability.toFunction(DEX.Spot.trailingStopLimitOrder):
                         pseudoOrder = {
-                            ...parameters,
+                            ...orderParameters(),
                             condition: OrderCondition.TrailingStopLimit,
                             stopPrice: Common.bn(transaction.args[4]),
                             price: Common.bn(transaction.args[5]),
@@ -451,13 +462,20 @@ export class Exchange {
                             trailingDistance: Common.bn(transaction.args[7])
                         };
                         break;
-                    default:
-                        pseudoOrder = null;
+                    case Readability.toFunction(DEX.Spot.depositPool):
+                        pseudoPool = {
+                            transaction: transaction,
+                            primaryAsset: new AssetId(transaction.args[0]),
+                            secondaryAsset: new AssetId(transaction.args[1]),
+                            price: Common.bn(transaction.args[2]) || new BigNumber(0),
+                            minPrice: Common.bn(transaction.args[3]),
+                            maxPrice: Common.bn(transaction.args[4]),
+                            feeRate: Common.bn(transaction.args[5]) || new BigNumber(0),
+                        };
                         break;
                 }
             } catch { }
     
-            let pseudoOrderBound = false;
             for (let i = 0; i < transaction.events.length; i++) {
                 const event = transaction.events[i];
                 Log.query(`exchange ${marketAccount} event (type: ${event.type}, block: ${blockNumber}):`, event.args);
@@ -509,16 +527,22 @@ export class Exchange {
                         const orderId = new Uint256(event.args[0].toString());
                         orders[orderId.toString()] = {
                             orderId: orderId,
-                            pseudoOrder: pseudoOrderBound ? null : pseudoOrder,
+                            pseudoRef: pseudoOrder,
                             primaryQuantity: new BigNumber(0),
                             secondaryQuantity: new BigNumber(0)
                         };
-                        pseudoOrderBound = true;
+                        pseudoOrder = null;
                         break;
                     }
                     case DEX.Spot.Events.Pool: {
                         const poolId = new Uint256(event.args[0].toString());
-                        pools[poolId.toString()] = { poolId: poolId, primaryQuantity: new BigNumber(0), secondaryQuantity: new BigNumber(0) };
+                        pools[poolId.toString()] = {
+                            poolId: poolId,
+                            pseudoRef: pseudoPool,
+                            primaryQuantity: new BigNumber(0),
+                            secondaryQuantity: new BigNumber(0)
+                        };
+                        pseudoPool = null;
                         break;
                     }
                     case DEX.Spot.Events.Swap: {
@@ -534,7 +558,7 @@ export class Exchange {
                         if (makerOrderId != null) {
                             orders[makerOrderId.toString()] = {
                                 orderId: makerOrderId,
-                                pseudoOrder: null,
+                                pseudoRef: null,
                                 primaryQuantity: (orders[makerOrderId.toString()]?.primaryQuantity || new BigNumber(0)).plus(quantity),
                                 secondaryQuantity: (orders[makerOrderId.toString()]?.secondaryQuantity || new BigNumber(0)).plus(price.multipliedBy(quantity))
                             };
@@ -542,13 +566,14 @@ export class Exchange {
                         if (makerPoolId != null) {
                             pools[makerPoolId.toString()] = {
                                 poolId: makerPoolId,
+                                pseudoRef: null,
                                 primaryQuantity: (pools[makerPoolId.toString()]?.primaryQuantity || new BigNumber(0)).plus(quantity),
                                 secondaryQuantity: (pools[makerPoolId.toString()]?.secondaryQuantity || new BigNumber(0)).plus(price.multipliedBy(quantity))
                             };
                         }
                         orders[virtualTakerOrderRefId.toString()] = {
                             orderId: virtualTakerOrderRefId,
-                            pseudoOrder: takerOrderId.gt(0) ? orders[virtualTakerOrderRefId.toString()]?.pseudoOrder || null : pseudoOrder,
+                            pseudoRef: takerOrderId.gt(0) ? orders[virtualTakerOrderRefId.toString()]?.pseudoRef || null : pseudoOrder,
                             primaryQuantity: (orders[virtualTakerOrderRefId.toString()]?.primaryQuantity || new BigNumber(0)).plus(quantity),
                             secondaryQuantity: (orders[virtualTakerOrderRefId.toString()]?.secondaryQuantity || new BigNumber(0)).plus(price.multipliedBy(quantity)),
                         };
@@ -598,15 +623,15 @@ export class Exchange {
             try {
                 let result: Order | null = null, order: any;
                 try {
-                    const pseudoOrder: PseudoOrder = event.pseudoOrder as any;
+                    const pseudoOrder: PseudoOrder = event.pseudoRef as any;
                     try {
                         order = await Blockchain.call(marketAccount, Readability.toFunction(DEX.Spot.orderOf), [event.orderId]);
                     } catch (exception) {
-                        if (!event.pseudoOrder)
+                        if (!event.pseudoRef)
                             throw exception;
                     }
 
-                    if (!order && !event.pseudoOrder)
+                    if (!order && !event.pseudoRef)
                         throw new Error('cannot find order of contract account ' + marketAccount);
 
                     const account = order ? order.account : pseudoOrder.transaction.fromAccount; 
@@ -707,25 +732,38 @@ export class Exchange {
         for (let target in pools) {
             const event = pools[target];
             try {
-                let result: Pool | null = null;
+                let result: Pool | null = null, pool: any;
                 try {
-                    const pool = await Blockchain.call(marketAccount, Readability.toFunction(DEX.Spot.poolOf), [event.poolId]);
-                    if (!accounts[pool.account]) {
-                        const accountId = await this.getAccountIdByAddress(pool.account, false, connection);
+                    const pseudoPool: PseudoPool = event.pseudoRef as any;
+                    try {
+                        pool = await Blockchain.call(marketAccount, Readability.toFunction(DEX.Spot.poolOf), [event.poolId]);
+                    } catch (exception) {
+                        if (!event.pseudoRef)
+                            throw exception;
+                    }
+
+                    if (!pool && !event.pseudoRef)
+                        throw new Error('cannot find pool of contract account ' + marketAccount);
+
+                    const account = pool ? pool.account : pseudoPool.transaction.fromAccount; 
+                    if (!accounts[account]) {
+                        const accountId = await this.getAccountIdByAddress(account, false, connection);
                         if (!accountId)
-                            throw new Error('cannot decode pool account ' + pool.account);
-                        accounts[pool.account] = accountId;
+                            throw new Error('cannot decode pool account ' + account);
+                        accounts[account] = accountId;
                     }
                     
-                    const pair = await Blockchain.call(marketAccount, Readability.toFunction(DEX.Spot.pairOf), [pool.pair_id]);
+                    const pair = pool ? await Blockchain.call(marketAccount, Readability.toFunction(DEX.Spot.pairOf), [pool.pair_id]) : { primary_asset: pseudoPool.primaryAsset.toHex(), secondary_asset: pseudoPool.secondaryAsset.toHex() };
                     if (!pair)
                         throw new Error('cannot find asset pair of contract account ' + marketAccount);
 
-                    const primaryAssetId = await this.getAssetIdByHash(new AssetId(pair.primary_asset), false, connection);
+                    const primaryAsset = new AssetId(pair.primary_asset);
+                    const primaryAssetId = await this.getAssetIdByHash(primaryAsset, false, connection);
                     if (!primaryAssetId)
                         throw new Error('cannot find primary asset of contract account ' + marketAccount);
 
-                    const secondaryAssetId = await this.getAssetIdByHash(new AssetId(pair.secondary_asset), false, connection);
+                    const secondaryAsset = new AssetId(pair.secondary_asset);
+                    const secondaryAssetId = await this.getAssetIdByHash(secondaryAsset, false, connection);
                     if (!secondaryAssetId)
                         throw new Error('cannot find secondary asset of contract account ' + marketAccount);
 
@@ -737,30 +775,32 @@ export class Exchange {
                     if (!pairId)
                         throw new Error('cannot find asset pair of contract account ' + marketAccount);
 
-                    const primaryRevenue = new BigNumber(pool.primary_revenue);
-                    const secondaryRevenue = new BigNumber(pool.secondary_revenue);
-                    const minPrice = Common.bn(pool.min_price);
-                    const maxPrice = Common.bn(pool.max_price);
+                    const primaryValue = pool ? new BigNumber(pool.primary_value) : pseudoPool.transaction.pays.filter(x => x.asset.token == primaryAsset.token).reduce((x, y) => x.plus(y.value), new BigNumber(0))
+                    const secondaryValue = pool ? new BigNumber(pool.secondary_value) : pseudoPool.transaction.pays.filter(x => x.asset.token == secondaryAsset.token).reduce((x, y) => x.plus(y.value), new BigNumber(0))
+                    const primaryRevenue = pool ? new BigNumber(pool.primary_revenue) : new BigNumber(0);
+                    const secondaryRevenue = pool ? new BigNumber(pool.secondary_revenue) : new BigNumber(0);
+                    const minPrice = pool ? Common.bn(pool.min_price)?.pow(2) : pseudoPool.minPrice;
+                    const maxPrice = pool ? Common.bn(pool.max_price)?.pow(2) : pseudoPool.maxPrice;
                     const concentrated = minPrice?.gt(0) && maxPrice?.gt(0);
                     result = await this.setPool({
-                        poolId: Common.u256(pool.id) || new Uint256(pool.id),
+                        poolId: pool ? Common.u256(pool.id) || new Uint256(pool.id) : event.poolId,
                         pairId: pairId,
                         marketId: market.id,
-                        accountId: accounts[pool.account],
+                        accountId: accounts[account],
                         blockNumber: blockNumber,
-                        primaryValue: new BigNumber(pool.primary_value),
-                        secondaryValue: new BigNumber(pool.secondary_value),
+                        primaryValue: primaryValue,
+                        secondaryValue: secondaryValue,
                         primaryRevenue: primaryRevenue,
                         secondaryRevenue: secondaryRevenue,
-                        liquidity: new BigNumber(pool.liquidity),
-                        price: concentrated ? new BigNumber(pool.price).pow(2) : new BigNumber(pool.price),
-                        minPrice: concentrated ? minPrice?.pow(2) : minPrice,
-                        maxPrice: concentrated ? maxPrice?.pow(2) : maxPrice,
-                        feeRate: new BigNumber(pool.fee_rate),
-                        exitFee: new BigNumber(pool.exit_fee),
+                        liquidity: pool ? new BigNumber(pool.liquidity) : new BigNumber(0),
+                        price: pool ? new BigNumber(pool.price).pow(concentrated ? 1 : 2) : pseudoPool.price,
+                        minPrice: minPrice,
+                        maxPrice: maxPrice,
+                        feeRate: pool ? new BigNumber(pool.fee_rate) : pseudoPool.feeRate,
+                        exitFee: pool ? new BigNumber(pool.exit_fee) : new BigNumber(0),
                         lastAskPrice: new BigNumber(0),
                         lastBidPrice: new BigNumber(0),
-                        active: true
+                        active: pool != null
                     }, connection);
                 } catch {
                     const prevPool = await this.getPoolByPoolId(event.poolId, connection);
@@ -924,9 +964,9 @@ export class Exchange {
             return null;
         }
     }
-    static async getLatestBlock(connection?: pq.TransactionSql): Promise<Block | null> {
+    static async getLatestBlock(offset?: number, connection?: pq.TransactionSql): Promise<Block | null> {
         const sql = connection || this.connection;
-        const result = await this.resultOf(sql`SELECT * FROM blocks ORDER BY block_number DESC LIMIT 1`);
+        const result = await this.resultOf(sql`SELECT * FROM blocks ORDER BY block_number DESC LIMIT 1 OFFSET ${offset || 0}`);
         try {
             return this.toBlock(result[0]);
         } catch {
@@ -1457,7 +1497,7 @@ export class Exchange {
     }
     static async setSyncedAccountBalancesByAccountId(id: Uint256, time: Date, balances: { asset: AssetId, value: BigNumber }[], connection?: pq.TransactionSql): Promise<void> {
         const sql = connection || this.connection;
-        const top = await this.getLatestBlock(connection);
+        const top = await this.getLatestBlock(undefined, connection);
         const updates: { account_id: string, asset_id: string, block_number: number, time: number, value: string }[] = [];
         for (let i = 0; i < balances.length; i++) {
             const balance = balances[i];
@@ -1549,7 +1589,7 @@ export class Exchange {
     }
     static async setSyncedAccountTierByAccountIdAndMarketAsset(accountId: Uint256, marketId: Uint256, assetId: Uint256, volume: BigNumber, makerFee: BigNumber, takerFee: BigNumber, connection?: pq.TransactionSql): Promise<void> {
         const sql = connection || this.connection;
-        const top = await this.getLatestBlock(connection);
+        const top = await this.getLatestBlock(undefined, connection);
         await this.resultOf(sql`
         INSERT INTO tiers
         (

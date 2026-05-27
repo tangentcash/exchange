@@ -82,63 +82,65 @@ export class Blockchain {
             this.timer = setInterval(() => RPC.connectSocket(), 15000) as any;
         }
     }
-    static async sync(): Promise<void> {
+    static async sync(tipBlockNumber?: number): Promise<void> {
         if (!this.markets.accounts.length || this.syncing)
             return;
 
         this.syncing = true;
         try {
-            const syncedBlock = (await Exchange.getLatestBlock()) || { blockNumber: 0, blockHash: new Uint256() };
-            let reorganize = !syncedBlock.blockNumber, unsyncedQueue: number[] = [];
+            let pendingQueue: number[] = [];
+            let syncedBlock = await Exchange.getLatestBlock();
             for (let i = 0; i < this.markets.accounts.length; i++) {
                 const queue: number[] = [];
                 while (true) {
-                    const transactions = await RPC.getTransactionsByOwner(this.markets.accounts[i], queue.length, reorganize ? 32 : 1, 1, 2);
+                    const transactions = await RPC.getTransactionsByOwner(this.markets.accounts[i], queue.length, queue.length > 0 ? 32 : 1, 0, 2);
                     if (!Array.isArray(transactions) || !transactions.length)
                         break;
                     
                     let finalize = false;
-                    for (let i = 0; i < transactions.length; i++) {
+                    for (let i = 0; i < transactions.length && !finalize; i++) {
                         const blockNumber = parseInt(transactions[i].receipt.block_number.toString());
-                        if (!reorganize && blockNumber <= syncedBlock.blockNumber) {
-                            const block = await RPC.getBlockByNumber(blockNumber);
-                            reorganize = block && new Uint256(block.hash, 16).neq(syncedBlock.blockHash);
-                            finalize = !reorganize;
-                            if (finalize)
-                                break;
+                        if (syncedBlock && blockNumber <= syncedBlock.blockNumber) {
+                            let collision = 0;
+                            const child = blockNumber == syncedBlock.blockNumber ? syncedBlock : await Exchange.getBlockByNumber(blockNumber);
+                            const parent = child ? await this.findBlock(child.blockHash) : null;
+                            finalize = child && parent;
+                            while (!finalize) {
+                                const tipBlock = await Exchange.getLatestBlock(collision++);
+                                const collisionBlock = tipBlock ? await this.findBlock(tipBlock.blockHash) : null;
+                                if (!tipBlock || collisionBlock != null) {
+                                    Log.info(`blockchain reorganize: ${tipBlock ? 'rollback to block ' + tipBlock.blockNumber.toString() : 'rebuild from scratch'} (collision: ${tipBlock ? tipBlock.blockHash.toHex() : 'null'})`);
+                                    await Exchange.rollbackToBlock(tipBlock?.blockNumber || 0);
+                                    syncedBlock = tipBlock;
+                                    break;
+                                }
+                            }
                         }
-                        queue.unshift(blockNumber);
+                        if (!finalize)
+                            queue.unshift(blockNumber);
                     }
-
+                    
+                    if (queue.length > 0)
+                        Log.info(`blockchain indexing: ${queue.length} transaction${queue.length > 1 ? 's' : ''}`);
+                    
                     if (finalize)
                         break;
-                    
-                    Log.info(`blockchain indexing: ${queue.length} transaction${queue.length > 1 ? 's' : ''}`);
                 }
-                unsyncedQueue = [...unsyncedQueue, ...queue];
+                pendingQueue = [...pendingQueue, ...queue];
             }
 
-            Log.info(`blockchain indexing complete: ${unsyncedQueue.length} transaction${unsyncedQueue.length > 1 ? 's' : ''}`);
-            if (reorganize) {
-                let nextBlock = await Exchange.getLatestBlock();
-                if (nextBlock != null) {
-                    let collisionBlock = await this.findBlock(nextBlock.blockHash);
-                    while (nextBlock != null && nextBlock.blockNumber > 0 && collisionBlock == null) {
-                        nextBlock = nextBlock.blockNumber > 1 ? await Exchange.getBlockByNumber(nextBlock.blockNumber - 1) : null;
-                        collisionBlock = nextBlock ? await this.findBlock(nextBlock.blockHash) : null;
-                    }
-
-                    const rollbackBlockNumber = nextBlock?.blockNumber || 0;
-                    Log.info(`blockchain reorganize: ${rollbackBlockNumber > 0 ? 'rollback to block ' + rollbackBlockNumber.toString() : 'rebuild from scratch'} (collision: ${nextBlock ? nextBlock.blockHash.toHex() : 'null'})`);
-                    await Exchange.rollbackToBlock(rollbackBlockNumber);
-                }
-            }
-
-            unsyncedQueue.sort((a: any, b: any) => a - b);
-            for (let i = 0; i < unsyncedQueue.length; i++) {
-                const blockNumber = unsyncedQueue[i];
+            pendingQueue.sort((a: any, b: any) => a - b);
+            for (let i = 0; i < pendingQueue.length; i++) {
+                const blockNumber = pendingQueue[i];
                 await this.dispatchBlock(blockNumber);
-                Log.info(`blockchain sync progress: ${(100 * (i + 1) / unsyncedQueue.length).toFixed(2)}% (block: ${blockNumber})`);
+                Log.info(`blockchain sync progress: ${(100 * (i + 1) / pendingQueue.length).toFixed(2)}% (block: ${blockNumber})`);
+            }
+            
+            if (tipBlockNumber && !pendingQueue.find(x => x == tipBlockNumber)) {
+                await this.dispatchBlock(tipBlockNumber);
+                Log.info(`blockchain sync: OK complete (block: ${tipBlockNumber}, transactions: ${pendingQueue.length})`);
+            } else {
+                Log.info(`blockchain sync: OK complete (transactions: ${pendingQueue.length})`);
             }
         } catch (exception) {
             Log.error('blockchain sync failed:', exception);
@@ -146,7 +148,7 @@ export class Blockchain {
     
         RPC.onNodeMessage = async (event) => {
             if (event.type == 'block' && typeof event.result.number == 'number' && event.result.number > 0) {
-                await this.sync();
+                await this.sync(event.result.number);
             }
         };
         this.syncing = false;
@@ -263,18 +265,16 @@ export class Blockchain {
             }
         }
 
-        if (matches > 0) {
-            const block = await RPC.getBlockByNumber(number);
-            const blockTime = new BigNumber(block.generation_time);
-            const blockDate = blockTime.isNaN() ? new Date() : new Date(blockTime.toNumber());
-            const blockHash = new Uint256(block.hash, 16);
-            await Exchange.setBlock({ blockNumber: number, blockHash: blockHash }, accounts);
-            for (let account in results) {
-                try {
-                    await Exchange.dispatchTransactions(number, blockDate, account, results[account]);
-                } catch (exception) {
-                    Log.error(`failed to dispatch block events (block: ${number}, account: ${account}):`, exception);
-                }
+        const block = await RPC.getBlockByNumber(number);
+        const blockTime = new BigNumber(block.generation_time);
+        const blockDate = blockTime.isNaN() ? new Date() : new Date(blockTime.toNumber());
+        const blockHash = new Uint256(block.hash, 16);
+        await Exchange.setBlock({ blockNumber: number, blockHash: blockHash }, accounts);
+        for (let account in results) {
+            try {
+                await Exchange.dispatchTransactions(number, blockDate, account, results[account]);
+            } catch (exception) {
+                Log.error(`failed to dispatch block events (block: ${number}, account: ${account}):`, exception);
             }
         }
     }
