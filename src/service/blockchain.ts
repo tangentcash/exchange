@@ -39,7 +39,6 @@ export class Blockchain {
         accounts: string[]
     } = { versions: { }, accounts: [] };
     static blockchains: BlockchainInfo[] | null = null;
-    static genesisBlockNumber: number | null = null;
     static timer: number | null = null;
     static syncing: boolean;
 
@@ -87,51 +86,64 @@ export class Blockchain {
         if (!this.markets.accounts.length || this.syncing)
             return;
 
-        if (this.genesisBlockNumber == null) {
-            for (let i = 0; i < this.markets.accounts.length; i++) {
-                const transaction = await RPC.getTransactionsByOwner(this.markets.accounts[i], 0, 1, -1, 2);
-                if (Array.isArray(transaction) && transaction.length > 0) {
-                    this.genesisBlockNumber = Math.min(parseInt(transaction[0].receipt.block_number.toString()), this.genesisBlockNumber || Number.MAX_SAFE_INTEGER);
-                }
-            }
-        }
-
         this.syncing = true;
         try {
-            let tip = new BigNumber(await RPC.getBlockTipNumber() || 0);
-            let nextBlock = await Exchange.getLatestBlock();
-            let reorganize = (nextBlock?.blockNumber || 0) > tip.toNumber();
-            if (reorganize) {
-                nextBlock = await Exchange.getBlockByNumber(tip.toNumber());
+            const syncedBlock = (await Exchange.getLatestBlock()) || { blockNumber: 0, blockHash: new Uint256() };
+            let reorganize = !syncedBlock.blockNumber, unsyncedQueue: number[] = [];
+            for (let i = 0; i < this.markets.accounts.length; i++) {
+                const queue: number[] = [];
+                while (true) {
+                    const transactions = await RPC.getTransactionsByOwner(this.markets.accounts[i], queue.length, reorganize ? 32 : 1, 1, 2);
+                    if (!Array.isArray(transactions) || !transactions.length)
+                        break;
+                    
+                    let finalize = false;
+                    for (let i = 0; i < transactions.length; i++) {
+                        const blockNumber = parseInt(transactions[i].receipt.block_number.toString());
+                        if (!reorganize && blockNumber <= syncedBlock.blockNumber) {
+                            const block = await RPC.getBlockByNumber(blockNumber);
+                            reorganize = block && new Uint256(block.hash, 16).neq(syncedBlock.blockHash);
+                            finalize = !reorganize;
+                            if (finalize)
+                                break;
+                        }
+                        queue.unshift(blockNumber);
+                    }
+
+                    if (finalize)
+                        break;
+                    
+                    Log.info(`blockchain indexing: ${queue.length} transaction${queue.length > 1 ? 's' : ''}`);
+                }
+                unsyncedQueue = [...unsyncedQueue, ...queue];
             }
 
-            if (nextBlock != null) {
-                let collisionBlock = await this.findBlock(nextBlock?.blockHash);
-                while (nextBlock != null && nextBlock.blockNumber > 0 && collisionBlock == null) {
-                    nextBlock = nextBlock.blockNumber > 1 ? await Exchange.getBlockByNumber(nextBlock.blockNumber - 1) : null;
-                    if (nextBlock != null)
-                        collisionBlock = await this.findBlock(nextBlock?.blockHash);
-                    reorganize = true;
-                }
+            Log.info(`blockchain indexing complete: ${unsyncedQueue.length} transaction${unsyncedQueue.length > 1 ? 's' : ''}`);
+            if (reorganize) {
+                let nextBlock = await Exchange.getLatestBlock();
+                if (nextBlock != null) {
+                    let collisionBlock = await this.findBlock(nextBlock.blockHash);
+                    while (nextBlock != null && nextBlock.blockNumber > 0 && collisionBlock == null) {
+                        nextBlock = nextBlock.blockNumber > 1 ? await Exchange.getBlockByNumber(nextBlock.blockNumber - 1) : null;
+                        collisionBlock = nextBlock ? await this.findBlock(nextBlock.blockHash) : null;
+                    }
 
-                const rollbackBlockNumber = nextBlock?.blockNumber || 0;
-                if (reorganize) {
+                    const rollbackBlockNumber = nextBlock?.blockNumber || 0;
                     Log.info(`blockchain reorganize: ${rollbackBlockNumber > 0 ? 'rollback to block ' + rollbackBlockNumber.toString() : 'rebuild from scratch'} (collision: ${nextBlock ? nextBlock.blockHash.toHex() : 'null'})`);
                     await Exchange.rollbackToBlock(rollbackBlockNumber);
                 }
             }
-            
-            let nextTip = BigNumber.max(new BigNumber((nextBlock?.blockNumber || 0) + 1), new BigNumber(this.genesisBlockNumber || 1));
-            let baseTip = new BigNumber(nextTip);
-            while (nextTip.lte(tip)) {
-                await this.dispatchBlock(nextTip.toNumber());
-                Log.info(`blockchain sync progress: ${nextTip.eq(tip) ? '100.00' : nextTip.minus(baseTip).dividedBy(tip.minus(baseTip)).multipliedBy(100).toFixed(2)}% (block: ${nextTip.toString()})`);
-                nextTip = nextTip.plus(1);
+
+            unsyncedQueue.sort((a: any, b: any) => a - b);
+            for (let i = 0; i < unsyncedQueue.length; i++) {
+                const blockNumber = unsyncedQueue[i];
+                await this.dispatchBlock(blockNumber);
+                Log.info(`blockchain sync progress: ${(100 * (i + 1) / unsyncedQueue.length).toFixed(2)}% (block: ${blockNumber})`);
             }
         } catch (exception) {
             Log.error('blockchain sync failed:', exception);
         }
-        
+    
         RPC.onNodeMessage = async (event) => {
             if (event.type == 'block' && typeof event.result.number == 'number' && event.result.number > 0) {
                 await this.sync();
@@ -251,16 +263,18 @@ export class Blockchain {
             }
         }
 
-        const block = await RPC.getBlockByNumber(number);
-        const blockTime = new BigNumber(block.generation_time);
-        const blockDate = blockTime.isNaN() ? new Date() : new Date(blockTime.toNumber());
-        const blockHash = new Uint256(block.hash, 16);
-        await Exchange.setBlock({ blockNumber: number, blockHash: blockHash }, accounts);
-        for (let account in results) {
-            try {
-                await Exchange.dispatchTransactions(number, blockDate, account, results[account]);
-            } catch (exception) {
-                Log.error(`failed to dispatch block events (block: ${number}, account: ${account}):`, exception);
+        if (matches > 0) {
+            const block = await RPC.getBlockByNumber(number);
+            const blockTime = new BigNumber(block.generation_time);
+            const blockDate = blockTime.isNaN() ? new Date() : new Date(blockTime.toNumber());
+            const blockHash = new Uint256(block.hash, 16);
+            await Exchange.setBlock({ blockNumber: number, blockHash: blockHash }, accounts);
+            for (let account in results) {
+                try {
+                    await Exchange.dispatchTransactions(number, blockDate, account, results[account]);
+                } catch (exception) {
+                    Log.error(`failed to dispatch block events (block: ${number}, account: ${account}):`, exception);
+                }
             }
         }
     }
