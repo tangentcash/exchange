@@ -793,7 +793,7 @@ export class Exchange {
                         primaryRevenue: primaryRevenue,
                         secondaryRevenue: secondaryRevenue,
                         liquidity: pool ? new BigNumber(pool.liquidity) : new BigNumber(0),
-                        price: pool ? new BigNumber(pool.price).pow(concentrated ? 1 : 2) : pseudoPool.price,
+                        price: pool ? new BigNumber(pool.price).pow(concentrated ? 2 : 1) : pseudoPool.price,
                         minPrice: minPrice,
                         maxPrice: maxPrice,
                         feeRate: pool ? new BigNumber(pool.fee_rate) : pseudoPool.feeRate,
@@ -2007,6 +2007,31 @@ export class Exchange {
             return this.toPool(result[0]);
         } catch {
             return null;
+        }
+    }
+    static async getBestPools(cursor: Cursor, connection?: pq.TransactionSql): Promise<Pool[]> {
+        const sql = connection || this.connection;
+        const result = await this.resultOf(sql`
+        SELECT
+            pools.*,
+            passet.hash as primary_asset,
+            sasset.hash as secondary_asset,
+            accounts.hash as market_account_hash
+        FROM pools
+            INNER JOIN pairs ON pairs.id = pair_id
+            INNER JOIN assets passet ON passet.id = pairs.primary_asset_id
+            INNER JOIN assets sasset ON sasset.id = pairs.secondary_asset_id
+            INNER JOIN markets ON markets.id = market_id
+            INNER JOIN accounts ON accounts.id = markets.account_id
+        WHERE active = TRUE ORDER BY 100000000 * (primary_revenue * price + secondary_revenue) / (primary_value * price + secondary_value) DESC LIMIT ${cursor.count} OFFSET ${cursor.offset}`);
+        try {
+            const pools = [];
+            for (let i = 0; i < result.length; i++) {
+                pools.push(this.toPool(result[i]));
+            }
+            return pools;
+        } catch {
+            return [];
         }
     }
     static async getPoolsByAccountId(accountId: Uint256, active: boolean | null, cursor: Cursor, connection?: pq.TransactionSql): Promise<Pool[]> {

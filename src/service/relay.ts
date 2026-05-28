@@ -253,6 +253,7 @@ export namespace Router {
             Channel.register(server, 'get', '/market', Asset, Market.get);
             Channel.register(server, 'get', '/market/order', Asset, Market.getOrder);
             Channel.register(server, 'get', '/market/pool', Asset, Market.getPool);
+            Channel.register(server, 'get', '/market/pools', Asset, Market.getPools);
             Channel.register(server, 'get', '/market/paths', Asset, Market.getPaths);
             Channel.register(server, 'get', '/market/assets', Asset, Market.getPolyAssets);
             Channel.register(server, 'get', '/market/pair', Asset, Market.getPair);
@@ -287,6 +288,9 @@ export namespace Router {
                 throw new Error('Pool not found');
 
             return pool;
+        }
+        static async getPools(args: PageQuery): Promise<Pool[]> {
+            return await Exchange.getBestPools(Cursor.page(args.page || 0));
         }
         static async getPolyAssets(args: { assetHash?: string, liquidity?: boolean }): Promise<(AssetId & { liquidity?: BigNumber })[]> {
             if (typeof args.assetHash != 'string')
