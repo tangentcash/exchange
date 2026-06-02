@@ -256,6 +256,7 @@ export namespace Router {
             Channel.register(server, 'get', '/market/pools', Asset, Market.getPools);
             Channel.register(server, 'get', '/market/paths', Asset, Market.getPaths);
             Channel.register(server, 'get', '/market/assets', Asset, Market.getPolyAssets);
+            Channel.register(server, 'get', '/market/price', Asset, Market.getPrice);
             Channel.register(server, 'get', '/market/pair', Asset, Market.getPair);
             Channel.register(server, 'get', '/market/pair/assets', Asset, Market.getPairPolyAssets);
             Channel.register(server, 'get', '/market/pairs', Asset, Market.getPairs);
@@ -351,6 +352,24 @@ export namespace Router {
                 
             const marketId = new Uint256(args.marketId);
             return await Exchange.getRoutingPathsByAssetIds(marketId, assetIdIn, assetIdOut, amountIn, slippage, 6);
+        }
+        static async getPrice(args: { primaryAssetHash?: string, secondaryAssetHash?: string }): Promise<BigNumber | null> {
+            if (typeof args.primaryAssetHash != 'string')
+                throw new Error('Primary asset hash is required');
+
+            if (typeof args.secondaryAssetHash != 'string')
+                throw new Error('Secondary asset hash is required');
+
+            const primaryAssetId = await Exchange.getAssetIdByHash(new AssetId(args.primaryAssetHash), true);
+            if (!primaryAssetId)
+                throw new Error('Primary asset id not found');
+
+            const secondaryAssetId = await Exchange.getAssetIdByHash(new AssetId(args.secondaryAssetHash), true);
+            if (!secondaryAssetId)
+                throw new Error('Secondary asset id not found');
+
+            const price = await Exchange.getAssetPrice(primaryAssetId, secondaryAssetId);
+            return price;
         }
         static async getPair(args: { id?: string | number, primaryAssetHash?: string, secondaryAssetHash?: string, createIfNotExists?: boolean }): Promise<AggregatedPair> {
             if (typeof args.id != 'string' && typeof args.id != 'number')
