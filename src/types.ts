@@ -89,10 +89,10 @@ export type AggregatedTrade = {
     close: BigNumber
 }
 
-export type AggregatedMatch = {
+export type AggregatedLog = {
     time: number,
     account: string,
-    side: OrderSide,
+    side: OrderSide | 'lp',
     price: BigNumber,
     quantity: BigNumber
 }
@@ -165,6 +165,17 @@ export type Trade = {
     takerAccountId?: Uint256;
     blockNumber?: number;
     side: OrderSide;
+    price: BigNumber;
+    quantity: BigNumber;
+    time: Date;
+}
+
+export type Depth = {
+    pairId: Uint256;
+    marketId: Uint256;
+    poolId: Uint256;
+    accountId: Uint256;
+    blockNumber: number;
     price: BigNumber;
     quantity: BigNumber;
     time: Date;

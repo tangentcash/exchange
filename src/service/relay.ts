@@ -4,7 +4,7 @@ import { Log } from '../logging';
 import { Connection, Cursor, Notification, Exchange, PriceDescriptors, RouterPath, TimeCursor } from './exchange';
 import { FastifyInstance } from 'fastify/types/instance';
 import { Blockchain, BlockchainInfo } from './blockchain';
-import { AggregatedMatch, AggregatedPair, Order, OrderSide, Pool, Market as MarketT } from '../types';
+import { AggregatedLog, AggregatedPair, Order, OrderSide, Pool, Market as MarketT } from '../types';
 import fastify, { FastifyReply, FastifyRequest } from 'fastify';
 import fastifyWebsocket, { WebSocket } from '@fastify/websocket';
 import cors from '@fastify/cors';
@@ -260,7 +260,7 @@ export namespace Router {
             Channel.register(server, 'get', '/market/pair', Asset, Market.getPair);
             Channel.register(server, 'get', '/market/pair/assets', Asset, Market.getPairPolyAssets);
             Channel.register(server, 'get', '/market/pairs', Asset, Market.getPairs);
-            Channel.register(server, 'get', '/market/pair/trades', Asset, Market.getPairTrades);
+            Channel.register(server, 'get', '/market/pair/logs', Asset, Market.getPairLogs);
             Channel.register(server, 'get', '/market/pair/price/series', Asset, Market.getPairPriceSeries);
             Channel.register(server, 'get', '/market/pair/price/levels', Asset, Market.getPairPriceLevels);
             Channel.register(server, 'get', '/markets', Asset, Market.getMarkets);
@@ -444,7 +444,7 @@ export namespace Router {
                 bid: result.bid.map((v) => [v.id.toInteger(), v.price, v.quantity]),
             }
         }
-        static async getPairTrades(args: { marketId?: string | number, pairId?: string | number } & PageQuery): Promise<AggregatedMatch[]> {
+        static async getPairLogs(args: { marketId?: string | number, pairId?: string | number } & PageQuery): Promise<AggregatedLog[]> {
             const marketId = typeof args.marketId == 'string' || typeof args.marketId == 'number' ? new Uint256(args.marketId) : null;
             if (!marketId)
                 throw new Error('Market id is required');
@@ -453,7 +453,7 @@ export namespace Router {
             if (!pairId)
                 throw new Error('Pair id is required');
 
-            const result = await Exchange.getAggregatedMatchesByMarketPair(marketId, pairId, Cursor.page(args.page || 0));
+            const result = await Exchange.getAggregatedLogsByMarketPair(marketId, pairId, Cursor.page(args.page || 0));
             return result;
         }
         static async getPairPolyAssets(args: { marketId?: string | number, pairId?: string | number }): Promise<{ primary: AssetId[], secondary: AssetId[] }> {

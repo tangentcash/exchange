@@ -1,6 +1,6 @@
 import { BigNumber } from "bignumber.js";
 import { AssetId, ByteUtil, DEX, Hashing, Pubkeyhash, Readability, Signing, Uint256, Whitelist } from 'tangentsdk';
-import { MarketPolicy, Market, Order, OrderCondition, OrderPolicy, OrderSide, Trade, AggregatedPair, AggregatedTrade, AggregatedLevel, AggregatedMatch, Block, RefType, Pool } from './../types';
+import { MarketPolicy, Market, Order, OrderCondition, OrderPolicy, OrderSide, Trade, AggregatedPair, AggregatedTrade, AggregatedLevel, AggregatedLog, Block, RefType, Pool, Depth } from './../types';
 import { Log } from './../logging';
 import { Common } from './../common';
 import { Blockchain, TransactionInfo } from './blockchain';
@@ -302,6 +302,19 @@ export class Exchange {
         );
         CREATE INDEX IF NOT EXISTS pools_pool_id ON pools USING hash (pool_id);
         
+        CREATE TABLE IF NOT EXISTS depths
+        (
+            pair_id BIGINT NOT NULL REFERENCES pairs (id) ON DELETE CASCADE,
+            market_id BIGINT NOT NULL REFERENCES markets (id) ON DELETE CASCADE,
+            pool_id BIGINT NOT NULL REFERENCES pools (id) ON DELETE CASCADE,
+            account_id BIGINT NOT NULL REFERENCES accounts (id) ON DELETE CASCADE,
+            block_number BIGINT NOT NULL REFERENCES blocks (block_number) ON DELETE CASCADE,
+            price NUMERIC(96, 18) NOT NULL,
+            quantity NUMERIC(96, 18) NOT NULL,
+            time BIGINT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS depths_pair_id_time ON depths (pair_id, time DESC);
+        
         CREATE TABLE IF NOT EXISTS trades
         (
             pair_id BIGINT NOT NULL,
@@ -391,8 +404,9 @@ export class Exchange {
 
             accounts[marketAccount] = accountId;
             const market = await this.getMarketByAccountId(accountId, connection);
-            if (market != null)
-                await this.cleanupTrades(market.id, blockNumber, connection);
+            if (market != null) {
+                await this.cleanupLogs(market.id, blockNumber, connection);
+            }
         }
         
         const orders: Record<string, { orderId: Uint256, pseudoRef: PseudoOrder | null, primaryQuantity: BigNumber, secondaryQuantity: BigNumber }> = { };
@@ -729,6 +743,7 @@ export class Exchange {
             }
         }
 
+        let timeOffset = 0;
         for (let target in pools) {
             const event = pools[target];
             try {
@@ -802,11 +817,35 @@ export class Exchange {
                         lastBidPrice: new BigNumber(0),
                         active: pool != null
                     }, connection);
+                    if (result != null) {
+                        await this.setDepth({
+                            poolId: result.id,
+                            pairId: pairId,
+                            marketId: market.id,
+                            accountId: accounts[account],
+                            blockNumber: blockNumber,
+                            price: result.price,
+                            quantity: result.primaryValue.plus(result.primaryRevenue).plus(result.secondaryValue.plus(result.secondaryRevenue).dividedBy(result.price)),
+                            time: new Date(blockTime.getTime() + 100 * timeOffset++)
+                        }, connection);
+                    }
                 } catch {
                     const prevPool = await this.getPoolByPoolId(event.poolId, connection);
                     if (prevPool) {
                         prevPool.active = false;
                         result = await this.setPool(prevPool, connection);
+                        if (result != null) {
+                            await this.setDepth({
+                                poolId: result.id,
+                                pairId: result.pairId,
+                                marketId: result.marketId,
+                                accountId: result.accountId,
+                                blockNumber: blockNumber,
+                                price: result.price,
+                                quantity: result.primaryValue.plus(result.primaryRevenue).plus(result.secondaryValue.plus(result.secondaryRevenue).dividedBy(result.price)).negated(),
+                                time: new Date(blockTime.getTime() + 100 * timeOffset++)
+                            }, connection);
+                        }
                     }
                 }
 
@@ -887,7 +926,7 @@ export class Exchange {
                     side: event.side,
                     price: event.price,
                     quantity: event.quantity,
-                    time: new Date(blockTime.getTime() + 100 * i)
+                    time: new Date(blockTime.getTime() + 100 * (timeOffset + i))
                 };
                 const result = await this.setTrade(trade, connection);
                 if (result != null) {
@@ -2084,6 +2123,38 @@ export class Exchange {
             return [];
         }
     }
+    static async setDepth(depth: Omit<Depth, 'id'>, connection?: pq.TransactionSql): Promise<Depth | null> {
+        const sql = connection || this.connection;
+        const result = await this.resultOf(sql`
+        INSERT INTO depths
+        (
+            pair_id,
+            market_id,
+            pool_id,
+            account_id,
+            block_number,
+            price,
+            quantity,
+            time
+        )
+        VALUES
+        (
+            ${depth.pairId.toString()},
+            ${depth.marketId.toString()},
+            ${depth.poolId.toString()},
+            ${depth.accountId.toString()},
+            ${depth.blockNumber},
+            ${depth.price.toString()},
+            ${depth.quantity.toString()},
+            ${depth.time.getTime()}
+        )
+        RETURNING *`);
+        try {
+            return this.toDepth(result[0]);
+        } catch {
+            return null;
+        }
+    }
     static async setTrade(trade: Omit<Trade, 'id'>, connection?: pq.TransactionSql): Promise<Trade | null> {
         const sql = connection || this.connection;
         const result = await this.resultOf(sql`
@@ -2124,20 +2195,12 @@ export class Exchange {
             return null;
         }
     }
-    static async cleanupTrades(marketId: Uint256, blockNumber: number, connection?: pq.TransactionSql): Promise<void> {
+    static async cleanupLogs(marketId: Uint256, blockNumber: number, connection?: pq.TransactionSql): Promise<void> {
         const sql = connection || this.connection;
         try {
+            await this.resultOf(sql`DELETE FROM depths WHERE market_id = ${marketId.toString()} AND block_number = ${blockNumber}`);
             await this.resultOf(sql`DELETE FROM trades WHERE market_id = ${marketId.toString()} AND block_number = ${blockNumber}`);
         } catch { }
-    }
-    static async getTradeById(id: Uint256, connection?: pq.TransactionSql): Promise<Trade | null> {
-        const sql = connection || this.connection;
-        const result = await this.resultOf(sql`SELECT * FROM trades WHERE id = ${id.toString()}`);
-        try {
-            return this.toTrade(result[0]);
-        } catch {
-            return null;
-        }
     }
     static async getAggregatedTradesByPairId(pairId: Uint256, cursor: TimeCursor, connection?: pq.TransactionSql): Promise<AggregatedTrade[]> {
         const sql = connection || this.connection;
@@ -2232,29 +2295,45 @@ export class Exchange {
             close: base.close
         }));
     }
-    static async getAggregatedMatchesByMarketPair(marketId: Uint256, pairId: Uint256, cursor: Cursor, connection?: pq.TransactionSql): Promise<AggregatedMatch[]> {
+    static async getAggregatedLogsByMarketPair(marketId: Uint256, pairId: Uint256, cursor: Cursor, connection?: pq.TransactionSql): Promise<AggregatedLog[]> {
         const sql = connection || this.connection;
         const result = await this.resultOf(sql`
-        SELECT
-	        COALESCE(taker_account.hash, maker_account.hash) AS account_hash,
-            time,
-            side,
-            price,
-            quantity
-        FROM trades
-            LEFT JOIN accounts maker_account ON maker_account.id = maker_account_id
-            LEFT JOIN accounts taker_account ON taker_account.id = taker_account_id
-        WHERE pair_id = ${pairId.toString()} AND market_id = ${marketId.toString()} AND (maker_account.hash IS NOT NULL OR taker_account.hash IS NOT NULL)
-        ORDER BY time DESC
-        LIMIT ${cursor.count} OFFSET ${cursor.offset}`);
+        (
+            SELECT
+                accounts.hash AS account_hash,
+                time,
+                10 AS side,
+                price,
+                quantity
+            FROM depths
+                LEFT JOIN accounts ON accounts.id = account_id
+            WHERE pair_id = ${pairId.toString()} AND market_id = ${marketId.toString()}
+        )
+        UNION ALL
+        (
+            SELECT
+                COALESCE(taker_account.hash, maker_account.hash) AS account_hash,
+                time,
+                side,
+                price,
+                quantity
+            FROM trades
+                LEFT JOIN accounts maker_account ON maker_account.id = maker_account_id
+                LEFT JOIN accounts taker_account ON taker_account.id = taker_account_id
+            WHERE pair_id = ${pairId.toString()} AND market_id = ${marketId.toString()} AND (maker_account.hash IS NOT NULL OR taker_account.hash IS NOT NULL)
+        )
+        ORDER BY time DESC LIMIT ${cursor.count} OFFSET ${cursor.offset}`);
         try {
-            return result.map((item) => ({
-                time: Common.num(item['time']) || new Date().getTime(),
-                account: item['account_hash'] ? Signing.encodeAddress(new Pubkeyhash(new Uint8Array(item['account_hash']))) || '' : '',
-                side:  Common.num(item['side']) as OrderSide,
-                price: Common.bn(item['price']) || new BigNumber(0),
-                quantity: Common.bn(item['quantity']) || new BigNumber(0)
-            }));
+            return result.map((item) => {
+                const side = Common.num(item['side']);
+                return {
+                    time: Common.num(item['time']) || new Date().getTime(),
+                    account: item['account_hash'] ? Signing.encodeAddress(new Pubkeyhash(new Uint8Array(item['account_hash']))) || '' : '',
+                    side: side == 10 ? 'lp' : side as OrderSide,
+                    price: Common.bn(item['price']) || new BigNumber(0),
+                    quantity: Common.bn(item['quantity']) || new BigNumber(0)
+                }
+            });
         } catch {
             return [];
         }
@@ -2551,6 +2630,18 @@ export class Exchange {
             takerAccountId: Common.u256(value['taker_account_id']),
             blockNumber: value['block_number'] || null,
             side: value['side'] as OrderSide,
+            price: new BigNumber(value['price']),
+            quantity: new BigNumber(value['quantity']),
+            time: new Date(value['time'])
+        };
+    }
+    private static toDepth(value: pq.Row): Depth {
+        return {
+            pairId: new Uint256(value['pair_id']),
+            marketId: Common.u256(value['market_id']) || new Uint256(0),
+            poolId: Common.u256(value['pool_id']) || new Uint256(0),
+            accountId: Common.u256(value['account_id']) || new Uint256(0),
+            blockNumber: value['block_number'] || 0,
             price: new BigNumber(value['price']),
             quantity: new BigNumber(value['quantity']),
             time: new Date(value['time'])
