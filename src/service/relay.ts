@@ -353,12 +353,16 @@ export namespace Router {
             const marketId = new Uint256(args.marketId);
             return await Exchange.getRoutingPathsByAssetIds(marketId, assetIdIn, assetIdOut, amountIn, slippage, 6);
         }
-        static async getPrice(args: { primaryAssetHash?: string, secondaryAssetHash?: string }): Promise<BigNumber | null> {
+        static async getPrice(args: { primaryAssetHash?: string, secondaryAssetHash?: string, interval?: BigNumber | string | number }): Promise<BigNumber | null> {
             if (typeof args.primaryAssetHash != 'string')
                 throw new Error('Primary asset hash is required');
 
             if (typeof args.secondaryAssetHash != 'string')
                 throw new Error('Secondary asset hash is required');
+
+            const interval = typeof args.interval == 'string' || typeof args.interval == 'number' ? 1000 * new Uint256(args.interval).toInteger() : null;
+            if (args.interval && !interval)
+                throw new Error('interval is not valid');
 
             const primaryAssetId = await Exchange.getAssetIdByHash(new AssetId(args.primaryAssetHash), true);
             if (!primaryAssetId)
@@ -368,7 +372,7 @@ export namespace Router {
             if (!secondaryAssetId)
                 throw new Error('Secondary asset id not found');
 
-            const price = await Exchange.getAssetPrice(primaryAssetId, secondaryAssetId);
+            const price = interval ? await Exchange.getAssetTWAP(primaryAssetId, secondaryAssetId, interval) : await Exchange.getAssetPrice(primaryAssetId, secondaryAssetId);
             return price;
         }
         static async getPair(args: { id?: string | number, primaryAssetHash?: string, secondaryAssetHash?: string, createIfNotExists?: boolean }): Promise<AggregatedPair> {

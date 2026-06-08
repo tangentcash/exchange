@@ -1475,6 +1475,50 @@ export class Exchange {
 
         return price;
     }
+    static async getAssetTWAP(primaryAssetId: Uint256, secondaryAssetId: Uint256, interval: number, connection?: pq.TransactionSql): Promise<BigNumber | null> {
+        if (primaryAssetId.toString() == secondaryAssetId.toString()) {
+            return new BigNumber(1);
+        } else if (interval < 0) {
+            return null;
+        }
+
+        const sql = connection || this.connection;
+        const result = await this.resultOf(sql`
+        WITH points AS (
+            SELECT
+                (SELECT time FROM trades WHERE pair_id = ppair.id ORDER BY time DESC LIMIT 1) AS primary_time,
+                (SELECT time FROM trades WHERE pair_id = spair.id ORDER BY time DESC LIMIT 1) AS secondary_time,
+                ppair.id AS primary_pair,
+                spair.id AS secondary_pair,
+                passet.hash AS primary_asset,
+                sasset.hash AS secondary_asset
+            FROM assets passet
+                INNER JOIN assets sasset ON sasset.id = ${secondaryAssetId.toString()}
+                LEFT JOIN pairs ppair ON ppair.primary_asset_id = passet.id AND ppair.secondary_asset_id IS NULL
+                LEFT JOIN pairs spair ON spair.primary_asset_id = sasset.id AND ppair.secondary_asset_id IS NULL
+            WHERE passet.id = ${primaryAssetId.toString()}
+        )
+        SELECT
+            (SELECT SUM(price * GREATEST(quantity, 0.000001)) / SUM(GREATEST(quantity, 0.000001)) FROM trades WHERE pair_id = points.primary_pair AND time >= points.primary_time - ${interval}) AS primary_price,
+            (SELECT SUM(price * GREATEST(quantity, 0.000001)) / SUM(GREATEST(quantity, 0.000001)) FROM trades WHERE pair_id = points.secondary_pair AND time >= points.secondary_time - ${interval}) AS secondary_price,
+            points.primary_asset,
+            points.secondary_asset
+        FROM points`);
+        if (!result.length)
+            throw new Error('Pair not found');
+
+        const primaryAsset = new AssetId(new Uint8Array(result[0]['primary_asset']));
+        const primaryStable = Quotes.baseOf(symbolOf(primaryAsset)) != null;
+        const primaryPrice = Common.bn(result[0]['primary_price']) || (primaryStable ? new BigNumber(1) : new BigNumber(NaN));
+        const secondaryAsset = new AssetId(new Uint8Array(result[0]['secondary_asset']));
+        const secondaryStable = Quotes.baseOf(symbolOf(secondaryAsset)) != null;
+        const secondaryPrice = Common.bn(result[0]['secondary_price']) || (secondaryStable ? new BigNumber(1) : new BigNumber(NaN));
+        const price = primaryPrice.dividedBy(secondaryPrice);
+        if (!price.isFinite())
+            throw new Error('Price not found');
+
+        return price;
+    }
     static async getAssetHandles(connection?: pq.TransactionSql): Promise<AssetId[]> {
         const sql = connection || this.connection;
         const result = await this.resultOf(sql`SELECT hash FROM assets`);
