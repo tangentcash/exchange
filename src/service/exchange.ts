@@ -817,7 +817,7 @@ export class Exchange {
                         lastBidPrice: new BigNumber(0),
                         active: pool != null
                     }, connection);
-                    if (result != null) {
+                    if (result != null && pseudoPool != null) {
                         await this.setDepth({
                             poolId: result.id,
                             pairId: pairId,

@@ -40,7 +40,7 @@ export type QuoteSources = {
 
 export class Quotes {
     static currencies: string[][] = [
-        ["USD", "USDT", "USDC", "USDe", "DAI", "USD1", "FDUSD", "FDUSD", "PYUSD", "RLUSD", "TUSD", "USDD", "USDf", "USD0", "USDG", "GHO", "DEUSD", "AUSD", "USDN", "FRXUSD", "XUSD", "USDL", "USDB", "USDP"]
+        ["USD", "USDT", "USDC", "DAI"]
     ];
     static quotes: QuoteSources = { realtime: { }, fallback: { } };
     static blacklist: Record<string, Set<string>> = { };

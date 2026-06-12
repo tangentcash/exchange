@@ -63,16 +63,6 @@ async function main(): Promise<void> {
         if (options.jobs?.blockSync === true) {
             await Blockchain.sync();
         }
-        if (typeof options.jobs?.assetPrices == 'object') {
-            const setup = options.jobs.assetPrices;
-            if (typeof setup.realtime == 'object' && typeof setup.fallback == 'object' && typeof setup.frequency == 'number') {
-                Quotes.setSources({
-                    realtime: setup.realtime || { },
-                    fallback: setup.fallback || { }
-                });
-                await Jobs.runAssetPrices(setup.frequency);
-            }
-        }
         if (typeof options.jobs?.assetsCleanup == 'number') {
             await Jobs.runAssetCleanup(options.jobs.assetsCleanup);
         }
@@ -81,6 +71,17 @@ async function main(): Promise<void> {
         }
         if (typeof options.jobs?.marketData == 'number') {
             await Jobs.runMarketData(options.jobs.marketData);
+        }
+        if (typeof options.jobs?.assetPrices == 'object') {
+            const setup = options.jobs.assetPrices;
+            if (typeof setup.realtime == 'object' && typeof setup.fallback == 'object' && typeof setup.frequency == 'number') {
+                Quotes.setSources({
+                    realtime: setup.realtime || { },
+                    fallback: setup.fallback || { }
+                });
+                Jobs.runAssetPrices(setup.frequency);
+                Log.info('background jobs: asset price resolver now running');
+            }
         }
         Log.info('background jobs: OK');
     } catch (exception: any) {
