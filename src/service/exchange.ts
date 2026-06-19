@@ -1716,6 +1716,51 @@ export class Exchange {
             takerFee: Common.bn(result[0]['taker_fee']) || null
         };
     }
+    static async getOverallMetrics(connection?: pq.TransactionSql): Promise<{ assets: number, pairs: number, accounts: number, actions: number, quantity: BigNumber, volume: BigNumber } | null> {
+        const sql = connection || this.connection;
+        const result = await this.resultOf(sql`
+        SELECT
+            (SELECT COUNT(1) FROM assets) AS assets,
+            (SELECT COUNT(1) FROM pairs WHERE primary_asset_id IS NOT NULL AND secondary_asset_id IS NOT NULL) AS pairs,
+            (SELECT COUNT(1) FROM accounts) AS accounts,
+            (SELECT (SELECT COUNT(1) FROM orders) + (SELECT COUNT(1) FROM pools)) AS actions,
+            (
+                WITH aggregations AS (
+                    SELECT
+                        (SELECT price FROM trades WHERE pair_id = (SELECT id FROM pairs WHERE primary_asset_id = asset_id AND secondary_asset_id IS NULL) ORDER BY time DESC LIMIT 1) AS price,
+                        SUM(value) AS value
+                    FROM balances GROUP BY asset_id
+                )
+                SELECT SUM(value * COALESCE(price, 0)) FROM aggregations
+            ) AS quantity,
+            (
+                WITH aggregations AS (
+                    SELECT
+                        (SELECT trades.price FROM trades WHERE trades.pair_id = (SELECT id FROM pairs WHERE primary_asset_id = (SELECT primary_asset_id FROM pairs WHERE pairs.id = depths.pair_id) AND secondary_asset_id IS NULL) ORDER BY time DESC LIMIT 1) AS price,
+                        SUM(quantity) AS value
+                    FROM depths WHERE quantity > 0 GROUP BY pair_id
+                    UNION ALL
+                    SELECT
+                        (SELECT trades.price FROM trades WHERE trades.pair_id = (SELECT t.id FROM pairs t WHERE t.primary_asset_id = pairs.primary_asset_id AND t.secondary_asset_id IS NULL) ORDER BY time DESC LIMIT 1) AS price,
+                        (SELECT SUM(quantity) FROM trades WHERE pair_id = pairs.id) AS value
+                    FROM pairs WHERE primary_asset_id IS NOT NULL AND secondary_asset_id IS NOT NULL
+                )
+                SELECT SUM(value * COALESCE(price, 0)) FROM aggregations
+            ) AS volume`);
+        try {
+            const value = result[0];
+            return {
+                assets: Common.num(value['assets']) || 0,
+                pairs: Common.num(value['pairs']) || 0,
+                accounts: Common.num(value['accounts']) || 0,
+                actions: Common.num(value['actions']) || 0,
+                quantity: Common.bn(value['quantity']) || new BigNumber(0),
+                volume: Common.bn(value['volume']) || new BigNumber(0)
+            };
+        } catch {
+            return null;
+        }
+    }
     static async setMarket(market: Omit<Market, 'id'>, connection?: pq.TransactionSql): Promise<Market | null> {
         const sql = connection || this.connection;
         const result = await this.resultOf(sql`

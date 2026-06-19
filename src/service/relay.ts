@@ -251,6 +251,7 @@ export namespace Router {
     export class Market {
         constructor(server: FastifyInstance) {
             Channel.register(server, 'get', '/market', Asset, Market.get);
+            Channel.register(server, 'get', '/market/metrics', Asset, Market.getMetrics);
             Channel.register(server, 'get', '/market/order', Asset, Market.getOrder);
             Channel.register(server, 'get', '/market/pool', Asset, Market.getPool);
             Channel.register(server, 'get', '/market/pools', Asset, Market.getPools);
@@ -264,6 +265,15 @@ export namespace Router {
             Channel.register(server, 'get', '/market/pair/price/series', Asset, Market.getPairPriceSeries);
             Channel.register(server, 'get', '/market/pair/price/levels', Asset, Market.getPairPriceLevels);
             Channel.register(server, 'get', '/markets', Asset, Market.getMarkets);
+        }
+        static async getMetrics(_: any, reply?: FastifyReply) {
+            if (reply != null) {
+                const expiration = new Date();
+                expiration.setDate(expiration.getDate() + 1);
+                reply.header('Cache-Control', 'public, max-age=86400');
+                reply.header('Expires', expiration.toUTCString());
+            }
+            return await Exchange.getOverallMetrics();
         }
         static async getMarkets() {
             return await Exchange.getMarkets();
