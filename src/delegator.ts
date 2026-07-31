@@ -92,7 +92,6 @@ async function main() {
     const feeRate = new BigNumber(config.feeRate || 0.0005);
     const range: number | null = config.range || 0.05;
     while (true) {
-        const queue: [string, Promise<string>][] = [];
         const delegatedPools: {
             primaryAsset: string;
             secondaryAsset: string;
@@ -145,7 +144,7 @@ async function main() {
 
                 primaryValue = BigNumber.min(primaryReserve, primaryValue);
                 secondaryValue = BigNumber.min(secondaryReserve, secondaryValue);
-                queue.push([poolId, send(address, (nonce: Uint256, gasPrice: BigNumber, gasLimit: Uint256) => {
+                const transactionHash = await send(address, (nonce: Uint256, gasPrice: BigNumber, gasLimit: Uint256) => {
                     const transaction = {
                         signature: new Hashsig(),
                         asset: new AssetId(),
@@ -167,20 +166,10 @@ async function main() {
                     stream = new Stream();
                     SchemaUtil.store(stream, { ...transaction, signature: signature }, new Transactions.Call());
                     return stream;
-                })]);
-                Log.info(`LP ${poolId} transfer pending (price: ${price.toString()})`);
+                });
+                Log.info(`LP ${poolId} transfer finalized (price: ${price.toString()}, tx: ${transactionHash})`);
             } catch (exception) {
                 Log.error(`LP ${maybePoolId || '(null)'} transfer failed:`, exception);
-            }
-        }
-
-        for (let i = 0; i < queue.length; i++) {
-            const [poolId, transfer] = queue[i];
-            try {
-                const transactionHash = await transfer;
-                Log.info(`LP ${poolId} transfer finalized (tx: ${transactionHash})`);
-            } catch (exception) {
-                Log.error(`LP ${poolId} transfer failed:`, exception);
             }
         }
 
