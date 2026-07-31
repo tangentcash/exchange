@@ -12,10 +12,12 @@ export class Common {
             case 'number':
                 return new BigNumber(value).toNumber();
             default:
-                if (value instanceof Uint256)
-                    return new BigNumber(value.toString()).toNumber();
-                if (BigNumber.isBigNumber(value))
-                    return value.toNumber();
+                if (value !== undefined && value !== null) {
+                    if (value instanceof Uint256)
+                        return new BigNumber(value.toString()).toNumber();
+                    if (BigNumber.isBigNumber(value))
+                        return value.toNumber();
+                }
                 return undefined;
         }
     }
@@ -26,10 +28,12 @@ export class Common {
             case 'number':
                 return new BigNumber(value);
             default:
-                if (value instanceof Uint256)
-                    return new BigNumber(value.toString());
-                if (BigNumber.isBigNumber(value))
-                    return value;
+                if (value !== undefined && value !== null) {
+                    if (value instanceof Uint256)
+                        return new BigNumber(value.toString());
+                    if (BigNumber.isBigNumber(value))
+                        return value;
+                }
                 return undefined;
         }
     }
@@ -41,14 +45,16 @@ export class Common {
             case 'number':
                 return new Uint256(value);
             default:
-                if (value instanceof Uint8Array)
-                    return new Uint256(value);
-                if (Buffer.isBuffer(value))
-                    return new Uint256(new Uint8Array(value));
-                if (BigNumber.isBigNumber(value))
-                    return new Uint256(value.toFixed(0));
-                if (value instanceof Uint256)
-                    return value;
+                if (value !== undefined && value !== null) {
+                    if (value instanceof Uint8Array)
+                        return new Uint256(value);
+                    if (Buffer.isBuffer(value))
+                        return new Uint256(new Uint8Array(value));
+                    if (BigNumber.isBigNumber(value))
+                        return new Uint256(value.toFixed(0));
+                    if (value instanceof Uint256)
+                        return value;
+                }
                 return undefined;
         }
     }

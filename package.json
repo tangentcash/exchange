@@ -4,8 +4,10 @@
   "main": "dist/app.js",
   "scripts": {
     "make": "tsc",
-    "app": "node dist/app.js",
-    "redo": "tsc && node dist/app.js"
+    "indexer": "node dist/indexer.js",
+    "delegator": "node dist/delegator.js",
+    "make:indexer": "tsc && node dist/indexer.js",
+    "make:delegator": "tsc && node dist/delegator.js"
   },
   "dependencies": {
     "@fastify/cors": "11.1.0",

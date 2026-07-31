@@ -266,6 +266,7 @@ class address
 	real320 reserve_of(const uint256&in) const;
 	bool callable(const string&in) const;
 	t static_call<t>(const string&in, const ?&in...) const;
+	t protected_call<t>(const string&in, const payable&in, const ?&in...) const;
 	t call<t>(const string&in, const payable&in, const ?&in...) const;
 	bool opEquals(const address&in) const;
 }
@@ -321,6 +322,23 @@ class mapping<k, v>
 	void insert_if(bool, const k&in, const v&in);
 	const v& opIndex(const k&in) const;
 	bool has(const k&in) const;
+}
+class listing<v>
+{
+	~listing();
+	listing(int&in);
+	uint size() const;
+	bool empty() const;
+	void clear();
+	void erase(uint);
+	void set(uint, const v&in);
+	void push(const v&in);
+	void push_front(const v&in);
+	void pop();
+	void pop_front();
+	const v& front() const;
+	const v& back() const;
+	const v& opIndex(uint) const;
 }
 class ranging<c, r, v>
 {

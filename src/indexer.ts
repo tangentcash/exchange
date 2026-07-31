@@ -47,10 +47,9 @@ async function main(): Promise<void> {
     try {
         const blockchain: any = options.blockchain || { };
         Log.info('blockchain client setup (network: ' + (blockchain.network || 'default') + ', validator: ' + (blockchain.validator || 'null') + ')');
-        Log.info('blockchain event sources:', blockchain.markets || { });
         await Blockchain.setup({
             validator: blockchain.validator,
-            markets: blockchain.markets,
+            contracts: blockchain.contracts,
             network: blockchain.network || undefined
         });
     } catch (exception: any) {

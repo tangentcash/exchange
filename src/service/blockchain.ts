@@ -1,11 +1,11 @@
-import { AssetId, Chain, DEX, Pubkeyhash, RPC, Signing, Types, Uint256 } from "tangentsdk";
+import { AssetId, Chain, Spot, Pubkeyhash, RPC, Signing, Types, Uint256 } from "tangentsdk";
 import { Log } from "./../logging";
 import { Exchange } from "./exchange";
 import { BigNumber } from "bignumber.js";
 
 export type Options = {
     validator?: string;
-    markets?: Record<string, string>;
+    contracts?: Record<string, Record<string, string>>;
     network?: 'regtest' | 'testnet' | 'mainnet'
 }
 
@@ -23,35 +23,43 @@ export type BlockchainInfo = AssetId & {
     routingPolicy: string
 }
 
-export type TransactionInfo = {
+export type EventInfo = {
     hash: string;
     fromAccount: string;
     toAccount: string;
-    method: string;
+    method: string | null;
     args: any[],
     pays: { asset: AssetId, value: BigNumber }[];
-    events: { type: number, args: any[] }[];
+    event: { type: number, args: any[] };
 };
 
 export class Blockchain {
-    static markets: {
-        versions: Record<string, string>,
-        accounts: string[]
-    } = { versions: { }, accounts: [] };
+    static contracts: {
+        versions: Record<string, Record<string, string>>;
+        accounts: Record<string, { version: string, type: string }>;
+        topics: string[];
+    } = { versions: { }, accounts: { }, topics: [] };
     static blockchains: BlockchainInfo[] | null = null;
     static timer: number | null = null;
     static syncing: boolean;
 
+    static accountOf(account: string): ({ account: string, version: string, type: string }) | null {
+        const result = this.contracts.accounts[account];
+        return result ? { account: account, ...result } : null;
+    }
     static async setup(config: Options): Promise<void> {
         if (config.network && ['regtest', 'testnet', 'mainnet'].includes(config.network))
             Chain.props = Chain[config.network];
 
-        if (typeof config.markets == 'object') {
-            const targets = config.markets;
-            this.markets.accounts = Object.keys(targets).map(x => targets[x]);
-            this.markets.versions = { };
-            for (let version in targets) {
-                this.markets.versions[targets[version]] = version;
+        if (typeof config.contracts == 'object') {
+            this.contracts.accounts = { };
+            this.contracts.versions = config.contracts;
+            this.contracts.topics = Object.keys(this.contracts.versions).map(x => this.contracts.versions[x]).map((x) => [x.dex, x.dlp]).flat().filter(x => x != null);
+            for (let version in this.contracts.versions) {
+                const types = this.contracts.versions[version];
+                for (let type in types) {
+                    this.contracts.accounts[types[type]] = { version: version, type: type };
+                }
             }
         }
         RPC.applyValidator(config.validator || null);
@@ -61,7 +69,7 @@ export class Blockchain {
             onNodeResponse: (method: string, message: any, _: number) => Log.query(`blockchain return (method: ${method}):`, message),
             onNodeError: (method: string, error: unknown) => Log.error(`blockchain call ${method}: ${(error as any)?.message || error}`)
         });
-        return await this.reconfigure();
+        return await this.keepAlive(true);
     }
     static async shutdown(): Promise<void> {
         if (this.timer != null) {
@@ -71,29 +79,38 @@ export class Blockchain {
         if (RPC.socket != null)
             await RPC.disconnectSocket();
     }
-    static async reconfigure(): Promise<void> {
-        await this.shutdown();
-        if (this.markets.accounts.length > 0) {
-            RPC.applyTopics(this.markets.accounts, true);
-            const result = await RPC.connectSocket();
-            if (!result)
-                throw new Error('rpc connection failed');
-
-            this.timer = setInterval(() => RPC.connectSocket(), 15000) as any;
+    static async keepAlive(healthCheck: boolean = false, hadConnection: boolean = false): Promise<void> {
+        try {
+            if (!RPC.socket || !hadConnection) {
+                await RPC.unsubscribeTopics();
+                const result = await RPC.subscribeTopics(this.contracts.topics, true);
+                if (!RPC.socket || result == null) {
+                    throw new Error('rpc unreachable');
+                } else if (!hadConnection) {
+                    Log.info('blockchain rpc acquired (topics: ' + (result != null ? result.toString() : 'null') + ')');
+                    hadConnection = true;
+                }
+            }
+        } catch (exception) {
+            Log.error('blockchain rpc connection error:', exception);
+            hadConnection = false;
+        }
+        if (healthCheck) {
+            this.timer = setTimeout(() => this.keepAlive(healthCheck, hadConnection), 5000) as any;
         }
     }
     static async sync(tipBlockNumber?: number): Promise<void> {
-        if (!this.markets.accounts.length || this.syncing)
+        if (!this.contracts.topics.length || this.syncing)
             return;
 
         this.syncing = true;
         try {
             let pendingQueue: number[] = [];
             let syncedBlock = await Exchange.getLatestBlock();
-            for (let i = 0; i < this.markets.accounts.length; i++) {
+            for (let i = 0; i < this.contracts.topics.length; i++) {
                 const queue: number[] = [];
                 while (true) {
-                    const transactions = await RPC.getTransactionsByOwner(this.markets.accounts[i], queue.length, queue.length > 0 ? 32 : 1, 0, 2);
+                    const transactions = await RPC.getTransactionsByOwner(this.contracts.topics[i], queue.length, queue.length > 0 ? 32 : 1, 0, 2);
                     if (!Array.isArray(transactions) || !transactions.length)
                         break;
                     
@@ -197,7 +214,7 @@ export class Blockchain {
     static async dispatchBlock(number: number): Promise<void> {
         const transactions = await RPC.getBlockTransactionsByNumber(number, 3);
         let accounts: string[] = [], matches = 0;
-        let results: Record<string, TransactionInfo[]> = { };
+        let results: Record<string, EventInfo[]> = { };
         if (Array.isArray(transactions)) {
             for (let i = 0; i < transactions.length; i++) {
                 const result = transactions[i];
@@ -234,33 +251,30 @@ export class Blockchain {
                 for (let j = 0; j < subtransactions.length; j++) {
                     const target = subtransactions[j];
                     const toAccount = target.transaction.callable || '';
-                    if ((target.transaction.type != 'call' && target.transaction.type != 'deploy') || this.markets.accounts.indexOf(toAccount) == -1)
+                    if (target.transaction.type != 'call' && target.transaction.type != 'deploy')
                         continue;
                     
-                    const filteredEvents = [];
-                    for (let i = 0; i < target.events.length; i++) {
-                        const item = target.events[i];
-                        const event = BigNumber.isBigNumber(item.event) ? item.event.toNumber() : parseInt(item.event);
-                        if (dispatchableEvents.indexOf(event) != -1) {
-                            filteredEvents.push({ type: event, args: item.args });
-                        }
-                    }
-                    
-                    const subresult = {
+                    const events = target.events.map((x) => ({
                         hash: target.transaction.hash || '',
                         fromAccount: target.sender || '',
-                        toAccount: toAccount,
-                        method: target.transaction.function || DEX.Spot.construct,
+                        toAccount: x.emitter || toAccount,
+                        method: target.transaction.function || null,
                         args: target.transaction.args || [],
                         pays: target.transaction.pays || [],
-                        events: filteredEvents
-                    };
-                    const subresults = results[subresult.toAccount];
-                    if (subresults != null)
-                        subresults.push(subresult);
-                    else
-                        results[subresult.toAccount] = [subresult];
-                    ++matches;
+                        event: {
+                            type: BigNumber.isBigNumber(x.event) ? x.event.toNumber() : parseInt(x.event),
+                            args: x.args
+                        }
+                    })).filter((x) => this.contracts.topics.indexOf(x.toAccount) != -1 && dispatchableEvents.indexOf(x.event.type) != -1);
+                    for (let i = 0; i < events.length; i++) {
+                        const event = events[i];
+                        const subresults = results[event.toAccount];
+                        if (subresults != null)
+                            subresults.push(event);
+                        else
+                            results[event.toAccount] = [event];
+                        ++matches;
+                    }
                 }
             }
         }
@@ -269,10 +283,14 @@ export class Blockchain {
         const blockTime = new BigNumber(block.generation_time);
         const blockDate = blockTime.isNaN() ? new Date() : new Date(blockTime.toNumber());
         const blockHash = new Uint256(block.hash, 16);
+        const blockRef = { number: number, time: blockDate };
         await Exchange.setBlock({ blockNumber: number, blockHash: blockHash }, accounts);
         for (let account in results) {
             try {
-                await Exchange.dispatchTransactions(number, blockDate, account, results[account]);
+                const accountRef = this.accountOf(account);
+                if (accountRef != null) {
+                    await Exchange.dispatchEvents(blockRef, accountRef, results[account]);
+                }
             } catch (exception) {
                 Log.error(`failed to dispatch block events (block: ${number}, account: ${account}):`, exception);
             }
@@ -288,9 +306,11 @@ export class Blockchain {
 }
 
 export const dispatchableEvents: number[] = [
-    DEX.Spot.Events.Config,
-    DEX.Spot.Events.Order,
-    DEX.Spot.Events.Pool,
-    DEX.Spot.Events.Swap,
-    DEX.Spot.Events.AssetTier
+    Spot.DEX.Events.Config,
+    Spot.DEX.Events.Order,
+    Spot.DEX.Events.Pool,
+    Spot.DEX.Events.Swap,
+    Spot.DEX.Events.AssetTier,
+    Spot.DLP.Events.Config,
+    Spot.DLP.Events.PoolRefEvent
 ];

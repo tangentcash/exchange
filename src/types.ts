@@ -101,7 +101,13 @@ export type AggregatedLevel = {
     id: Uint256,
     price: BigNumber,
     quantity: BigNumber,
-    iceberg: boolean
+    curve?: {
+        minPrice: BigNumber | null,
+        maxPrice: BigNumber | null,
+        primaryValue: BigNumber,
+        secondaryValue: BigNumber,
+        feeRate: BigNumber
+    }
 }
 
 export type Order = {
@@ -140,6 +146,9 @@ export type Pool = {
     marketAccount?: string;
     accountId: Uint256;
     blockNumber: number;
+    initialPrice: BigNumber;
+    initialPrimaryValue: BigNumber;
+    initialSecondaryValue: BigNumber;
     primaryValue: BigNumber;
     secondaryValue: BigNumber;
     primaryRevenue: BigNumber;
@@ -148,6 +157,7 @@ export type Pool = {
     price: BigNumber;
     minPrice?: BigNumber;
     maxPrice?: BigNumber;
+    volume?: BigNumber;
     feeRate: BigNumber;
     exitFee: BigNumber;
     lastAskPrice: BigNumber;
@@ -179,4 +189,73 @@ export type Depth = {
     price: BigNumber;
     quantity: BigNumber;
     time: Date;
+}
+
+export type Delegator = {
+    id: Uint256;
+    marketId: Uint256;
+    accountId: Uint256;
+    account?: string;
+    deployerAccountId: Uint256;
+    deployerAccount?: string;
+    blockNumber: number;
+    rewardEmission: BigNumber;
+    rewardBalance: BigNumber;
+    permissions: {
+        primaryAssetId: Uint256;
+        primaryAsset: string;
+        secondaryAssetId: Uint256;
+        secondaryAsset: string;
+    }[];
+}
+
+export type DelegatedPool = {
+    id: Uint256;
+    pairId: Uint256;
+    marketId: Uint256;
+    marketAccount?: string;
+    delegatorId: Uint256;
+    delegatorAccount?: string;
+    accountId: Uint256;
+    primaryAsset?: string;
+    secondaryAsset?: string;
+    blockNumber: number;
+    rewardValue: BigNumber;
+    initialPrimaryValue: BigNumber;
+    initialSecondaryValue: BigNumber;
+    primaryValue: BigNumber;
+    secondaryValue: BigNumber;
+    primaryTotal?: BigNumber;
+    secondaryTotal?: BigNumber;
+    primaryReserve?: BigNumber;
+    secondaryReserve?: BigNumber;
+    allocationPrice?: BigNumber;
+    volume?: BigNumber;
+    share?: BigNumber;
+    feeRate?: BigNumber;
+    active: boolean;
+}
+
+export type PseudoDelegatedPool = {
+    marketId: Uint256;
+    pairId: Uint256;
+    delegatorId: Uint256;
+    marketAccount?: string;
+    delegatorAccount?: string;
+    primaryAsset?: string;
+    secondaryAsset?: string;
+    initialValue: BigNumber;
+    currentValue: BigNumber;
+    volume: BigNumber;
+    feeRate?: BigNumber;
+}
+
+export type PseudoDelegatedState = {
+    primaryAsset: string;
+    secondaryAsset: string;
+    delegatorAccount: string;
+    poolId: Uint256;
+    primaryLiquidity: BigNumber;
+    secondaryLiquidity: BigNumber;
+    price: BigNumber;
 }

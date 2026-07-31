@@ -1,9 +1,9 @@
 import { BigNumber } from "bignumber.js";
-import { AssetId, ByteUtil, DEX, Hashing, Pubkeyhash, Readability, Signing, Uint256, Whitelist } from 'tangentsdk';
-import { MarketPolicy, Market, Order, OrderCondition, OrderPolicy, OrderSide, Trade, AggregatedPair, AggregatedTrade, AggregatedLevel, AggregatedLog, Block, RefType, Pool, Depth } from './../types';
+import { AssetId, ByteUtil, Hashing, Pubkeyhash, Readability, Signing, Spot, Uint256, Whitelist } from 'tangentsdk';
+import { MarketPolicy, Market, Order, OrderCondition, OrderPolicy, OrderSide, Trade, AggregatedPair, AggregatedTrade, AggregatedLevel, AggregatedLog, Block, RefType, Pool, Depth, Delegator, DelegatedPool, PseudoDelegatedPool, PseudoDelegatedState } from './../types';
 import { Log } from './../logging';
 import { Common } from './../common';
-import { Blockchain, TransactionInfo } from './blockchain';
+import { Blockchain, EventInfo } from './blockchain';
 import { Quotes, symbolOf } from './market';
 import NodeCache from 'node-cache';
 import pq from 'postgres';
@@ -17,6 +17,8 @@ export enum Notification {
     AuthorizerResponse = 'response:authorizer',
     ChainUpdate = 'update:chain',
     MarketUpdate = 'update:market',
+    DelegatorUpdate = 'update:delegator',
+    DelegatedPoolUpdate = 'update:delegated-pool',
     OrderUpdate = 'update:order',
     PoolUpdate = 'update:pool',
     TradeUpdate = 'update:trade',
@@ -37,7 +39,7 @@ export type RouterPath = {
 }[];
 
 export type PseudoOrder = {
-    transaction: TransactionInfo,
+    transaction: EventInfo,
     primaryAsset: AssetId,
     secondaryAsset: AssetId,
     condition: OrderCondition;
@@ -52,7 +54,7 @@ export type PseudoOrder = {
 }
 
 export type PseudoPool = {
-    transaction: TransactionInfo,
+    transaction: EventInfo,
     primaryAsset: AssetId,
     secondaryAsset: AssetId,
     price: BigNumber;
@@ -176,6 +178,7 @@ export class Exchange {
             id BIGSERIAL,
             hash BYTEA NOT NULL UNIQUE,
             synced BOOLEAN DEFAULT FALSE,
+            auto_time BIGINT DEFAULT floor(EXTRACT(EPOCH FROM CURRENT_TIMESTAMP)),
             PRIMARY KEY (id)
         );
         CREATE INDEX IF NOT EXISTS accounts_hash ON accounts USING hash (hash);
@@ -184,6 +187,7 @@ export class Exchange {
         (
             id BIGSERIAL,
             hash BYTEA NOT NULL UNIQUE,
+            auto_time BIGINT DEFAULT floor(EXTRACT(EPOCH FROM CURRENT_TIMESTAMP)),
             PRIMARY KEY (id)
         );
         CREATE INDEX IF NOT EXISTS assets_hash ON assets USING hash (hash);
@@ -226,6 +230,19 @@ export class Exchange {
             asset_reset_days BIGINT NOT NULL,
             account_reset_days BIGINT NOT NULL,
             market_policy SMALLINT NOT NULL,
+            PRIMARY KEY (id)
+        );
+
+        CREATE TABLE IF NOT EXISTS delegators
+        (
+            id BIGSERIAL,
+            market_id BIGINT NOT NULL REFERENCES markets (id) ON DELETE CASCADE,
+            account_id BIGINT NOT NULL UNIQUE REFERENCES accounts (id) ON DELETE CASCADE,
+            deployer_account_id BIGINT NOT NULL REFERENCES accounts (id) ON DELETE CASCADE,
+            block_number BIGINT NOT NULL REFERENCES blocks (block_number) ON DELETE CASCADE,
+            reward_emission NUMERIC(96, 18) NOT NULL,
+            reward_balance NUMERIC(96, 18) NOT NULL,
+            permissions JSONB DEFAULT NULL,
             PRIMARY KEY (id)
         );
 
@@ -284,6 +301,9 @@ export class Exchange {
             market_id BIGINT NOT NULL REFERENCES markets (id) ON DELETE CASCADE,
             account_id BIGINT NOT NULL REFERENCES accounts (id) ON DELETE CASCADE,
             block_number BIGINT NOT NULL REFERENCES blocks (block_number) ON DELETE CASCADE,
+            initial_price NUMERIC(96, 18) NOT NULL,
+            initial_primary_value NUMERIC(96, 18) NOT NULL,
+            initial_secondary_value NUMERIC(96, 18) NOT NULL,
             primary_value NUMERIC(96, 18) NOT NULL,
             secondary_value NUMERIC(96, 18) NOT NULL,
             primary_revenue NUMERIC(96, 18) NOT NULL,
@@ -301,7 +321,25 @@ export class Exchange {
             UNIQUE (market_id, pool_id)
         );
         CREATE INDEX IF NOT EXISTS pools_pool_id ON pools USING hash (pool_id);
-        
+
+        CREATE TABLE IF NOT EXISTS delegated_pools
+        (
+            id BIGSERIAL,
+            pair_id BIGINT NOT NULL REFERENCES pairs (id) ON DELETE CASCADE,
+            market_id BIGINT NOT NULL REFERENCES markets (id) ON DELETE CASCADE,
+            delegator_id BIGINT NOT NULL REFERENCES delegators (id) ON DELETE CASCADE,
+            account_id BIGINT NOT NULL REFERENCES accounts (id) ON DELETE CASCADE,
+            block_number BIGINT NOT NULL REFERENCES blocks (block_number) ON DELETE CASCADE,
+            reward_value NUMERIC(96, 18) NOT NULL,
+            initial_primary_value NUMERIC(96, 18) NOT NULL,
+            initial_secondary_value NUMERIC(96, 18) NOT NULL,
+            primary_value NUMERIC(96, 18) NOT NULL,
+            secondary_value NUMERIC(96, 18) NOT NULL,
+            active BOOLEAN NOT NULL,
+            PRIMARY KEY (id),
+            UNIQUE (pair_id, market_id, delegator_id, account_id)
+        );
+
         CREATE TABLE IF NOT EXISTS depths
         (
             pair_id BIGINT NOT NULL REFERENCES pairs (id) ON DELETE CASCADE,
@@ -359,6 +397,41 @@ export class Exchange {
                 INNER JOIN assets passet ON passet.id = pairs.primary_asset_id
                 INNER JOIN assets sasset ON sasset.id = pairs.secondary_asset_id
                 INNER JOIN timings ON TRUE
+        );
+        CREATE MATERIALIZED VIEW IF NOT EXISTS pools_view AS (
+            WITH timings AS (
+                SELECT
+                    (SELECT EXTRACT(EPOCH FROM CURRENT_DATE::TIMESTAMP)::BIGINT * 1000) AS min_time,
+                    (SELECT EXTRACT(EPOCH FROM CURRENT_DATE::TIMESTAMP + INTERVAL '1 day')::BIGINT * 1000) AS max_time
+            )
+            SELECT
+                pools.id,
+                COALESCE((SELECT SUM(price * quantity) FROM trades WHERE pair_id = pools.pair_id AND time BETWEEN timings.min_time AND timings.max_time AND maker_pool_id = pools.id), 0.0) AS volume
+            FROM pools
+                INNER JOIN timings ON TRUE
+        );
+        CREATE MATERIALIZED VIEW IF NOT EXISTS delegators_view AS (
+            WITH sources AS (
+                SELECT
+                    delegators.id,
+                    delegators.account_id,
+                    delegated_pools.pair_id
+                FROM delegated_pools
+                    INNER JOIN delegators ON delegators.id = delegated_pools.delegator_id
+                GROUP BY delegators.id, delegators.account_id, delegated_pools.pair_id
+            ), timings AS (
+                SELECT
+                    (SELECT EXTRACT(EPOCH FROM CURRENT_DATE::TIMESTAMP)::BIGINT * 1000) AS min_time,
+                    (SELECT EXTRACT(EPOCH FROM CURRENT_DATE::TIMESTAMP + INTERVAL '1 day')::BIGINT * 1000) AS max_time
+            )
+            SELECT
+                sources.id,
+                sources.pair_id,
+                (SELECT COALESCE(SUM(trades.price * trades.quantity), 0) FROM trades
+                    INNER JOIN pools ON pools.id = maker_pool_id AND pools.account_id = sources.account_id
+                WHERE trades.pair_id = sources.pair_id AND time BETWEEN timings.min_time AND timings.max_time) AS volume
+            FROM sources
+                INNER JOIN timings ON TRUE
         )`.simple());
     }
     static async isolate<T>(callback: (sql: pq.TransactionSql) => T | Promise<T>) {
@@ -395,240 +468,474 @@ export class Exchange {
         await listener.unlisten();
         Log.info(`exchange ${channel} channel: shutdown`);
     }
-    static async dispatchTransactions(blockNumber: number, blockTime: Date, marketAccount: string, transactions: TransactionInfo[], connection?: pq.TransactionSql): Promise<void> {
+    static async dispatchEvents(block: { number: number, time: Date }, contract: { account: string, version: string, type: string }, events: EventInfo[], connection?: pq.TransactionSql): Promise<void> {
         const accounts: Record<string, Uint256> = { };
-        if (!accounts[marketAccount]) {
-            const accountId = await this.getAccountIdByAddress(marketAccount, false, connection);
+        if (!accounts[contract.account]) {
+            const accountId = await this.getAccountIdByAddress(contract.account, false, connection);
             if (!accountId)
-                throw new Error('cannot decode contract account ' + marketAccount);
+                throw new Error('cannot decode contract account ' + contract.account);
 
-            accounts[marketAccount] = accountId;
-            const market = await this.getMarketByAccountId(accountId, connection);
-            if (market != null) {
-                await this.cleanupLogs(market.id, blockNumber, connection);
+            accounts[contract.account] = accountId;
+            switch (contract.type) {
+                case 'dex': {
+                    const market = await this.getMarketByAccountId(accountId, connection);
+                    if (market != null) {
+                        await this.cleanupLogs(market.id, block.number, connection);
+                    }
+                    break;
+                }
             }
         }
         
+        let step = 0;
+        const pseudos: Record<string, any> = { };
         const orders: Record<string, { orderId: Uint256, pseudoRef: PseudoOrder | null, primaryQuantity: BigNumber, secondaryQuantity: BigNumber }> = { };
         const pools: Record<string, { poolId: Uint256, pseudoRef: PseudoPool | null, primaryQuantity: BigNumber, secondaryQuantity: BigNumber }> = { };
         const trades: { makerOrderOrPoolId: Uint256, makerOrderId: Uint256 | null, makerPoolId: Uint256 | null, takerOrderId: Uint256, side: OrderSide, price: BigNumber, quantity: BigNumber }[] = [];
-        for (let i = 0; i < transactions.length; i++) {
-            const transaction = transactions[i];
-            let pseudoOrder: PseudoOrder | null = null;
-            let pseudoPool: PseudoPool | null = null;
-            try {
-                const orderParameters = () => ({
-                    transaction: transaction,
-                    primaryAsset: new AssetId(transaction.args[0]),
-                    secondaryAsset: new AssetId(transaction.args[1]),
-                    side: parseInt(transaction.args[2].toString()) as OrderSide,
-                    policy: parseInt(transaction.args[3].toString()) as OrderPolicy,
-                    value: transaction.pays.reduce((x, y) => x.plus(y.value), new BigNumber(0))
-                });
-                switch (Readability.toFunction(transaction.method)) {
-                    case Readability.toFunction(DEX.Spot.marketOrder):
-                        pseudoOrder = {
-                            ...orderParameters(),
-                            condition: OrderCondition.Market,
-                            slippage: Common.bn(transaction.args[4]),
-                        };
-                        break;
-                    case Readability.toFunction(DEX.Spot.limitOrder):
-                        pseudoOrder = {
-                            ...orderParameters(),
-                            condition: OrderCondition.Limit,
-                            price: Common.bn(transaction.args[4]),
-                        };
-                        break;
-                    case Readability.toFunction(DEX.Spot.stopOrder):
-                        pseudoOrder = {
-                            ...orderParameters(),
-                            condition: OrderCondition.Stop,
-                            stopPrice: Common.bn(transaction.args[4]),
-                            slippage: Common.bn(transaction.args[5])
-                        };
-                        break;
-                    case Readability.toFunction(DEX.Spot.stopLimitOrder):
-                        pseudoOrder = {
-                            ...orderParameters(),
-                            condition: OrderCondition.StopLimit,
-                            stopPrice: Common.bn(transaction.args[4]),
-                            price: Common.bn(transaction.args[5])
-                        };
-                        break;
-                    case Readability.toFunction(DEX.Spot.trailingStopOrder):
-                        pseudoOrder = {
-                            ...orderParameters(),
-                            condition: OrderCondition.TrailingStop,
-                            stopPrice: Common.bn(transaction.args[4]),
-                            slippage: Common.bn(transaction.args[5]),
-                            trailingStep: Common.bn(transaction.args[6]),
-                            trailingDistance: Common.bn(transaction.args[7]),
-                        };
-                        break;
-                    case Readability.toFunction(DEX.Spot.trailingStopLimitOrder):
-                        pseudoOrder = {
-                            ...orderParameters(),
-                            condition: OrderCondition.TrailingStopLimit,
-                            stopPrice: Common.bn(transaction.args[4]),
-                            price: Common.bn(transaction.args[5]),
-                            trailingStep: Common.bn(transaction.args[6]),
-                            trailingDistance: Common.bn(transaction.args[7])
-                        };
-                        break;
-                    case Readability.toFunction(DEX.Spot.depositPool):
-                        pseudoPool = {
-                            transaction: transaction,
-                            primaryAsset: new AssetId(transaction.args[0]),
-                            secondaryAsset: new AssetId(transaction.args[1]),
-                            price: Common.bn(transaction.args[2]) || new BigNumber(0),
-                            minPrice: Common.bn(transaction.args[3]),
-                            maxPrice: Common.bn(transaction.args[4]),
-                            feeRate: Common.bn(transaction.args[5]) || new BigNumber(0),
-                        };
-                        break;
-                }
-            } catch { }
-    
-            for (let i = 0; i < transaction.events.length; i++) {
-                const event = transaction.events[i];
-                Log.query(`exchange ${marketAccount} event (type: ${event.type}, block: ${blockNumber}):`, event.args);
-                switch (event.type) {
-                    case DEX.Spot.Events.Config: {
-                        try {
-                            const market = await Blockchain.call(marketAccount, Readability.toFunction(DEX.Spot.paramsOf), []);
-                            if (market != null) {
-                                if (!accounts[market.deployer_account]) {
-                                    const accountId = await this.getAccountIdByAddress(market.deployer_account, false, connection);
-                                    if (!accountId)
-                                        throw new Error('cannot decode deployer account ' + market.deployer_account);
-                                    accounts[market.deployer_account] = accountId;
-                                }
-                                
-                                const result = await this.setMarket({
-                                    accountId: accounts[marketAccount],
-                                    deployerAccountId: accounts[market.deployer_account],
-                                    blockNumber: blockNumber,
-                                    poolExitFee: Common.bn(market.pool_exit_fee) || new BigNumber(0),
-                                    maxPoolFeeRate: Common.bn(market.max_pool_fee_rate) || new BigNumber(0),
-                                    minMakerFee: Common.bn(market.min_maker_fee) || new BigNumber(0),
-                                    maxMakerFee: Common.bn(market.max_maker_fee) || new BigNumber(0),
-                                    makerFeeExponent: Common.num(market.maker_fee_exponent) || 0,
-                                    minTakerFee: Common.bn(market.min_taker_fee) || new BigNumber(0),
-                                    maxTakerFee: Common.bn(market.max_taker_fee) || new BigNumber(0),
-                                    takerFeeExponent: Common.num(market.taker_fee_exponent) || 0,
-                                    assetVolumeTarget: Common.bn(market.asset_volume_target) || new BigNumber(0),
-                                    assetResetDays: Common.num(market.asset_reset_days) || 0,
-                                    accountResetDays: Common.num(market.account_reset_days) || 0,
-                                    marketPolicy: (Common.num(market.market_policy) || 0) as MarketPolicy
-                                }, connection);
-                                if (result != null) {
-                                    await this.notify(Notification.MarketUpdate, {
-                                        query: { },
-                                        args: {
-                                            marketId: result.id
-                                        }
+        for (let i = 0; i < events.length; i++) {
+            const log = events[i];
+            Log.query(`exchange ${contract.account} event (type: ${log.event.type}, block: ${block.number}):`, log.event.args);
+            switch (contract.type) {
+                case 'dex': {
+                    switch (log.event.type) {
+                        case Spot.DEX.Events.Config: {
+                            try {
+                                const market = await Blockchain.call(contract.account, Readability.toFunction(Spot.DEX.paramsOf), []);
+                                if (market != null) {
+                                    if (!accounts[market.deployer_account]) {
+                                        const accountId = await this.getAccountIdByAddress(market.deployer_account, false, connection);
+                                        if (!accountId)
+                                            throw new Error('cannot decode deployer account ' + market.deployer_account);
+                                        accounts[market.deployer_account] = accountId;
+                                    }
+                                    
+                                    const result = await this.setMarket({
+                                        accountId: accounts[contract.account],
+                                        deployerAccountId: accounts[market.deployer_account],
+                                        blockNumber: block.number,
+                                        poolExitFee: Common.bn(market.pool_exit_fee) || new BigNumber(0),
+                                        maxPoolFeeRate: Common.bn(market.max_pool_fee_rate) || new BigNumber(0),
+                                        minMakerFee: Common.bn(market.min_maker_fee) || new BigNumber(0),
+                                        maxMakerFee: Common.bn(market.max_maker_fee) || new BigNumber(0),
+                                        makerFeeExponent: Common.num(market.maker_fee_exponent) || 0,
+                                        minTakerFee: Common.bn(market.min_taker_fee) || new BigNumber(0),
+                                        maxTakerFee: Common.bn(market.max_taker_fee) || new BigNumber(0),
+                                        takerFeeExponent: Common.num(market.taker_fee_exponent) || 0,
+                                        assetVolumeTarget: Common.bn(market.asset_volume_target) || new BigNumber(0),
+                                        assetResetDays: Common.num(market.asset_reset_days) || 0,
+                                        accountResetDays: Common.num(market.account_reset_days) || 0,
+                                        marketPolicy: (Common.num(market.market_policy) || 0) as MarketPolicy
                                     }, connection);
+                                    if (result != null) {
+                                        await this.notify(Notification.MarketUpdate, {
+                                            query: { },
+                                            args: { marketId: result.id }
+                                        }, connection);
+                                    }
+                                }
+                                Log.info(`exchange ${contract.account} market update`);
+                            } catch (exception) {
+                                Log.error(`exchange ${contract.account} market update error:`, exception);
+                            }
+                            break;
+                        }
+                        case Spot.DEX.Events.Order: {
+                            let pseudo: PseudoOrder | null = null;
+                            if (!pseudos[log.hash]) {
+                                try {
+                                    const orderParameters = () => ({
+                                        transaction: log,
+                                        primaryAsset: new AssetId(log.args[0]),
+                                        secondaryAsset: new AssetId(log.args[1]),
+                                        side: parseInt(log.args[2].toString()) as OrderSide,
+                                        policy: parseInt(log.args[3].toString()) as OrderPolicy,
+                                        value: log.pays.reduce((x, y) => x.plus(y.value), new BigNumber(0))
+                                    });
+                                    switch (log.method ? Readability.toFunction(log.method) : null) {
+                                        case Readability.toFunction(Spot.DEX.marketOrder):
+                                            pseudo = {
+                                                ...orderParameters(),
+                                                condition: OrderCondition.Market,
+                                                slippage: Common.bn(log.args[4]),
+                                            };
+                                            break;
+                                        case Readability.toFunction(Spot.DEX.limitOrder):
+                                            pseudo = {
+                                                ...orderParameters(),
+                                                condition: OrderCondition.Limit,
+                                                price: Common.bn(log.args[4]),
+                                            };
+                                            break;
+                                        case Readability.toFunction(Spot.DEX.stopOrder):
+                                            pseudo = {
+                                                ...orderParameters(),
+                                                condition: OrderCondition.Stop,
+                                                stopPrice: Common.bn(log.args[4]),
+                                                slippage: Common.bn(log.args[5])
+                                            };
+                                            break;
+                                        case Readability.toFunction(Spot.DEX.stopLimitOrder):
+                                            pseudo = {
+                                                ...orderParameters(),
+                                                condition: OrderCondition.StopLimit,
+                                                stopPrice: Common.bn(log.args[4]),
+                                                price: Common.bn(log.args[5])
+                                            };
+                                            break;
+                                        case Readability.toFunction(Spot.DEX.trailingStopOrder):
+                                            pseudo = {
+                                                ...orderParameters(),
+                                                condition: OrderCondition.TrailingStop,
+                                                stopPrice: Common.bn(log.args[4]),
+                                                slippage: Common.bn(log.args[5]),
+                                                trailingStep: Common.bn(log.args[6]),
+                                                trailingDistance: Common.bn(log.args[7]),
+                                            };
+                                            break;
+                                        case Readability.toFunction(Spot.DEX.trailingStopLimitOrder):
+                                            pseudo = {
+                                                ...orderParameters(),
+                                                condition: OrderCondition.TrailingStopLimit,
+                                                stopPrice: Common.bn(log.args[4]),
+                                                price: Common.bn(log.args[5]),
+                                                trailingStep: Common.bn(log.args[6]),
+                                                trailingDistance: Common.bn(log.args[7])
+                                            };
+                                            break;
+                                    }
+                                } catch { }
+                                pseudos[log.hash] = { order: pseudo };
+                            }
+
+                            const orderId = new Uint256(log.event.args[0].toString());
+                            orders[orderId.toString()] = {
+                                orderId: orderId,
+                                pseudoRef: pseudo,
+                                primaryQuantity: new BigNumber(0),
+                                secondaryQuantity: new BigNumber(0)
+                            };
+                            break;
+                        }
+                        case Spot.DEX.Events.Pool: {
+                            let pseudo: PseudoPool | null = null;
+                            if (!pseudos[log.hash]) {
+                                try {
+                                    switch (log.method ? Readability.toFunction(log.method) : null) {
+                                        case Readability.toFunction(Spot.DEX.depositPool):
+                                            pseudo = {
+                                                transaction: log,
+                                                primaryAsset: new AssetId(log.args[0]),
+                                                secondaryAsset: new AssetId(log.args[1]),
+                                                price: Common.bn(log.args[2]) || new BigNumber(0),
+                                                minPrice: Common.bn(log.args[3]),
+                                                maxPrice: Common.bn(log.args[4]),
+                                                feeRate: Common.bn(log.args[5]) || new BigNumber(0),
+                                            };
+                                            break;
+                                    }
+                                } catch { }
+                                pseudos[log.hash] = { pool: pseudo };
+                            }
+
+                            const poolId = new Uint256(log.event.args[0].toString());
+                            pools[poolId.toString()] = {
+                                poolId: poolId,
+                                pseudoRef: pseudo,
+                                primaryQuantity: new BigNumber(0),
+                                secondaryQuantity: new BigNumber(0)
+                            };
+                            break;
+                        }
+                        case Spot.DEX.Events.Swap: {
+                            const refType = parseInt(log.event.args[2]) as RefType;
+                            const makerOrderOrPoolId = new Uint256(log.event.args[0].toString());
+                            const makerOrderId = refType == RefType.Order ? makerOrderOrPoolId : null;
+                            const makerPoolId = refType == RefType.Pool ? makerOrderOrPoolId : null;
+                            const takerOrderId = new Uint256(log.event.args[1].toString());
+                            const virtualTakerOrderRefId = takerOrderId.gt(0) ? takerOrderId : new Uint256(log.hash);
+                            const side = parseInt(log.event.args[3]) as OrderSide;
+                            const price = new BigNumber(log.event.args[4].toString());
+                            const quantity = new BigNumber(log.event.args[5].toString());
+                            if (makerOrderId != null) {
+                                orders[makerOrderId.toString()] = {
+                                    orderId: makerOrderId,
+                                    pseudoRef: null,
+                                    primaryQuantity: (orders[makerOrderId.toString()]?.primaryQuantity || new BigNumber(0)).plus(quantity),
+                                    secondaryQuantity: (orders[makerOrderId.toString()]?.secondaryQuantity || new BigNumber(0)).plus(price.multipliedBy(quantity))
+                                };
+                            }
+                            if (makerPoolId != null) {
+                                pools[makerPoolId.toString()] = {
+                                    poolId: makerPoolId,
+                                    pseudoRef: null,
+                                    primaryQuantity: (pools[makerPoolId.toString()]?.primaryQuantity || new BigNumber(0)).plus(quantity),
+                                    secondaryQuantity: (pools[makerPoolId.toString()]?.secondaryQuantity || new BigNumber(0)).plus(price.multipliedBy(quantity))
+                                };
+                            }
+                            orders[virtualTakerOrderRefId.toString()] = {
+                                orderId: virtualTakerOrderRefId,
+                                pseudoRef: takerOrderId.gt(0) ? orders[virtualTakerOrderRefId.toString()]?.pseudoRef || null : pseudos[log.hash] || null,
+                                primaryQuantity: (orders[virtualTakerOrderRefId.toString()]?.primaryQuantity || new BigNumber(0)).plus(quantity),
+                                secondaryQuantity: (orders[virtualTakerOrderRefId.toString()]?.secondaryQuantity || new BigNumber(0)).plus(price.multipliedBy(quantity)),
+                            };
+                            trades.push({
+                                makerOrderOrPoolId: makerOrderOrPoolId,
+                                makerOrderId: makerOrderId,
+                                makerPoolId: makerPoolId,
+                                takerOrderId: virtualTakerOrderRefId,
+                                side: side,
+                                price: price,
+                                quantity: quantity
+                            });
+                            break;
+                        }
+                        case Spot.DEX.Events.AssetTier: {
+                            const asset = new AssetId(log.event.args[0].toString());
+                            try {
+                                const accountId = await this.getAccountIdByAddress(contract.account, false, connection);
+                                if (!accountId)
+                                    throw new Error('Failed to get contract account id: ' + contract.account);
+
+                                const market = await this.getMarketByAccountId(accountId, connection);
+                                if (!market)
+                                    throw new Error('Failed to get market: ' + contract.account);
+
+                                const tier = await Blockchain.call(contract.account, Readability.toFunction(Spot.DEX.assetOf), [asset.toUint256()]);
+                                const assetId = await this.getAssetIdByHash(asset, 'trusted', connection);
+                                if (!assetId)
+                                    throw new Error('Failed to get asset id');
+
+                                await this.setPolyAsset(assetId, market, tier ? tier.symbol || null : null, connection);
+                                Log.info(`exchange ${contract.account} poly asset update: ${asset.id} maps to ${tier ? tier.symbol || null : null}`);
+                            } catch (exception) {
+                                Log.error(`exchange ${contract.account} poly asset update error (ref: ${asset.id}):`, exception);
+                            }
+                            break;
+                        }
+                        default:
+                            Log.error(`exchange ${contract.account} event is unknown (type: ${log.event.type}, block: ${block.number}, contract: dex):`, log.event.args);
+                            break;
+                    }
+                    break;
+                }
+                case 'dlp': {
+                    switch (log.event.type) {
+                        case Spot.DLP.Events.Config: {
+                            try {
+                                const delegator = await Blockchain.call(contract.account, Readability.toFunction(Spot.DLP.paramsOf), []);
+                                if (delegator != null) {
+                                    if (!accounts[delegator.deployer_account]) {
+                                        const accountId = await this.getAccountIdByAddress(delegator.deployer_account, false, connection);
+                                        if (!accountId)
+                                            throw new Error('cannot decode deployer account ' + delegator.deployer_account);
+                                        accounts[delegator.deployer_account] = accountId;
+                                    }
+
+                                    const marketAccountId = await this.getAccountIdByAddress(delegator.dex_account, true, connection);
+                                    if (!marketAccountId)
+                                        throw new Error('cannot find account ' + delegator.dex_account);
+
+                                    const market = await this.getMarketByAccountId(marketAccountId, connection);
+                                    if (!market)
+                                        throw new Error('cannot find market account ' + delegator.dex_account);
+
+                                    const permissions = Array.isArray(delegator.permissions) ? delegator.permissions.map((x: any) => ({
+                                        primaryAssetId: null,
+                                        primaryAsset: x.primary_asset,
+                                        secondaryAssetId: null,
+                                        secondaryAsset: x.secondary_asset
+                                    })) : [];
+                                    for (let i = 0; i < permissions.length; i++) {
+                                        const permission = permissions[i];
+                                        permission.primaryAssetId = await this.getAssetIdByHash(new AssetId(permission.primaryAsset), 'trusted', connection);
+                                        permission.secondaryAssetId = await this.getAssetIdByHash(new AssetId(permission.secondaryAsset), 'trusted', connection);
+                                    }
+                                    
+                                    const result = await this.setDelegator({
+                                        marketId: market.id,
+                                        accountId: accounts[contract.account],
+                                        deployerAccountId: accounts[delegator.deployer_account],
+                                        blockNumber: block.number,
+                                        rewardEmission: Common.bn(delegator.reward_emission) || new BigNumber(0),
+                                        rewardBalance: Common.bn(delegator.reward_balance) || new BigNumber(0),
+                                        permissions: permissions.filter((x: any) => x.primaryAssetId != null && x.secondaryAssetId != null)
+                                    }, connection);
+                                    if (result != null) {
+                                        await this.notify(Notification.DelegatorUpdate, {
+                                            query: { },
+                                            args: { delegatorId: result.id }
+                                        }, connection);
+                                    }
+                                }
+                                Log.info(`exchange ${contract.account} delegator update`);
+                            } catch (exception) {
+                                Log.error(`exchange ${contract.account} delegator update error:`, exception);
+                            }
+                            break;
+                        }
+                        case Spot.DLP.Events.PoolRefEvent: {
+                            const primaryAsset = new AssetId(log.event.args[0]);
+                            const secondaryAsset = new AssetId(log.event.args[1]);
+                            const ownerPubkeyhash = new Pubkeyhash(log.event.args[2]);
+                            const owner = Signing.encodeAddress(ownerPubkeyhash);
+                            const batch = log.event.args[3];
+                            if (batch) {
+                                try {
+                                    const accountId = await this.getAccountIdByAddress(contract.account, false, connection);
+                                    if (!accountId)
+                                        throw new Error('Failed to get delegator account id: ' + contract.account);
+
+                                    const delegator = await this.getDelegatorByAccountId(accountId, connection);
+                                    if (!delegator)
+                                        throw new Error('Failed to get delegator: ' + contract.account);
+
+                                    const primaryAssetId = await this.getAssetIdByHash(primaryAsset, 'trusted', connection);
+                                    if (!primaryAssetId)
+                                        throw new Error('cannot find primary asset of contract account ' + contract.account);
+
+                                    const secondaryAssetId = await this.getAssetIdByHash(secondaryAsset, 'trusted', connection);
+                                    if (!secondaryAssetId)
+                                        throw new Error('cannot find secondary asset of contract account ' + contract.account);
+
+                                    const market = await this.getMarketById(delegator.marketId, connection);
+                                    if (!market)
+                                        throw new Error('cannot find market of delegator contract account ' + contract.account);
+
+                                    const pairId = await this.getPairByAssetIds(primaryAssetId, secondaryAssetId, market.id, true, connection);
+                                    if (!pairId)
+                                        throw new Error('cannot find asset pair of contract account ' + contract.account);
+
+                                    const delegatedPools = await this.getAllDelegatedPoolsByDelegatorIdAndMarketPair(delegator.id, delegator.marketId, pairId)
+                                    for (let i = 0; i < delegatedPools.length; i++) {
+                                        const delegatedPool = delegatedPools[i];
+                                        let delegatedPoolId: Uint256 | null = null;
+                                        let owner: string | null = null;
+                                        try {
+                                            const account = await this.getAccountHashById(delegatedPool.accountId, connection);
+                                            if (!account)
+                                                throw new Error('Failed to get delegated pool account id: ' + delegatedPool.accountId);
+
+                                            owner = Signing.encodeAddress(account);
+                                            const share = await Blockchain.call(contract.account, Readability.toFunction(Spot.DLP.shareOf), [primaryAsset.toUint256(), secondaryAsset.toUint256(), owner]);
+                                            const result = await this.setDelegatedPool({
+                                                pairId: pairId,
+                                                marketId: market.id,
+                                                delegatorId: delegator.id,
+                                                accountId: delegatedPool.accountId,
+                                                blockNumber: block.number,
+                                                rewardValue: Common.bn(share.reward_value) || new BigNumber(0),
+                                                initialPrimaryValue: Common.bn(share.primary_value) || new BigNumber(0),
+                                                initialSecondaryValue: Common.bn(share.secondary_value) || new BigNumber(0),
+                                                primaryValue: Common.bn(share.primary_value) || new BigNumber(0),
+                                                secondaryValue: Common.bn(share.secondary_value) || new BigNumber(0),
+                                                active: true
+                                            }, false);
+                                            if (result) {
+                                                delegatedPoolId = result.id;
+                                            }
+                                        } catch {
+                                            const prevDelegatedPool = await this.getDelegatedPoolByHandle(market.id, pairId, delegator.id, delegatedPool.accountId, connection);
+                                            if (prevDelegatedPool) {
+                                                delegatedPoolId = prevDelegatedPool.id;
+                                                prevDelegatedPool.blockNumber = block.number;
+                                                prevDelegatedPool.active = false;
+                                                await this.setDelegatedPool(prevDelegatedPool, false, connection);
+                                            }
+                                        }
+
+                                        if (owner && delegatedPoolId) {
+                                            await this.notify(Notification.DelegatedPoolUpdate, {
+                                                query: { accounts: [owner] },
+                                                args: { delegatedPoolId: delegatedPoolId }
+                                            }, connection);
+                                        }
+                                    }
+
+                                    Log.info(`exchange ${contract.account} delegated pool batch update (market_id: ${market.id.toString()}, pair_id: ${pairId.toString()}, delegator_id: ${delegator.id.toString()}): ${delegatedPools.length} updates`);
+                                } catch (exception) {
+                                    Log.error(`exchange ${contract.account} delegated pool batch update error (primary_asset: ${primaryAsset.id}, secondary_asset: ${secondaryAsset.id}):`, exception);
                                 }
                             }
-                            Log.info(`exchange ${marketAccount} market update`);
-                        } catch (exception) {
-                            Log.error(`exchange ${marketAccount} market update error:`, exception);
-                        }
-                        break;
-                    }
-                    case DEX.Spot.Events.Order: {
-                        const orderId = new Uint256(event.args[0].toString());
-                        orders[orderId.toString()] = {
-                            orderId: orderId,
-                            pseudoRef: pseudoOrder,
-                            primaryQuantity: new BigNumber(0),
-                            secondaryQuantity: new BigNumber(0)
-                        };
-                        pseudoOrder = null;
-                        break;
-                    }
-                    case DEX.Spot.Events.Pool: {
-                        const poolId = new Uint256(event.args[0].toString());
-                        pools[poolId.toString()] = {
-                            poolId: poolId,
-                            pseudoRef: pseudoPool,
-                            primaryQuantity: new BigNumber(0),
-                            secondaryQuantity: new BigNumber(0)
-                        };
-                        pseudoPool = null;
-                        break;
-                    }
-                    case DEX.Spot.Events.Swap: {
-                        const refType = parseInt(event.args[2]) as RefType;
-                        const makerOrderOrPoolId = new Uint256(event.args[0].toString());
-                        const makerOrderId = refType == RefType.Order ? makerOrderOrPoolId : null;
-                        const makerPoolId = refType == RefType.Pool ? makerOrderOrPoolId : null;
-                        const takerOrderId = new Uint256(event.args[1].toString());
-                        const virtualTakerOrderRefId = takerOrderId.gt(0) ? takerOrderId : new Uint256(transaction.hash);
-                        const side = parseInt(event.args[3]) as OrderSide;
-                        const price = new BigNumber(event.args[4].toString());
-                        const quantity = new BigNumber(event.args[5].toString());
-                        if (makerOrderId != null) {
-                            orders[makerOrderId.toString()] = {
-                                orderId: makerOrderId,
-                                pseudoRef: null,
-                                primaryQuantity: (orders[makerOrderId.toString()]?.primaryQuantity || new BigNumber(0)).plus(quantity),
-                                secondaryQuantity: (orders[makerOrderId.toString()]?.secondaryQuantity || new BigNumber(0)).plus(price.multipliedBy(quantity))
-                            };
-                        }
-                        if (makerPoolId != null) {
-                            pools[makerPoolId.toString()] = {
-                                poolId: makerPoolId,
-                                pseudoRef: null,
-                                primaryQuantity: (pools[makerPoolId.toString()]?.primaryQuantity || new BigNumber(0)).plus(quantity),
-                                secondaryQuantity: (pools[makerPoolId.toString()]?.secondaryQuantity || new BigNumber(0)).plus(price.multipliedBy(quantity))
-                            };
-                        }
-                        orders[virtualTakerOrderRefId.toString()] = {
-                            orderId: virtualTakerOrderRefId,
-                            pseudoRef: takerOrderId.gt(0) ? orders[virtualTakerOrderRefId.toString()]?.pseudoRef || null : pseudoOrder,
-                            primaryQuantity: (orders[virtualTakerOrderRefId.toString()]?.primaryQuantity || new BigNumber(0)).plus(quantity),
-                            secondaryQuantity: (orders[virtualTakerOrderRefId.toString()]?.secondaryQuantity || new BigNumber(0)).plus(price.multipliedBy(quantity)),
-                        };
-                        trades.push({
-                            makerOrderOrPoolId: makerOrderOrPoolId,
-                            makerOrderId: makerOrderId,
-                            makerPoolId: makerPoolId,
-                            takerOrderId: virtualTakerOrderRefId,
-                            side: side,
-                            price: price,
-                            quantity: quantity
-                        });
-                        break;
-                    }
-                    case DEX.Spot.Events.AssetTier: {
-                        const asset = new AssetId(event.args[0].toString());
-                        try {
-                            const accountId = await this.getAccountIdByAddress(marketAccount, false, connection);
-                            if (!accountId)
-                                throw new Error('Failed to get market account id: ' + marketAccount);
 
-                            const market = await this.getMarketByAccountId(accountId, connection);
-                            if (!market)
-                                throw new Error('Failed to get market: ' + marketAccount);
+                            if (!ownerPubkeyhash.equals(new Pubkeyhash())) {
+                                try {
+                                    const ownerId = owner ? await this.getAccountIdByAddress(owner, false, connection) : null;
+                                    if (!ownerId)
+                                        throw new Error('Failed to get owner account id: ' + owner);
 
-                            const tier = await Blockchain.call(marketAccount, Readability.toFunction(DEX.Spot.assetOf), [asset.toUint256()]);
-                            const assetId = await this.getAssetIdByHash(asset, false, connection);
-                            if (!assetId)
-                                throw new Error('Failed to get asset id');
+                                    const accountId = await this.getAccountIdByAddress(contract.account, false, connection);
+                                    if (!accountId)
+                                        throw new Error('Failed to get delegator account id: ' + contract.account);
 
-                            await this.setPolyAsset(assetId, market, tier ? tier.symbol || null : null, connection);
-                            Log.info(`exchange ${marketAccount} poly asset update: ${asset.id} maps to ${tier ? tier.symbol || null : null}`);
-                        } catch (exception) {
-                            Log.error(`exchange ${marketAccount} poly asset update error (ref: ${asset.id}):`, exception);
+                                    const delegator = await this.getDelegatorByAccountId(accountId, connection);
+                                    if (!delegator)
+                                        throw new Error('Failed to get delegator: ' + contract.account);
+
+                                    const primaryAssetId = await this.getAssetIdByHash(primaryAsset, 'trusted', connection);
+                                    if (!primaryAssetId)
+                                        throw new Error('cannot find primary asset of contract account ' + contract.account);
+
+                                    const secondaryAssetId = await this.getAssetIdByHash(secondaryAsset, 'trusted', connection);
+                                    if (!secondaryAssetId)
+                                        throw new Error('cannot find secondary asset of contract account ' + contract.account);
+
+                                    const market = await this.getMarketById(delegator.marketId, connection);
+                                    if (!market)
+                                        throw new Error('cannot find market of delegator contract account ' + contract.account);
+
+                                    const pairId = await this.getPairByAssetIds(primaryAssetId, secondaryAssetId, market.id, true, connection);
+                                    if (!pairId)
+                                        throw new Error('cannot find asset pair of contract account ' + contract.account);
+
+                                    let delegatedPoolId: Uint256 | null = null;
+                                    try {
+                                        const share = await Blockchain.call(contract.account, Readability.toFunction(Spot.DLP.shareOf), [primaryAsset.toUint256(), secondaryAsset.toUint256(), owner]);
+                                        const result = await this.setDelegatedPool({
+                                            pairId: pairId,
+                                            marketId: market.id,
+                                            delegatorId: delegator.id,
+                                            accountId: ownerId,
+                                            blockNumber: block.number,
+                                            rewardValue: Common.bn(share.reward_value) || new BigNumber(0),
+                                            initialPrimaryValue: Common.bn(share.primary_value) || new BigNumber(0),
+                                            initialSecondaryValue: Common.bn(share.secondary_value) || new BigNumber(0),
+                                            primaryValue: Common.bn(share.primary_value) || new BigNumber(0),
+                                            secondaryValue: Common.bn(share.secondary_value) || new BigNumber(0),
+                                            active: true
+                                        }, true);
+                                        if (result) {
+                                            delegatedPoolId = result.id;
+                                        }
+                                    } catch {
+                                        const prevDelegatedPool = await this.getDelegatedPoolByHandle(market.id, pairId, delegator.id, ownerId, connection);
+                                        if (prevDelegatedPool) {
+                                            delegatedPoolId = prevDelegatedPool.id;
+                                            prevDelegatedPool.blockNumber = block.number;
+                                            prevDelegatedPool.active = false;
+                                            await this.setDelegatedPool(prevDelegatedPool, false, connection);
+                                        }
+                                    }             
+
+                                    await this.notify(Notification.DelegatedPoolUpdate, {
+                                        query: { accounts: [owner] },
+                                        args: { delegatedPoolId: delegatedPoolId || new Uint256(0) }
+                                    }, connection);
+                                    Log.info(`exchange ${contract.account} delegated pool update (market_id: ${market.id.toString()}, pair_id: ${pairId.toString()}, delegator_id: ${delegator.id.toString()}, ownerId: ${ownerId.toString()})`);
+                                } catch (exception) {
+                                    Log.error(`exchange ${contract.account} delegated pool update error (primary_asset: ${primaryAsset.id}, secondary_asset: ${secondaryAsset.id}, owner: ${owner}):`, exception);
+                                }
+                            }
+                            break;
                         }
-                        break;
+                        default:
+                            Log.error(`exchange ${contract.account} event is unknown (type: ${log.event.type}, block: ${block.number}, contract: dlp):`, log.event.args);
+                            break;
                     }
-                    default:
-                        Log.error(`exchange ${marketAccount} event is unknown (type: ${event}, block: ${blockNumber}):`, event.args);  
-                        break;
+                    break;
                 }
+                default:
+                    Log.error(`exchange ${contract.account} event is unknown (type: ${log.event.type}, block: ${block.number}):`, log.event.args);
+                    break;
             }
         }
 
@@ -639,14 +946,14 @@ export class Exchange {
                 try {
                     const pseudoOrder: PseudoOrder = event.pseudoRef as any;
                     try {
-                        order = await Blockchain.call(marketAccount, Readability.toFunction(DEX.Spot.orderOf), [event.orderId]);
+                        order = await Blockchain.call(contract.account, Readability.toFunction(Spot.DEX.orderOf), [event.orderId]);
                     } catch (exception) {
                         if (!event.pseudoRef)
                             throw exception;
                     }
 
                     if (!order && !event.pseudoRef)
-                        throw new Error('cannot find order of contract account ' + marketAccount);
+                        throw new Error('cannot find order of contract account ' + contract.account);
 
                     const account = order ? order.account : pseudoOrder.transaction.fromAccount; 
                     if (!accounts[account]) {
@@ -656,25 +963,25 @@ export class Exchange {
                         accounts[account] = accountId;
                     }
                     
-                    const pair = order ? await Blockchain.call(marketAccount, Readability.toFunction(DEX.Spot.pairOf), [order.pair_id]) : { primary_asset: pseudoOrder.primaryAsset.toHex(), secondary_asset: pseudoOrder.secondaryAsset.toHex() };
+                    const pair = order ? await Blockchain.call(contract.account, Readability.toFunction(Spot.DEX.pairOf), [order.pair_id]) : { primary_asset: pseudoOrder.primaryAsset.toHex(), secondary_asset: pseudoOrder.secondaryAsset.toHex() };
                     if (!pair)
-                        throw new Error('cannot find asset pair of contract account ' + marketAccount);
+                        throw new Error('cannot find asset pair of contract account ' + contract.account);
 
-                    const primaryAssetId = await this.getAssetIdByHash(new AssetId(pair.primary_asset), false, connection);
+                    const primaryAssetId = await this.getAssetIdByHash(new AssetId(pair.primary_asset), 'trusted', connection);
                     if (!primaryAssetId)
-                        throw new Error('cannot find primary asset of contract account ' + marketAccount);
+                        throw new Error('cannot find primary asset of contract account ' + contract.account);
 
-                    const secondaryAssetId = await this.getAssetIdByHash(new AssetId(pair.secondary_asset), false, connection);
+                    const secondaryAssetId = await this.getAssetIdByHash(new AssetId(pair.secondary_asset), 'trusted', connection);
                     if (!secondaryAssetId)
-                        throw new Error('cannot find secondary asset of contract account ' + marketAccount);
+                        throw new Error('cannot find secondary asset of contract account ' + contract.account);
 
-                    const market = await this.getMarketByAccountId(accounts[marketAccount], connection);
+                    const market = await this.getMarketByAccountId(accounts[contract.account], connection);
                     if (!market)
-                        throw new Error('cannot find market of contract account ' + marketAccount);
+                        throw new Error('cannot find market of contract account ' + contract.account);
 
                     const pairId = await this.getPairByAssetIds(primaryAssetId, secondaryAssetId, market.id, true, connection);
                     if (!pairId)
-                        throw new Error('cannot find asset pair of contract account ' + marketAccount);
+                        throw new Error('cannot find asset pair of contract account ' + contract.account);
 
                     const startingValue = BigNumber.max(pseudoOrder ? pseudoOrder.value : 0, order ? order.value : 0);
                     const currentValue = new BigNumber(order ? order.value : BigNumber.max(0, pseudoOrder.value.minus(pseudoOrder.side == OrderSide.Buy ? event.secondaryQuantity : event.primaryQuantity)));
@@ -683,7 +990,7 @@ export class Exchange {
                         pairId: pairId,
                         marketId: market.id,
                         accountId: accounts[account],
-                        blockNumber: blockNumber,
+                        blockNumber: block.number,
                         condition: (Common.num(order ? order.condition : pseudoOrder.condition) || 0) as OrderCondition,
                         side: (Common.num(order ? order.side : pseudoOrder.side) || 0) as OrderSide,
                         policy: (Common.num(order ? order.policy : pseudoOrder.policy) || 0) as OrderPolicy,
@@ -704,6 +1011,7 @@ export class Exchange {
                     if (prevOrder) {
                         prevOrder.fillingPrice = event.primaryQuantity.gt(0) ? Common.bn(event.secondaryQuantity.dividedBy(event.primaryQuantity)) : undefined;
                         prevOrder.value = BigNumber.max(0, prevOrder.value.minus(prevOrder.side == OrderSide.Buy ? event.secondaryQuantity : event.primaryQuantity));
+                        prevOrder.blockNumber = block.number;
                         prevOrder.active = false;
                         result = await this.setOrder(prevOrder, connection);
                     }
@@ -714,36 +1022,28 @@ export class Exchange {
                     if (!account)
                         throw new Error('cannot decode order account ' + result.accountId);
 
-                    await this.notify(Notification.OrderUpdate, {
-                        query: {
-                            accounts: [account]
-                        },
-                        args: {
-                            orderId: result.id
-                        }
-                    }, connection);
-                    if (result.lastPrice.gt(0) && result.lastQuantity.gte(0)) {
-                        await this.notify(Notification.LevelUpdate, {
+                    await Promise.all([
+                        this.notify(Notification.OrderUpdate, {
+                            query: { accounts: [account] },
+                            args: { orderId: result.id }
+                        }, connection),
+                        this.notify(Notification.LevelUpdate, {
                             query: { },
-                            args: result.active && result.lastQuantity.gt(0) ? {
+                            args: result.active && result.lastPrice.gt(0) && result.lastQuantity.gt(0) ? {
                                 id: result.id,
                                 side: result.side,
                                 price: result.lastPrice,
-                                quantity: result.lastQuantity,
-                                iceberg: false
-                            } : {
-                                id: result.id
-                            }
-                        }, connection);
-                    }
+                                quantity: result.lastQuantity
+                            } as AggregatedLevel : { id: result.id }
+                        }, connection)
+                    ]);
                 }
-                Log.info(`exchange ${marketAccount} order update (order_id: ${event.orderId.toString()})`);
+                Log.info(`exchange ${contract.account} order update (order_id: ${event.orderId.toString()})`);
             } catch (exception) {
-                Log.error(`exchange ${marketAccount} order update error (order_id: ${event.orderId.toString()}):`, exception);
+                Log.error(`exchange ${contract.account} order update error (order_id: ${event.orderId.toString()}):`, exception);
             }
         }
 
-        let timeOffset = 0;
         for (let target in pools) {
             const event = pools[target];
             try {
@@ -751,14 +1051,14 @@ export class Exchange {
                 try {
                     const pseudoPool: PseudoPool = event.pseudoRef as any;
                     try {
-                        pool = await Blockchain.call(marketAccount, Readability.toFunction(DEX.Spot.poolOf), [event.poolId]);
+                        pool = await Blockchain.call(contract.account, Readability.toFunction(Spot.DEX.poolOf), [event.poolId]);
                     } catch (exception) {
                         if (!event.pseudoRef)
                             throw exception;
                     }
 
                     if (!pool && !event.pseudoRef)
-                        throw new Error('cannot find pool of contract account ' + marketAccount);
+                        throw new Error('cannot find pool of contract account ' + contract.account);
 
                     const account = pool ? pool.account : pseudoPool.transaction.fromAccount; 
                     if (!accounts[account]) {
@@ -768,27 +1068,27 @@ export class Exchange {
                         accounts[account] = accountId;
                     }
                     
-                    const pair = pool ? await Blockchain.call(marketAccount, Readability.toFunction(DEX.Spot.pairOf), [pool.pair_id]) : { primary_asset: pseudoPool.primaryAsset.toHex(), secondary_asset: pseudoPool.secondaryAsset.toHex() };
+                    const pair = pool ? await Blockchain.call(contract.account, Readability.toFunction(Spot.DEX.pairOf), [pool.pair_id]) : { primary_asset: pseudoPool.primaryAsset.toHex(), secondary_asset: pseudoPool.secondaryAsset.toHex() };
                     if (!pair)
-                        throw new Error('cannot find asset pair of contract account ' + marketAccount);
+                        throw new Error('cannot find asset pair of contract account ' + contract.account);
 
                     const primaryAsset = new AssetId(pair.primary_asset);
-                    const primaryAssetId = await this.getAssetIdByHash(primaryAsset, false, connection);
+                    const primaryAssetId = await this.getAssetIdByHash(primaryAsset, 'trusted', connection);
                     if (!primaryAssetId)
-                        throw new Error('cannot find primary asset of contract account ' + marketAccount);
+                        throw new Error('cannot find primary asset of contract account ' + contract.account);
 
                     const secondaryAsset = new AssetId(pair.secondary_asset);
-                    const secondaryAssetId = await this.getAssetIdByHash(secondaryAsset, false, connection);
+                    const secondaryAssetId = await this.getAssetIdByHash(secondaryAsset, 'trusted', connection);
                     if (!secondaryAssetId)
-                        throw new Error('cannot find secondary asset of contract account ' + marketAccount);
+                        throw new Error('cannot find secondary asset of contract account ' + contract.account);
 
-                    const market = await this.getMarketByAccountId(accounts[marketAccount], connection);
+                    const market = await this.getMarketByAccountId(accounts[contract.account], connection);
                     if (!market)
-                        throw new Error('cannot find market of contract account ' + marketAccount);
+                        throw new Error('cannot find market of contract account ' + contract.account);
 
                     const pairId = await this.getPairByAssetIds(primaryAssetId, secondaryAssetId, market.id, true, connection);
                     if (!pairId)
-                        throw new Error('cannot find asset pair of contract account ' + marketAccount);
+                        throw new Error('cannot find asset pair of contract account ' + contract.account);
 
                     const primaryValue = pool ? new BigNumber(pool.primary_value) : pseudoPool.transaction.pays.filter(x => x.asset.token == primaryAsset.token).reduce((x, y) => x.plus(y.value), new BigNumber(0))
                     const secondaryValue = pool ? new BigNumber(pool.secondary_value) : pseudoPool.transaction.pays.filter(x => x.asset.token == secondaryAsset.token).reduce((x, y) => x.plus(y.value), new BigNumber(0))
@@ -797,18 +1097,22 @@ export class Exchange {
                     const minPrice = pool ? Common.bn(pool.min_price)?.pow(2) : pseudoPool.minPrice;
                     const maxPrice = pool ? Common.bn(pool.max_price)?.pow(2) : pseudoPool.maxPrice;
                     const concentrated = minPrice?.gt(0) && maxPrice?.gt(0);
+                    const price = pool ? new BigNumber(pool.price).pow(concentrated ? 2 : 1) : pseudoPool.price;
                     result = await this.setPool({
                         poolId: pool ? Common.u256(pool.id) || new Uint256(pool.id) : event.poolId,
                         pairId: pairId,
                         marketId: market.id,
                         accountId: accounts[account],
-                        blockNumber: blockNumber,
+                        blockNumber: block.number,
+                        initialPrice: price,
+                        initialPrimaryValue: primaryValue.plus(primaryRevenue),
+                        initialSecondaryValue: secondaryValue.plus(secondaryRevenue),
                         primaryValue: primaryValue,
                         secondaryValue: secondaryValue,
                         primaryRevenue: primaryRevenue,
                         secondaryRevenue: secondaryRevenue,
                         liquidity: pool ? new BigNumber(pool.liquidity) : new BigNumber(0),
-                        price: pool ? new BigNumber(pool.price).pow(concentrated ? 2 : 1) : pseudoPool.price,
+                        price: price,
                         minPrice: minPrice,
                         maxPrice: maxPrice,
                         feeRate: pool ? new BigNumber(pool.fee_rate) : pseudoPool.feeRate,
@@ -817,21 +1121,22 @@ export class Exchange {
                         lastBidPrice: new BigNumber(0),
                         active: pool != null
                     }, connection);
-                    if (result != null && pseudoPool != null) {
+                    if (result != null && (pseudoPool != null || result.initialPrice.eq(result.price))) {
                         await this.setDepth({
                             poolId: result.id,
                             pairId: pairId,
                             marketId: market.id,
                             accountId: accounts[account],
-                            blockNumber: blockNumber,
+                            blockNumber: block.number,
                             price: result.price,
                             quantity: result.primaryValue.plus(result.primaryRevenue).plus(result.secondaryValue.plus(result.secondaryRevenue).dividedBy(result.price)),
-                            time: new Date(blockTime.getTime() + 100 * timeOffset++)
+                            time: new Date(block.time.getTime() + 100 * step++)
                         }, connection);
                     }
                 } catch {
                     const prevPool = await this.getPoolByPoolId(event.poolId, connection);
                     if (prevPool) {
+                        prevPool.blockNumber = block.number;
                         prevPool.active = false;
                         result = await this.setPool(prevPool, connection);
                         if (result != null) {
@@ -840,10 +1145,10 @@ export class Exchange {
                                 pairId: result.pairId,
                                 marketId: result.marketId,
                                 accountId: result.accountId,
-                                blockNumber: blockNumber,
+                                blockNumber: block.number,
                                 price: result.price,
                                 quantity: result.primaryValue.plus(result.primaryRevenue).plus(result.secondaryValue.plus(result.secondaryRevenue).dividedBy(result.price)).negated(),
-                                time: new Date(blockTime.getTime() + 100 * timeOffset++)
+                                time: new Date(block.time.getTime() + 100 * step++)
                             }, connection);
                         }
                     }
@@ -854,44 +1159,56 @@ export class Exchange {
                     if (!account)
                         throw new Error('cannot decode order account ' + result.accountId);
 
-                    await Promise.all([
-                        this.notify(Notification.PoolUpdate, {
-                            query: {
-                                accounts: [account]
-                            },
-                            args: {
-                                poolId: result.id
-                            }
-                        }, connection),
-                        this.notify(Notification.LevelUpdate, {
+                    const minPrice = result.minPrice || result.lastBidPrice.multipliedBy(0.9999);
+                    const maxPrice = result.maxPrice || result.lastAskPrice.multipliedBy(1.0001);
+                    const events = [this.notify(Notification.PoolUpdate, {
+                        query: { accounts: [account] },
+                        args: { poolId: result.id }
+                    }, connection)];
+                    if (result.active && ((result.lastAskPrice.gt(0) && result.lastAskPrice.lt(maxPrice) && result.primaryValue.gt(0)) || (result.lastBidPrice.gt(0) && result.lastBidPrice.gt(minPrice) && result.secondaryValue.gt(0)))) {
+                        events.push(this.notify(Notification.LevelUpdate, {
                             query: { },
-                            args: result.active && result.lastAskPrice.gt(0) && result.primaryValue.gt(0) ? {
+                            args: result.lastAskPrice.gt(0) && result.lastAskPrice.lt(maxPrice) && result.primaryValue.gt(0) ? {
                                 id: result.id,
                                 side: OrderSide.Sell,
                                 price: result.lastAskPrice,
                                 quantity: result.primaryValue,
-                                iceberg: true
-                            } : {
-                                id: result.id
-                            }
-                        }, connection),
-                        this.notify(Notification.LevelUpdate, {
+                                curve: {
+                                    minPrice: result.minPrice,
+                                    maxPrice: result.maxPrice,
+                                    primaryValue: result.primaryValue,
+                                    secondaryValue: result.secondaryValue,
+                                    feeRate: result.feeRate
+                                }
+                            } as AggregatedLevel : { id: result.id }
+                        }, connection));
+                        events.push(this.notify(Notification.LevelUpdate, {
                             query: { },
-                            args: result.active && result.lastBidPrice.gt(0) && result.secondaryValue.gt(0) ? {
+                            args: result.active && result.lastBidPrice.gt(0) && result.lastBidPrice.gt(minPrice) && result.secondaryValue.gt(0) ? {
                                 id: result.id,
                                 side: OrderSide.Buy,
                                 price: result.lastBidPrice,
                                 quantity: result.secondaryValue.dividedBy(result.lastBidPrice),
-                                iceberg: true
-                            } : {
-                                id: result.id
-                            }
-                        }, connection)
-                    ]);
+                                curve: {
+                                    minPrice: result.minPrice,
+                                    maxPrice: result.maxPrice,
+                                    primaryValue: result.primaryValue,
+                                    secondaryValue: result.secondaryValue,
+                                    feeRate: result.feeRate
+                                }
+                            } as AggregatedLevel : { id: result.id }
+                        }, connection));
+                    } else {
+                        events.push(this.notify(Notification.LevelUpdate, {
+                            query: { },
+                            args: { id: result.id }
+                        }, connection));
+                    }
+                    await Promise.all(events);
                 }
-                Log.info(`exchange ${marketAccount} pool update (pool_id: ${event.poolId.toString()})`);
+                Log.info(`exchange ${contract.account} pool update (pool_id: ${event.poolId.toString()})`);
             } catch (exception) {
-                Log.error(`exchange ${marketAccount} pool update error (pool_id: ${event.poolId.toString()}):`, exception);
+                Log.error(`exchange ${contract.account} pool update error (pool_id: ${event.poolId.toString()}):`, exception);
             }
         }
 
@@ -902,16 +1219,16 @@ export class Exchange {
                 const makerPool = !makerOrder && event.makerPoolId != null ? await this.getPoolByPoolId(event.makerPoolId, connection) : null;
                 const takerOrder = await this.getOrderByOrderId(event.takerOrderId, connection);
                 if (!makerOrder && !makerPool && !takerOrder)
-                    throw new Error('cannot find maker/taker order of contract account ' + marketAccount + '(taker_order_id: ' + event.takerOrderId.toString() + ')');
+                    throw new Error('cannot find maker/taker order of contract account ' + contract.account + '(taker_order_id: ' + event.takerOrderId.toString() + ')');
 
                 const marketId: Uint256 = (makerOrder?.marketId || makerPool?.marketId || takerOrder?.marketId) as any;
                 const pairId: Uint256 = (makerOrder?.pairId || makerPool?.pairId || takerOrder?.pairId) as any;
                 if (takerOrder && (marketId.neq(takerOrder.marketId) || pairId.neq(takerOrder.pairId)))
-                    throw new Error('maker/taker order market mismatch of contract account ' + marketAccount + '(maker_order_or_pool_id: ' + (event.makerOrderOrPoolId.toString() || 'null') + ', taker_order_id: ' + event.takerOrderId.toString() + ')');
+                    throw new Error('maker/taker order market mismatch of contract account ' + contract.account + '(maker_order_or_pool_id: ' + (event.makerOrderOrPoolId.toString() || 'null') + ', taker_order_id: ' + event.takerOrderId.toString() + ')');
             
                 const assets = await this.getPairById(pairId, connection);
                 if (!assets || !assets.primaryAsset || !assets.secondaryAsset)
-                    throw new Error('cannot find assets of contract account ' + marketAccount + '(order_id: ' + event.takerOrderId.toString() + ')');
+                    throw new Error('cannot find assets of contract account ' + contract.account + '(order_id: ' + event.takerOrderId.toString() + ')');
                 
                 const base = assets && assets.secondaryAsset && Whitelist.has(assets.secondaryAsset.hash) ? Quotes.assetBaseOf(assets.secondaryAsset.hash) : null;
                 const trade = {
@@ -922,11 +1239,11 @@ export class Exchange {
                     makerAccountId: makerOrder?.accountId || makerPool?.accountId,
                     takerOrderId: takerOrder?.id,
                     takerAccountId: takerOrder?.accountId,
-                    blockNumber: blockNumber,
+                    blockNumber: block.number,
                     side: event.side,
                     price: event.price,
                     quantity: event.quantity,
-                    time: new Date(blockTime.getTime() + 100 * (timeOffset + i))
+                    time: new Date(block.time.getTime() + 100 * (step + i))
                 };
                 const result = await this.setTrade(trade, connection);
                 if (result != null) {
@@ -953,9 +1270,9 @@ export class Exchange {
                         await this.setTrade(trade, connection);
                     }
                 }
-                Log.info(`exchange ${marketAccount} trade update: (maker_order_or_pool_id: ${event.makerOrderOrPoolId.toString() || 'null'}, taker_order_id: ${event.takerOrderId.toString()})`);
+                Log.info(`exchange ${contract.account} trade update: (maker_order_or_pool_id: ${event.makerOrderOrPoolId.toString() || 'null'}, taker_order_id: ${event.takerOrderId.toString()})`);
             } catch (exception) {
-                Log.error(`exchange ${marketAccount} trade update error:`, exception);
+                Log.error(`exchange ${contract.account} trade update error:`, exception);
             }
         }
     }
@@ -996,7 +1313,10 @@ export class Exchange {
             }
         }
         
-        await this.notify(Notification.ChainUpdate, { query: { }, args: { tip: block.blockNumber } }, connection);
+        await this.notify(Notification.ChainUpdate, {
+            query: { },
+            args: { tip: block.blockNumber }
+        }, connection);
         try {
             return this.toBlock(result[0]);
         } catch {
@@ -1040,7 +1360,7 @@ export class Exchange {
         if (!polyAsset)
             return null;
 
-        const polyAssetId = await this.getAssetIdByHash(polyAsset, false, connection);
+        const polyAssetId = await this.getAssetIdByHash(polyAsset, 'trusted', connection);
         if (!polyAssetId)
             return polyAsset;
 
@@ -1063,7 +1383,7 @@ export class Exchange {
             return null;
         }
     }
-    static async getAssetIdByHash(hash: AssetId, verifyExistence: boolean, connection?: pq.TransactionSql): Promise<Uint256 | null> {
+    static async getAssetIdByHash(hash: AssetId, mode: 'trusted' | 'untrusted' | 'read-only', connection?: pq.TransactionSql): Promise<Uint256 | null> {
         const sql = connection || this.connection;
         const cache = this.get(this.cache.assetHashToAssetId, hash.toHex());
         if (cache != null)
@@ -1071,8 +1391,11 @@ export class Exchange {
 
         let result = await this.resultOf(sql`SELECT id FROM assets WHERE hash = ${hash.toUint8Array()}`);
         if (!result.length) {
-            if (!!hash.token != !!hash.checksum)
+            if (!!hash.token != !!hash.checksum) {
                 throw new Error('Impossible asset handle (token/contract mismatch)');
+            } else if (mode == 'read-only') {
+                return null;
+            }
 
             const blockchains = await Blockchain.getBlockchains();
             const info = blockchains.find((v) => v.chain == hash.chain);
@@ -1081,7 +1404,7 @@ export class Exchange {
                     if (info.tokenPolicy == null || info.tokenPolicy == 'none')
                         throw new Error('Impossible asset handle (tokens are not supported)');
 
-                    if (verifyExistence) {
+                    if (mode == 'untrusted') {
                         try {
                             const result = await Blockchain.getAssetHolders(hash);
                             if (!result || !new BigNumber(result).gt(0))
@@ -1135,8 +1458,12 @@ export class Exchange {
     }
     static async precomputeMarketData(connection?: pq.TransactionSql): Promise<void> {
         const sql = connection || this.connection;
-        await this.resultOf(sql`REFRESH MATERIALIZED VIEW pairs_view`);
-        await this.resultOf(sql`UPDATE pairs pair SET launch_time = (SELECT MIN(time) FROM trades WHERE pair_id IN (pair.id, (SELECT id FROM pairs ppair WHERE ppair.primary_asset_id = pair.primary_asset_id AND ppair.secondary_asset_id IS NULL LIMIT 1), (SELECT id FROM pairs spair WHERE spair.primary_asset_id = pair.secondary_asset_id AND spair.secondary_asset_id IS NULL LIMIT 1))) WHERE pair.launch_time IS NULL`);
+        await Promise.all([
+            this.resultOf(sql`REFRESH MATERIALIZED VIEW pairs_view`),
+            this.resultOf(sql`REFRESH MATERIALIZED VIEW pools_view`),
+            this.resultOf(sql`REFRESH MATERIALIZED VIEW delegators_view`),
+            this.resultOf(sql`UPDATE pairs pair SET launch_time = (SELECT MIN(time) FROM trades WHERE pair_id IN (pair.id, (SELECT id FROM pairs ppair WHERE ppair.primary_asset_id = pair.primary_asset_id AND ppair.secondary_asset_id IS NULL LIMIT 1), (SELECT id FROM pairs spair WHERE spair.primary_asset_id = pair.secondary_asset_id AND spair.secondary_asset_id IS NULL LIMIT 1))) WHERE pair.launch_time IS NULL`)
+        ]);
     }
     static async getPairByAssetIds(primaryAssetId: Uint256 | null, secondaryAssetId: Uint256 | null, marketId: Uint256 | null, createIfNotExists: boolean, connection?: pq.TransactionSql): Promise<Uint256 | null> {
         const sql = connection || this.connection;
@@ -1259,8 +1586,8 @@ export class Exchange {
         }
     }
     static async getPairByAssetHashes(primaryAssetHash: AssetId | null, secondaryAssetHash: AssetId | null, marketId: Uint256 | null, verifyExistence: boolean, createIfNotExists: boolean, connection?: pq.TransactionSql): Promise<Uint256 | null> {
-        const primaryAssetId = primaryAssetHash ? await this.getAssetIdByHash(primaryAssetHash, verifyExistence, connection) : null;
-        const secondaryAssetId = secondaryAssetHash ? await this.getAssetIdByHash(secondaryAssetHash, verifyExistence, connection) : null;
+        const primaryAssetId = primaryAssetHash ? await this.getAssetIdByHash(primaryAssetHash, verifyExistence ? 'untrusted' : 'trusted', connection) : null;
+        const secondaryAssetId = secondaryAssetHash ? await this.getAssetIdByHash(secondaryAssetHash, verifyExistence ? 'untrusted' : 'trusted', connection) : null;
         return await this.getPairByAssetIds(primaryAssetId, secondaryAssetId, marketId, createIfNotExists, connection);
     }
     static async getAggregatedPairs(marketId: Uint256, pairId: Uint256 | null, connection?: pq.TransactionSql): Promise<AggregatedPair[]> {
@@ -1584,7 +1911,7 @@ export class Exchange {
         const updates: { account_id: string, asset_id: string, block_number: number, time: number, value: string }[] = [];
         for (let i = 0; i < balances.length; i++) {
             const balance = balances[i];
-            const assetId = await this.getAssetIdByHash(balance.asset, false, connection);
+            const assetId = await this.getAssetIdByHash(balance.asset, 'trusted', connection);
             if (assetId != null && balance.value.gt(0)) {
                 const asset = assetId.toInteger().toString();
                 updates.push({ account_id: id.toString(), asset_id: asset, block_number: top?.blockNumber || 1, time: time.getTime(), value: balance.value.toString() });
@@ -1626,6 +1953,10 @@ export class Exchange {
                     SELECT DISTINCT account_id AS id1, unnest(ARRAY[primary_asset_id, secondary_asset_id]) AS id2 FROM pools
                         INNER JOIN pairs ON pairs.id = pools.pair_id
                     WHERE account_id = ${id.toString()} AND active = TRUE
+                    UNION ALL
+                    SELECT DISTINCT account_id AS id1, unnest(ARRAY[primary_asset_id, secondary_asset_id]) AS id2 FROM delegated_pools
+                        INNER JOIN pairs ON pairs.id = delegated_pools.pair_id
+                    WHERE account_id = ${id.toString()} AND active = TRUE
                 )
             )
             SELECT
@@ -1639,14 +1970,22 @@ export class Exchange {
         SELECT
             (SELECT hash FROM assets WHERE assets.id = asset_id) AS hash,
             (
+                SELECT COALESCE(SUM(value), 0.0) FROM orders
+                    INNER JOIN pairs ON pairs.id = orders.pair_id AND ((pairs.primary_asset_id = asset_id AND orders.side = ${OrderSide.Sell}) OR (pairs.secondary_asset_id = asset_id AND orders.side = ${OrderSide.Buy}))
+                WHERE account_id = ${id.toString()} AND active = TRUE
+            ) +
+            (
                 SELECT
                     COALESCE(SUM(CASE WHEN pairs.primary_asset_id = asset_id THEN primary_value + primary_revenue ELSE secondary_value + secondary_revenue END), 0.0)
                 FROM pools
                     INNER JOIN pairs ON pairs.id = pools.pair_id AND (pairs.primary_asset_id = asset_id OR pairs.secondary_asset_id = asset_id)
                 WHERE account_id = ${id.toString()} AND active = TRUE
-            ) + (
-                SELECT COALESCE(SUM(value), 0.0) FROM orders
-                    INNER JOIN pairs ON pairs.id = orders.pair_id AND ((pairs.primary_asset_id = asset_id AND orders.side = ${OrderSide.Sell}) OR (pairs.secondary_asset_id = asset_id AND orders.side = ${OrderSide.Buy}))
+            ) +
+            (
+                SELECT
+                    COALESCE(SUM(CASE WHEN pairs.primary_asset_id = asset_id THEN primary_value ELSE secondary_value END), 0.0)
+                FROM delegated_pools
+                    INNER JOIN pairs ON pairs.id = delegated_pools.pair_id AND (pairs.primary_asset_id = asset_id OR pairs.secondary_asset_id = asset_id)
                 WHERE account_id = ${id.toString()} AND active = TRUE
             ) AS unavailable,
             value AS available,
@@ -1827,8 +2166,8 @@ export class Exchange {
         const result = await this.resultOf(sql`
         SELECT
             markets.*,
-            accounts.hash as account_hash,
-            deployer_accounts.hash as deployer_account_hash
+            accounts.hash AS account_hash,
+            deployer_accounts.hash AS deployer_account_hash
         FROM markets
             INNER JOIN accounts ON accounts.id = markets.account_id
             INNER JOIN accounts deployer_accounts ON deployer_accounts.id = markets.deployer_account_id
@@ -1844,8 +2183,8 @@ export class Exchange {
         const result = await this.resultOf(sql`
         SELECT
             markets.*,
-            accounts.hash as account_hash,
-            deployer_accounts.hash as deployer_account_hash
+            accounts.hash AS account_hash,
+            deployer_accounts.hash AS deployer_account_hash
         FROM markets
             INNER JOIN accounts ON accounts.id = markets.account_id
             INNER JOIN accounts deployer_accounts ON deployer_accounts.id = markets.deployer_account_id
@@ -1861,8 +2200,8 @@ export class Exchange {
         const result = await this.resultOf(sql`
         SELECT
             markets.*,
-            accounts.hash as account_hash,
-            deployer_accounts.hash as deployer_account_hash
+            accounts.hash AS account_hash,
+            deployer_accounts.hash AS deployer_account_hash
         FROM markets
             INNER JOIN accounts ON accounts.id = markets.account_id
             INNER JOIN accounts deployer_accounts ON deployer_accounts.id = markets.deployer_account_id`);
@@ -1870,6 +2209,25 @@ export class Exchange {
             let results: Market[] = [];
             for (let i = 0; i < result.length; i++)
                 results.push(this.toMarket(result[i]));
+            return results;
+        } catch {
+            return [];
+        }
+    }
+    static async getDelegators(connection?: pq.TransactionSql): Promise<Delegator[]> {
+        const sql = connection || this.connection;
+        const result = await this.resultOf(sql`
+        SELECT
+            delegators.*,
+            accounts.hash AS account_hash,
+            deployer_accounts.hash AS deployer_account_hash
+        FROM delegators
+            INNER JOIN accounts ON accounts.id = delegators.account_id
+            INNER JOIN accounts deployer_accounts ON deployer_accounts.id = delegators.deployer_account_id`);
+        try {
+            let results: Delegator[] = [];
+            for (let i = 0; i < result.length; i++)
+                results.push(this.toDelegator(result[i]));
             return results;
         } catch {
             return [];
@@ -1945,9 +2303,9 @@ export class Exchange {
         const result = await this.resultOf(sql`
         SELECT
             orders.*,
-            passet.hash as primary_asset,
-            sasset.hash as secondary_asset,
-            accounts.hash as market_account_hash
+            passet.hash AS primary_asset,
+            sasset.hash AS secondary_asset,
+            accounts.hash AS market_account_hash
         FROM orders
             INNER JOIN pairs ON pairs.id = pair_id
             INNER JOIN assets passet ON passet.id = pairs.primary_asset_id
@@ -1966,9 +2324,9 @@ export class Exchange {
         const result = await this.resultOf(sql`
         SELECT
             orders.*,
-            passet.hash as primary_asset,
-            sasset.hash as secondary_asset,
-            accounts.hash as market_account_hash
+            passet.hash AS primary_asset,
+            sasset.hash AS secondary_asset,
+            accounts.hash AS market_account_hash
         FROM orders
             INNER JOIN pairs ON pairs.id = pair_id
             INNER JOIN assets passet ON passet.id = pairs.primary_asset_id
@@ -1987,9 +2345,9 @@ export class Exchange {
         const result = await this.resultOf(sql`
         SELECT
             orders.*,
-            passet.hash as primary_asset,
-            sasset.hash as secondary_asset,
-            accounts.hash as market_account_hash
+            passet.hash AS primary_asset,
+            sasset.hash AS secondary_asset,
+            accounts.hash AS market_account_hash
         FROM orders
             INNER JOIN pairs ON pairs.id = pair_id
             INNER JOIN assets passet ON passet.id = pairs.primary_asset_id
@@ -2012,9 +2370,9 @@ export class Exchange {
         const result = await this.resultOf(sql`
         SELECT
             orders.*,
-            passet.hash as primary_asset,
-            sasset.hash as secondary_asset,
-            accounts.hash as market_account_hash
+            passet.hash AS primary_asset,
+            sasset.hash AS secondary_asset,
+            accounts.hash AS market_account_hash
         FROM orders
             INNER JOIN pairs ON pairs.id = pair_id
             INNER JOIN assets passet ON passet.id = pairs.primary_asset_id
@@ -2042,6 +2400,9 @@ export class Exchange {
             market_id,
             account_id,
             block_number,
+            initial_price,
+            initial_primary_value,
+            initial_secondary_value,
             primary_value,
             secondary_value,
             primary_revenue,
@@ -2061,6 +2422,9 @@ export class Exchange {
             ${pool.marketId.toString()},
             ${pool.accountId.toString()},
             ${pool.blockNumber},
+            ${pool.initialPrice.toString()},
+            ${pool.initialPrimaryValue.toString()},
+            ${pool.initialSecondaryValue.toString()},
             ${pool.primaryValue.toString()},
             ${pool.secondaryValue.toString()},
             ${pool.primaryRevenue.toString()},
@@ -2100,15 +2464,17 @@ export class Exchange {
         const result = await this.resultOf(sql`
         SELECT
             pools.*,
-            passet.hash as primary_asset,
-            sasset.hash as secondary_asset,
-            accounts.hash as market_account_hash
+            passet.hash AS primary_asset,
+            sasset.hash AS secondary_asset,
+            accounts.hash AS market_account_hash,
+            pools_view.volume
         FROM pools
             INNER JOIN pairs ON pairs.id = pair_id
             INNER JOIN assets passet ON passet.id = pairs.primary_asset_id
             INNER JOIN assets sasset ON sasset.id = pairs.secondary_asset_id
             INNER JOIN markets ON markets.id = market_id
             INNER JOIN accounts ON accounts.id = markets.account_id
+            LEFT JOIN pools_view ON pools_view.id = pools.id
         WHERE pools.id = ${id.toString()}`);
         try {
             return this.toPool(result[0]);
@@ -2121,15 +2487,17 @@ export class Exchange {
         const result = await this.resultOf(sql`
         SELECT
             pools.*,
-            passet.hash as primary_asset,
-            sasset.hash as secondary_asset,
-            accounts.hash as market_account_hash
+            passet.hash AS primary_asset,
+            sasset.hash AS secondary_asset,
+            accounts.hash AS market_account_hash,
+            pools_view.volume
         FROM pools
             INNER JOIN pairs ON pairs.id = pair_id
             INNER JOIN assets passet ON passet.id = pairs.primary_asset_id
             INNER JOIN assets sasset ON sasset.id = pairs.secondary_asset_id
             INNER JOIN markets ON markets.id = market_id
             INNER JOIN accounts ON accounts.id = markets.account_id
+            LEFT JOIN pools_view ON pools_view.id = pools.id
         WHERE pool_id = ${poolId.toUint8Array()}`);
         try {
             return this.toPool(result[0]);
@@ -2142,15 +2510,17 @@ export class Exchange {
         const result = await this.resultOf(sql`
         SELECT
             pools.*,
-            passet.hash as primary_asset,
-            sasset.hash as secondary_asset,
-            accounts.hash as market_account_hash
+            passet.hash AS primary_asset,
+            sasset.hash AS secondary_asset,
+            accounts.hash AS market_account_hash,
+            pools_view.volume
         FROM pools
             INNER JOIN pairs ON pairs.id = pair_id
             INNER JOIN assets passet ON passet.id = pairs.primary_asset_id
             INNER JOIN assets sasset ON sasset.id = pairs.secondary_asset_id
             INNER JOIN markets ON markets.id = market_id
             INNER JOIN accounts ON accounts.id = markets.account_id
+            LEFT JOIN pools_view ON pools_view.id = pools.id
         WHERE active = TRUE ORDER BY 100000000 * (primary_revenue * price + secondary_revenue) / (primary_value * price + secondary_value) DESC LIMIT ${cursor.count} OFFSET ${cursor.offset}`);
         try {
             const pools = [];
@@ -2162,20 +2532,91 @@ export class Exchange {
             return [];
         }
     }
+    static async getBestDelegatedPools(connection?: pq.TransactionSql): Promise<PseudoDelegatedPool[]> {
+        const sql = connection || this.connection;
+        const result = await this.resultOf(sql`
+        WITH aggregates AS (
+            WITH targets AS (
+                WITH sources AS (
+                    SELECT
+                        market_id,
+                        pair_id,
+                        delegator_id,
+                        SUM(initial_primary_value) AS initial_primary_value,
+                        SUM(initial_secondary_value) AS initial_secondary_value,
+                        SUM(primary_value) AS primary_value,
+                        SUM(secondary_value) AS secondary_value
+                    FROM delegated_pools WHERE active = TRUE
+                    GROUP BY market_id, pair_id, delegator_id
+                )
+                SELECT
+                    sources.*,
+                    delegators.account_id,
+                    passet.hash AS primary_asset,
+                    sasset.hash AS secondary_asset,
+                    market_account.hash AS market_account_hash,
+                    delegator_account.hash AS delegator_account_hash,
+                    (SELECT v.fee_rate FROM pools v WHERE v.pair_id = sources.pair_id AND v.market_id = sources.market_id AND v.account_id = delegators.account_id AND v.active = TRUE LIMIT 1) AS fee_rate,
+                    COALESCE((SELECT price FROM trades WHERE pair_id = (SELECT id FROM pairs WHERE primary_asset_id = passet.id AND secondary_asset_id IS NULL) ORDER BY time DESC LIMIT 1), 1) AS primary_price,
+                    COALESCE((SELECT price FROM trades WHERE pair_id = (SELECT id FROM pairs WHERE primary_asset_id = sasset.id AND secondary_asset_id IS NULL) ORDER BY time DESC LIMIT 1), 1) AS secondary_price
+                FROM sources
+                    INNER JOIN pairs ON pairs.id = pair_id
+                    INNER JOIN assets passet ON passet.id = pairs.primary_asset_id
+                    INNER JOIN assets sasset ON sasset.id = pairs.secondary_asset_id
+                    INNER JOIN markets ON markets.id = sources.market_id
+                    INNER JOIN delegators ON delegators.id = sources.delegator_id
+                    INNER JOIN accounts market_account ON market_account.id = markets.account_id
+                    INNER JOIN accounts delegator_account ON delegator_account.id = delegators.account_id
+            )
+            SELECT
+                targets.*,
+                initial_primary_value * primary_price + initial_secondary_value * secondary_price AS initial_value,
+                primary_value * primary_price + secondary_value * secondary_price AS current_value,
+                delegators_view.volume
+            FROM targets
+                LEFT JOIN delegators_view ON delegators_view.id = targets.delegator_id AND delegators_view.pair_id = targets.pair_id
+            WHERE initial_primary_value > 0 OR initial_secondary_value > 0
+        )
+        SELECT * FROM aggregates ORDER BY 100000000 * (current_value - initial_value) / initial_value DESC`);
+        try {
+            const delegatedPools: PseudoDelegatedPool[] = [];
+            for (let i = 0; i < result.length; i++) {
+                const value = result[i];
+                delegatedPools.push({
+                    pairId: new Uint256(value['pair_id']),
+                    marketId: new Uint256(value['market_id']),
+                    delegatorId: new Uint256(value['delegator_id']),
+                    delegatorAccount: value['delegator_account_hash'] ? Signing.encodeAddress(new Pubkeyhash(new Uint8Array(value['delegator_account_hash']))) || undefined : undefined,
+                    marketAccount: value['market_account_hash'] ? Signing.encodeAddress(new Pubkeyhash(new Uint8Array(value['market_account_hash']))) || undefined : undefined,
+                    primaryAsset: value['primary_asset'] ? new AssetId(new Uint8Array(value['primary_asset'])).id : undefined,
+                    secondaryAsset: value['secondary_asset'] ? new AssetId(new Uint8Array(value['secondary_asset'])).id : undefined,
+                    initialValue: new BigNumber(value['initial_value']),
+                    currentValue: new BigNumber(value['current_value']),
+                    volume: new BigNumber(value['volume']),
+                    feeRate: Common.bn(value['fee_rate'])
+                });
+            }
+            return delegatedPools;
+        } catch {
+            return [];
+        }
+    }
     static async getPoolsByAccountId(accountId: Uint256, active: boolean | null, cursor: Cursor, connection?: pq.TransactionSql): Promise<Pool[]> {
         const sql = connection || this.connection;
         const result = await this.resultOf(sql`
         SELECT
             pools.*,
-            passet.hash as primary_asset,
-            sasset.hash as secondary_asset,
-            accounts.hash as market_account_hash
+            passet.hash AS primary_asset,
+            sasset.hash AS secondary_asset,
+            accounts.hash AS market_account_hash,
+            pools_view.volume
         FROM pools
             INNER JOIN pairs ON pairs.id = pair_id
             INNER JOIN assets passet ON passet.id = pairs.primary_asset_id
             INNER JOIN assets sasset ON sasset.id = pairs.secondary_asset_id
             INNER JOIN markets ON markets.id = market_id
             INNER JOIN accounts ON accounts.id = markets.account_id
+            LEFT JOIN pools_view ON pools_view.id = pools.id
         WHERE pools.account_id = ${accountId.toString()}${typeof active == 'boolean' ? sql` AND active = ${active}` : sql``} ORDER BY active DESC, block_number DESC LIMIT ${cursor.count} OFFSET ${cursor.offset}`);
         try {
             const pools = [];
@@ -2192,15 +2633,17 @@ export class Exchange {
         const result = await this.resultOf(sql`
         SELECT
             pools.*,
-            passet.hash as primary_asset,
-            sasset.hash as secondary_asset,
-            accounts.hash as market_account_hash
+            passet.hash AS primary_asset,
+            sasset.hash AS secondary_asset,
+            accounts.hash AS market_account_hash,
+            pools_view.volume
         FROM pools
             INNER JOIN pairs ON pairs.id = pair_id
             INNER JOIN assets passet ON passet.id = pairs.primary_asset_id
             INNER JOIN assets sasset ON sasset.id = pairs.secondary_asset_id
             INNER JOIN markets ON markets.id = market_id
             INNER JOIN accounts ON accounts.id = markets.account_id
+            LEFT JOIN pools_view ON pools_view.id = pools.id
         WHERE pools.account_id = ${accountId.toString()} AND pools.market_id = ${marketId.toString()} AND pools.pair_id = ${pairId.toString()}${typeof active == 'boolean' ? sql` AND active = ${active}` : sql``} ORDER BY active DESC, block_number DESC LIMIT ${cursor.count} OFFSET ${cursor.offset}`);
         try {
             const pools = [];
@@ -2211,6 +2654,309 @@ export class Exchange {
         } catch {
             return [];
         }
+    }
+    static async getDelegatorByAccountId(accountId: Uint256, connection?: pq.TransactionSql): Promise<Delegator | null> {
+        const sql = connection || this.connection;
+        const result = await this.resultOf(sql`
+        SELECT
+            delegators.*,
+            accounts.hash AS account_hash,
+            deployer_accounts.hash AS deployer_account_hash
+        FROM delegators
+            INNER JOIN accounts ON accounts.id = delegators.account_id
+            INNER JOIN accounts deployer_accounts ON deployer_accounts.id = delegators.deployer_account_id
+        WHERE account_id = ${accountId.toString()}`);
+        try {
+            return this.toDelegator(result[0]);
+        } catch {
+            return null;
+        }
+    }
+    static async setDelegator(delegator: Omit<Delegator, 'id'>, connection?: pq.TransactionSql): Promise<Delegator | null> {
+        const sql = connection || this.connection;
+        const result = await this.resultOf(sql`
+        INSERT INTO delegators
+        (
+            market_id,
+            account_id,
+            deployer_account_id,
+            block_number,
+            reward_emission,
+            reward_balance,
+            permissions
+        )
+        VALUES
+        (
+            ${delegator.marketId.toString()},
+            ${delegator.accountId.toString()},
+            ${delegator.deployerAccountId.toString()},
+            ${delegator.blockNumber},
+            ${delegator.rewardEmission.toString()},
+            ${delegator.rewardBalance.toString()},
+            ${sql.json(delegator.permissions.map((x) => ({
+                primaryAssetId: x.primaryAssetId.toString(),
+                primaryAsset: x.primaryAsset.toString(),
+                secondaryAssetId: x.secondaryAssetId.toString(),
+                secondaryAsset: x.secondaryAsset.toString()
+            })))}::jsonb
+        )
+        ON CONFLICT (account_id) DO UPDATE SET
+            market_id = EXCLUDED.market_id,
+            deployer_account_id = EXCLUDED.deployer_account_id,
+            block_number = EXCLUDED.block_number,
+            reward_emission = EXCLUDED.reward_emission,
+            reward_balance = EXCLUDED.reward_balance,
+            permissions = EXCLUDED.permissions
+        RETURNING *`);
+
+        try {
+            return this.toDelegator(result[0]);
+        } catch {
+            return null;
+        }
+    }
+    static async setDelegatedPool(pool: Omit<DelegatedPool, 'id'>, reset: boolean, connection?: pq.TransactionSql): Promise<DelegatedPool | null> {
+        const sql = connection || this.connection;
+        const result = await this.resultOf(sql`
+        INSERT INTO delegated_pools
+        (
+            pair_id,
+            market_id,
+            delegator_id,
+            account_id,
+            block_number,
+            initial_primary_value,
+            initial_secondary_value,
+            primary_value,
+            secondary_value,
+            reward_value,
+            active
+        )
+        VALUES
+        (
+            ${pool.pairId.toString()},
+            ${pool.marketId.toString()},
+            ${pool.delegatorId.toString()},
+            ${pool.accountId.toString()},
+            ${pool.blockNumber},
+            ${pool.initialPrimaryValue.toString()},
+            ${pool.initialSecondaryValue.toString()},
+            ${pool.primaryValue.toString()},
+            ${pool.secondaryValue.toString()},
+            ${pool.rewardValue.toString()},
+            ${pool.active}
+        )
+        ON CONFLICT (pair_id, market_id, delegator_id, account_id) DO UPDATE SET
+            block_number = EXCLUDED.block_number,
+            initial_primary_value = ${reset ? sql`EXCLUDED` : sql`delegated_pools`}.initial_primary_value,
+            initial_secondary_value = ${reset ? sql`EXCLUDED` : sql`delegated_pools`}.initial_secondary_value,
+            primary_value = EXCLUDED.primary_value,
+            secondary_value = EXCLUDED.secondary_value,
+            reward_value = EXCLUDED.reward_value,
+            active = EXCLUDED.active
+        RETURNING *`);
+        try {
+            return this.toDelegatedPool(result[0]);
+        } catch {
+            return null;
+        }
+    }
+    static async getDelegatedPoolById(id: Uint256, connection?: pq.TransactionSql): Promise<DelegatedPool | null> {
+        const sql = connection || this.connection;
+        const result = await this.resultOf(sql`
+        SELECT
+            delegated_pools.*,
+            passet.hash AS primary_asset,
+            sasset.hash AS secondary_asset,
+            market_account.hash AS market_account_hash,
+            delegator_account.hash AS delegator_account_hash,
+            delegators_view.volume,
+            (SELECT ARRAY[SUM(v.primary_value), SUM(v.secondary_value)] FROM delegated_pools v WHERE v.pair_id = delegated_pools.pair_id AND v.market_id = delegated_pools.market_id AND v.delegator_id = delegated_pools.delegator_id AND v.active = TRUE) AS virtual_pool,
+            (SELECT ARRAY[v.primary_value + v.primary_revenue - v.initial_primary_value, v.secondary_value + v.secondary_revenue - v.initial_secondary_value, v.primary_value, v.secondary_value, v.fee_rate, v.initial_price] FROM pools v WHERE v.pair_id = delegated_pools.pair_id AND v.market_id = delegated_pools.market_id AND v.account_id = delegators.account_id AND v.active = TRUE LIMIT 1) AS shadow_pool
+        FROM delegated_pools
+            INNER JOIN pairs ON pairs.id = pair_id
+            INNER JOIN assets passet ON passet.id = pairs.primary_asset_id
+            INNER JOIN assets sasset ON sasset.id = pairs.secondary_asset_id
+            INNER JOIN markets ON markets.id = market_id
+            INNER JOIN delegators ON delegators.id = delegator_id
+            INNER JOIN accounts market_account ON market_account.id = markets.account_id
+            INNER JOIN accounts delegator_account ON delegator_account.id = delegators.account_id
+            LEFT JOIN delegators_view ON delegators_view.id = delegator_id AND delegators_view.pair_id = pairs.id
+        WHERE delegated_pools.id = ${id.toString()}`);
+        try {
+            return this.toDelegatedPool(result[0]);
+        } catch {
+            return null;
+        }
+    }
+    static async getDelegatedPoolByHandle(marketId: Uint256, pairId: Uint256, delegatorId: Uint256, accountId: Uint256, connection?: pq.TransactionSql): Promise<DelegatedPool | null> {
+        const sql = connection || this.connection;
+        const result = await this.resultOf(sql`
+        SELECT
+            delegated_pools.*,
+            passet.hash AS primary_asset,
+            sasset.hash AS secondary_asset,
+            market_account.hash AS market_account_hash,
+            delegator_account.hash AS delegator_account_hash,
+            delegators_view.volume,
+            (SELECT ARRAY[SUM(v.primary_value), SUM(v.secondary_value)] FROM delegated_pools v WHERE v.pair_id = delegated_pools.pair_id AND v.market_id = delegated_pools.market_id AND v.delegator_id = delegated_pools.delegator_id AND v.active = TRUE) AS virtual_pool,
+            (SELECT ARRAY[v.primary_value + v.primary_revenue - v.initial_primary_value, v.secondary_value + v.secondary_revenue - v.initial_secondary_value, v.primary_value, v.secondary_value, v.fee_rate, v.initial_price] FROM pools v WHERE v.pair_id = delegated_pools.pair_id AND v.market_id = delegated_pools.market_id AND v.account_id = delegators.account_id AND v.active = TRUE LIMIT 1) AS shadow_pool
+        FROM delegated_pools
+            INNER JOIN pairs ON pairs.id = pair_id
+            INNER JOIN assets passet ON passet.id = pairs.primary_asset_id
+            INNER JOIN assets sasset ON sasset.id = pairs.secondary_asset_id
+            INNER JOIN markets ON markets.id = market_id
+            INNER JOIN delegators ON delegators.id = delegator_id
+            INNER JOIN accounts market_account ON market_account.id = markets.account_id
+            INNER JOIN accounts delegator_account ON delegator_account.id = delegators.account_id
+            LEFT JOIN delegators_view ON delegators_view.id = delegator_id AND delegators_view.pair_id = pairs.id
+        WHERE delegated_pools.market_id = ${marketId.toString()} AND delegated_pools.pair_id = ${pairId.toString()} AND delegated_pools.delegator_id = ${delegatorId.toString()} AND delegated_pools.account_id = ${accountId.toString()}`);
+        try {
+            return this.toDelegatedPool(result[0]);
+        } catch {
+            return null;
+        }
+    }
+    static async getAllDelegatedPoolsByDelegatorIdAndMarketPair(delegatorId: Uint256, marketId: Uint256, pairId: Uint256, connection?: pq.TransactionSql): Promise<DelegatedPool[]> {
+        const sql = connection || this.connection;
+        const result = await this.resultOf(sql`SELECT * FROM delegated_pools WHERE delegator_id = ${delegatorId.toString()} AND market_id = ${marketId.toString()} AND pair_id = ${pairId.toString()}`);
+        try {
+            const delegatedPools = [];
+            for (let i = 0; i < result.length; i++) {
+                delegatedPools.push(this.toDelegatedPool(result[i]));
+            }
+            return delegatedPools;
+        } catch {
+            return [];
+        }
+    }
+    static async getDelegatedPoolsByAccountIdAndMarketPair(accountId: Uint256, marketId: Uint256, pairId: Uint256, active: boolean | null, cursor: Cursor, connection?: pq.TransactionSql): Promise<DelegatedPool[]> {
+        const sql = connection || this.connection;
+        const result = await this.resultOf(sql`
+        SELECT
+            delegated_pools.*,
+            passet.hash AS primary_asset,
+            sasset.hash AS secondary_asset,
+            market_account.hash AS market_account_hash,
+            delegator_account.hash AS delegator_account_hash,
+            delegators_view.volume,
+            (SELECT ARRAY[SUM(v.primary_value), SUM(v.secondary_value)] FROM delegated_pools v WHERE v.pair_id = delegated_pools.pair_id AND v.market_id = delegated_pools.market_id AND v.delegator_id = delegated_pools.delegator_id AND v.active = TRUE) AS virtual_pool,
+            (SELECT ARRAY[v.primary_value + v.primary_revenue - v.initial_primary_value, v.secondary_value + v.secondary_revenue - v.initial_secondary_value, v.primary_value, v.secondary_value, v.fee_rate, v.initial_price] FROM pools v WHERE v.pair_id = delegated_pools.pair_id AND v.market_id = delegated_pools.market_id AND v.account_id = delegators.account_id AND v.active = TRUE LIMIT 1) AS shadow_pool
+        FROM delegated_pools
+            INNER JOIN pairs ON pairs.id = pair_id
+            INNER JOIN assets passet ON passet.id = pairs.primary_asset_id
+            INNER JOIN assets sasset ON sasset.id = pairs.secondary_asset_id
+            INNER JOIN markets ON markets.id = market_id
+            INNER JOIN delegators ON delegators.id = delegator_id
+            INNER JOIN accounts market_account ON market_account.id = markets.account_id
+            INNER JOIN accounts delegator_account ON delegator_account.id = delegators.account_id
+            LEFT JOIN delegators_view ON delegators_view.id = delegator_id AND delegators_view.pair_id = pairs.id
+        WHERE delegated_pools.account_id = ${accountId.toString()} AND delegated_pools.market_id = ${marketId.toString()} AND delegated_pools.pair_id = ${pairId.toString()}${typeof active == 'boolean' ? sql` AND active = ${active}` : sql``} ORDER BY active DESC, delegated_pools.block_number DESC LIMIT ${cursor.count} OFFSET ${cursor.offset}`);
+        try {
+            const delegatedPools = [];
+            for (let i = 0; i < result.length; i++) {
+                delegatedPools.push(this.toDelegatedPool(result[i]));
+            }
+            return delegatedPools;
+        } catch {
+            return [];
+        }
+    }
+    static async getDelegatedPoolsByAccountId(accountId: Uint256, active: boolean | null, cursor: Cursor, connection?: pq.TransactionSql): Promise<DelegatedPool[]> {
+        const sql = connection || this.connection;
+        const result = await this.resultOf(sql`
+        SELECT
+            delegated_pools.*,
+            passet.hash AS primary_asset,
+            sasset.hash AS secondary_asset,
+            market_account.hash AS market_account_hash,
+            delegator_account.hash AS delegator_account_hash,
+            delegators_view.volume,
+            (SELECT ARRAY[SUM(v.primary_value), SUM(v.secondary_value)] FROM delegated_pools v WHERE v.pair_id = delegated_pools.pair_id AND v.market_id = delegated_pools.market_id AND v.delegator_id = delegated_pools.delegator_id AND v.active = TRUE) AS virtual_pool,
+            (SELECT ARRAY[v.primary_value + v.primary_revenue - v.initial_primary_value, v.secondary_value + v.secondary_revenue - v.initial_secondary_value, v.primary_value, v.secondary_value, v.fee_rate, v.initial_price] FROM pools v WHERE v.pair_id = delegated_pools.pair_id AND v.market_id = delegated_pools.market_id AND v.account_id = delegators.account_id AND v.active = TRUE LIMIT 1) AS shadow_pool
+        FROM delegated_pools
+            INNER JOIN pairs ON pairs.id = pair_id
+            INNER JOIN assets passet ON passet.id = pairs.primary_asset_id
+            INNER JOIN assets sasset ON sasset.id = pairs.secondary_asset_id
+            INNER JOIN markets ON markets.id = market_id
+            INNER JOIN delegators ON delegators.id = delegator_id
+            INNER JOIN accounts market_account ON market_account.id = markets.account_id
+            INNER JOIN accounts delegator_account ON delegator_account.id = delegators.account_id
+            LEFT JOIN delegators_view ON delegators_view.id = delegator_id AND delegators_view.pair_id = pairs.id
+        WHERE delegated_pools.account_id = ${accountId.toString()}${typeof active == 'boolean' ? sql` AND active = ${active}` : sql``} ORDER BY active DESC, delegated_pools.block_number DESC LIMIT ${cursor.count} OFFSET ${cursor.offset}`);
+        try {
+            const delegatedPools = [];
+            for (let i = 0; i < result.length; i++) {
+                delegatedPools.push(this.toDelegatedPool(result[i]));
+            }
+            return delegatedPools;
+        } catch {
+            return [];
+        }
+    }
+    static async getDelegationOf(accountId: Uint256, connection?: pq.TransactionSql): Promise<PseudoDelegatedState[]> {
+        const sql = connection || this.connection;
+        const delegators = await this.resultOf(sql`SELECT
+            delegators.id,
+            account_id,
+            accounts.hash AS delegator_account_hash,
+            permissions
+        FROM delegators
+            INNER JOIN accounts ON accounts.id = delegators.account_id
+        WHERE deployer_account_id = ${accountId.toString()}`);
+        if (!delegators.length)
+            return [];
+
+        let results: PseudoDelegatedState[] = [];
+        for (let i = 0; i < delegators.length; i++) {
+            const delegator = delegators[i];
+            const delegatorAccount: string = Signing.encodeAddress(new Pubkeyhash(delegator['delegator_account_hash'])) || '';
+            const delegations = await this.resultOf(sql`
+            WITH sources AS (
+                SELECT
+                    pair_id,
+                    SUM(primary_value) AS primary_value,
+                    SUM(secondary_value) AS secondary_value
+                FROM delegated_pools       
+                WHERE delegator_id = ${delegator['id']} AND active = TRUE GROUP BY pair_id
+            )
+            SELECT
+                sources.primary_value,
+                sources.secondary_value,
+                passet.hash AS primary_asset,
+                sasset.hash AS secondary_asset
+            FROM sources
+                INNER JOIN pairs ON pairs.id = pair_id
+                INNER JOIN assets passet ON passet.id = pairs.primary_asset_id
+                INNER JOIN assets sasset ON sasset.id = pairs.secondary_asset_id`);
+            const delegatedPools = await this.resultOf(sql`
+            SELECT
+                pools.id,
+                price,
+                passet.hash AS primary_asset,
+                sasset.hash AS secondary_asset,
+                primary_value + primary_revenue - initial_primary_value AS primary_delta,
+                secondary_value + secondary_revenue - initial_secondary_value AS secondary_delta
+            FROM pools
+                INNER JOIN pairs ON pairs.id = pair_id
+                INNER JOIN assets passet ON passet.id = pairs.primary_asset_id
+                INNER JOIN assets sasset ON sasset.id = pairs.secondary_asset_id
+            WHERE account_id = ${delegator['account_id']} AND active = TRUE`);
+            results = [...results, ...(Array.isArray(delegator['permissions']) ? delegator['permissions'].map((x) => {
+                const delegation = delegations.find((v) => new AssetId(v['primary_asset']).id == new AssetId(x.primaryAsset).id && new AssetId(v['secondary_asset']).id == new AssetId(x.secondaryAsset).id) || { };
+                const delegatedPool = delegatedPools.find((v) => new AssetId(v['primary_asset']).id == new AssetId(x.primaryAsset).id && new AssetId(v['secondary_asset']).id == new AssetId(x.secondaryAsset).id) || { };
+                return {
+                    primaryAsset: x.primaryAsset,
+                    secondaryAsset: x.secondaryAsset,
+                    delegatorAccount: delegatorAccount,
+                    poolId: Common.u256(delegatedPool['id']) || new Uint256(0),
+                    primaryLiquidity: (Common.bn(delegation['primary_value']) || new BigNumber(0)).plus(Common.bn(delegatedPool['primary_delta']) || new BigNumber(0)),
+                    secondaryLiquidity: (Common.bn(delegation['secondary_value']) || new BigNumber(0)).plus(Common.bn(delegatedPool['secondary_delta']) || new BigNumber(0)),
+                    price: Common.bn(delegatedPool['price']) || new BigNumber(0)
+                };
+            }) : [])];
+        }
+        return results;
     }
     static async setDepth(depth: Omit<Depth, 'id'>, connection?: pq.TransactionSql): Promise<Depth | null> {
         const sql = connection || this.connection;
@@ -2290,6 +3036,58 @@ export class Exchange {
             await this.resultOf(sql`DELETE FROM depths WHERE market_id = ${marketId.toString()} AND block_number = ${blockNumber}`);
             await this.resultOf(sql`DELETE FROM trades WHERE market_id = ${marketId.toString()} AND block_number = ${blockNumber}`);
         } catch { }
+    }
+    static async getAssetPriceHistory(assets: AssetId[], interval: number, points: number, connection?: pq.TransactionSql): Promise<Record<string, AssetId & { history: [number, BigNumber][] }>> {
+        const sql = connection || this.connection;
+        const ids: (Uint256 | null)[] = (await Promise.all(assets.map(v => this.getAssetIdByHash(v, 'read-only', connection))));
+        const mapping: Record<string, AssetId> = { };
+        for (let i = 0; i < ids.length; i++) {
+            const id = ids[i];
+            if (id != null) {
+                mapping[id.toString()] = assets[i];
+            }
+        }
+
+        const results = await this.resultOf(sql`
+        WITH targets AS (
+            SELECT
+                assets.id AS asset_id,
+                pairs.id AS pair_id
+            FROM assets
+                INNER JOIN pairs ON primary_asset_id = assets.id AND secondary_asset_id IS NULL
+            WHERE assets.id = ANY(${ids.filter(v => v != null).map(v => v.toString())})
+        ), points AS (
+            SELECT
+                (SELECT EXTRACT(EPOCH FROM CURRENT_DATE::TIMESTAMP)::BIGINT - (${interval / 1000})::BIGINT * (${points} - step)::BIGINT) * 1000 AS min_time,
+                (SELECT EXTRACT(EPOCH FROM CURRENT_DATE::TIMESTAMP)::BIGINT - (${interval / 1000})::BIGINT * (${points - 1} - step)::BIGINT) * 1000 AS max_time
+            FROM GENERATE_SERIES(0, ${points - 1}) step
+        )
+        SELECT
+            asset_id,
+            max_time - 1 AS time,
+            (SELECT price FROM trades WHERE pair_id = targets.pair_id AND time BETWEEN min_time AND max_time ORDER BY time DESC LIMIT 1)
+        FROM targets
+            INNER JOIN points ON TRUE
+        ORDER BY min_time ASC`);
+        const history: Record<string, AssetId & { history: [number, BigNumber][] }> = { };
+        for (let i = 0; i < results.length; i++) {
+            const result = results[i];
+            const asset = mapping[result['asset_id'].toString()];
+            const time = Common.num(result['time']);
+            if (asset != null && time != null) {
+                const bucket = history[asset.id];
+                const lastPrice = bucket && bucket.history.length > 0 ? bucket.history[bucket.history.length - 1][1] : new BigNumber(0);
+                const price = Common.bn(result['price']) || lastPrice || new BigNumber(0);
+                if (!bucket) {
+                    const pseudoAsset: AssetId & { history: [number, BigNumber][] } = new AssetId(asset.id) as any;
+                    pseudoAsset.history = [[time, price]];
+                    history[asset.id] = pseudoAsset;
+                } else {
+                    bucket.history.push([time, price]);
+                }
+            }
+        }
+        return history;
     }
     static async getAggregatedTradesByPairId(pairId: Uint256, cursor: TimeCursor, connection?: pq.TransactionSql): Promise<AggregatedTrade[]> {
         const sql = connection || this.connection;
@@ -2436,7 +3234,11 @@ export class Exchange {
                 id,
                 last_price AS price,
                 last_quantity AS quantity,
-                FALSE AS iceberg
+                NULL AS min_price,
+                NULL AS max_price,
+                NULL AS primary_value,
+                NULL AS secondary_value,
+                NULL AS fee_rate
             FROM orders WHERE market_id = ${marketId.toString()} AND pair_id = ${pairId.toString()} AND side = ${OrderSide.Sell} AND active = TRUE AND last_price > 0 AND last_quantity > 0
             ORDER BY price ASC LIMIT ${levels}
         )
@@ -2447,7 +3249,11 @@ export class Exchange {
                 id,
                 last_ask_price AS price,
                 primary_value AS quantity,
-                TRUE AS iceberg
+                min_price,
+                max_price,
+                primary_value,
+                secondary_value,
+                fee_rate
             FROM pools WHERE market_id = ${marketId.toString()} AND pair_id = ${pairId.toString()} AND active = TRUE AND last_ask_price > 0 AND primary_value > 0 AND (max_price IS NULL OR last_ask_price <= max_price)
             ORDER BY price ASC LIMIT ${levels}
         )
@@ -2458,7 +3264,11 @@ export class Exchange {
                 id,
                 last_price AS price,
                 last_quantity AS quantity,
-                FALSE AS iceberg
+                NULL AS min_price,
+                NULL AS max_price,
+                NULL AS primary_value,
+                NULL AS secondary_value,
+                NULL AS fee_rate
             FROM orders WHERE market_id = ${marketId.toString()} AND pair_id = ${pairId.toString()} AND side = ${OrderSide.Buy} AND active = TRUE AND last_price > 0 AND last_quantity > 0
             ORDER BY price DESC LIMIT ${levels}
         )
@@ -2469,7 +3279,11 @@ export class Exchange {
                 id,
                 last_bid_price AS price,
                 secondary_value / last_bid_price AS quantity,
-                TRUE AS iceberg
+                min_price,
+                max_price,
+                primary_value,
+                secondary_value,
+                fee_rate
             FROM pools WHERE market_id = ${marketId.toString()} AND pair_id = ${pairId.toString()} AND active = TRUE AND last_bid_price > 0 AND secondary_value > 0 AND (min_price IS NULL OR last_bid_price >= min_price)
             ORDER BY price ASC LIMIT ${levels}
         )`);
@@ -2506,9 +3320,11 @@ export class Exchange {
         }
         return { primary: primary, secondary: secondary };
     }
-    static async getAggregatedPolyAssetIdsByMarket(assetId: Uint256, connection?: pq.TransactionSql): Promise<(AssetId & { marketId?: Uint256 })[]> {
+    static async getAggregatedPolyAssetIdsByMarket(targetAssetId: Uint256, connection?: pq.TransactionSql): Promise<(AssetId & { marketId?: Uint256 })[]> {
         const sql = connection || this.connection;
-        const result = await this.resultOf(sql`SELECT asset_id, market_id FROM poly_assets WHERE asset_id = ${assetId.toString()} OR poly_asset_id = ${assetId.toString()}`);
+        const polyResult = await this.resultOf(sql`SELECT poly_asset_id, market_id FROM poly_assets WHERE asset_id = ${targetAssetId.toString()} OR poly_asset_id = ${targetAssetId.toString()} LIMIT 1`);
+        const polyAssetId = (polyResult.length > 0 ? Common.u256(polyResult[0]['poly_asset_id']) : targetAssetId) || targetAssetId;
+        const result = await this.resultOf(sql`SELECT asset_id, market_id FROM poly_assets WHERE poly_asset_id = ${polyAssetId.toString()}`);
         const assets: (AssetId & { marketId?: Uint256 })[] = [];
         for (let i = 0; i < result.length; i++) {
             const assetId = Common.u256(result[i]['asset_id']) || new Uint256();
@@ -2518,6 +3334,12 @@ export class Exchange {
                 asset.marketId = marketId;
                 assets.push(asset);
             }
+        }
+        
+        const polyAsset: (AssetId & { marketId?: Uint256 }) | null = await this.getAssetHashById(polyAssetId, connection);
+        if (polyAsset != null && result.length > 0) {
+            polyAsset.marketId = Common.u256(result[0]['market_id']) || new Uint256();
+            assets.push(polyAsset);
         }
         return assets;
     }
@@ -2637,7 +3459,7 @@ export class Exchange {
             id: new Uint256(value['id']),
             accountId: new Uint256(value['account_id']),
             account: account,
-            version: account ? Blockchain.markets.versions[account] || undefined : undefined,
+            version: account ? Blockchain.accountOf(account)?.version || undefined : undefined,
             deployerAccountId: new Uint256(value['deployer_account_id']),
             deployerAccount: value['deployer_account_hash'] ? Signing.encodeAddress(new Pubkeyhash(new Uint8Array(value['deployer_account_hash']))) || undefined : undefined,
             blockNumber: Common.num(value['block_number']) || 0,
@@ -2693,6 +3515,9 @@ export class Exchange {
             marketAccount: value['market_account_hash'] ? Signing.encodeAddress(new Pubkeyhash(new Uint8Array(value['market_account_hash']))) || undefined : undefined,
             accountId: new Uint256(value['account_id']),
             blockNumber: value['block_number'],
+            initialPrice: new BigNumber(value['initial_price']),
+            initialPrimaryValue: new BigNumber(value['initial_primary_value']),
+            initialSecondaryValue: new BigNumber(value['initial_secondary_value']),
             primaryValue: new BigNumber(value['primary_value']),
             secondaryValue: new BigNumber(value['secondary_value']),
             primaryRevenue: new BigNumber(value['primary_revenue']),
@@ -2705,6 +3530,7 @@ export class Exchange {
             exitFee: new BigNumber(value['exit_fee']),
             lastAskPrice: Common.bn(value['last_ask_price']) || new BigNumber(0),
             lastBidPrice: Common.bn(value['last_bid_price']) || new BigNumber(0),
+            volume: Common.bn(value['volume']),
             active: value['active']
         };
     }
@@ -2736,6 +3562,70 @@ export class Exchange {
             time: new Date(value['time'])
         };
     }
+    private static toDelegator(value: pq.Row): Delegator {
+        const permissions = value['permissions'];
+        return {
+            id: new Uint256(value['id']),
+            marketId: Common.u256(value['market_id']) || new Uint256(0),
+            accountId: Common.u256(value['account_id']) || new Uint256(0),
+            account: value['account_hash'] ? Signing.encodeAddress(new Pubkeyhash(new Uint8Array(value['account_hash']))) || undefined : undefined,
+            deployerAccountId: Common.u256(value['deployer_account_id']) || new Uint256(0),
+            deployerAccount: value['deployer_account_hash'] ? Signing.encodeAddress(new Pubkeyhash(new Uint8Array(value['deployer_account_hash']))) || undefined : undefined,
+            blockNumber: value['block_number'] || 0,
+            rewardEmission: new BigNumber(value['reward_emission']),
+            rewardBalance: new BigNumber(value['reward_balance']),
+            permissions: Array.isArray(permissions) ? permissions.map((x) => ({
+                primaryAssetId: Common.u256(x.primaryAssetId) || new Uint256(0),
+                primaryAsset: x.primaryAsset,
+                secondaryAssetId: Common.u256(x.secondaryAssetId) || new Uint256(0),
+                secondaryAsset: x.secondaryAsset
+            })) : []
+        };
+    }
+    private static toDelegatedPool(value: pq.Row): DelegatedPool {
+        const virtualPool = value['virtual_pool'] || [], shadowPool = value['shadow_pool'] || [];
+        const primaryValue = new BigNumber(value['primary_value']);
+        const secondaryValue = new BigNumber(value['secondary_value']);
+        const primaryPrevTotal = Common.bn(virtualPool[0]) || new BigNumber(0);
+        const secondaryPrevTotal = Common.bn(virtualPool[1]) || new BigNumber(0);
+        const primaryDelta = Common.bn(shadowPool[0]) || new BigNumber(0);
+        const secondaryDelta = Common.bn(shadowPool[1]) || new BigNumber(0);
+        const primaryTotal = primaryPrevTotal.plus(primaryDelta);
+        const secondaryTotal = secondaryPrevTotal.plus(secondaryDelta);
+        const primaryReserve = Common.bn(shadowPool[2]) || new BigNumber(0);
+        const secondaryReserve = Common.bn(shadowPool[3]) || new BigNumber(0);
+        const feeRate = Common.bn(shadowPool[4]);
+        const price = Common.bn(shadowPool[5]) || new BigNumber(0);
+        const total = primaryPrevTotal.multipliedBy(price).plus(secondaryPrevTotal);
+        const share = total.gt(0) ? primaryValue.multipliedBy(price).plus(secondaryValue).dividedBy(total) : new BigNumber(0);
+        const dynamic = virtualPool.length == 2 && shadowPool.length == 6 && (!primaryDelta.eq(0) || !secondaryDelta.eq(0));
+        return {
+            id: new Uint256(value['id']),
+            delegatorId: new Uint256(value['delegator_id']),
+            delegatorAccount: value['delegator_account_hash'] ? Signing.encodeAddress(new Pubkeyhash(new Uint8Array(value['delegator_account_hash']))) || undefined : undefined,
+            pairId: new Uint256(value['pair_id']),
+            marketId: new Uint256(value['market_id']),
+            marketAccount: value['market_account_hash'] ? Signing.encodeAddress(new Pubkeyhash(new Uint8Array(value['market_account_hash']))) || undefined : undefined,
+            accountId: new Uint256(value['account_id']),
+            primaryAsset: value['primary_asset'] ? new AssetId(new Uint8Array(value['primary_asset'])).id : undefined,
+            secondaryAsset: value['secondary_asset'] ? new AssetId(new Uint8Array(value['secondary_asset'])).id : undefined,
+            blockNumber: value['block_number'],
+            rewardValue: new BigNumber(value['reward_value']),
+            initialPrimaryValue: new BigNumber(value['initial_primary_value']),
+            initialSecondaryValue: new BigNumber(value['initial_secondary_value']),
+            primaryValue: dynamic ? primaryTotal.multipliedBy(share) : primaryValue,
+            secondaryValue: dynamic ? secondaryTotal.multipliedBy(share) : secondaryValue,
+            primaryTotal: primaryTotal,
+            secondaryTotal: secondaryTotal,
+            primaryReserve: primaryReserve,
+            secondaryReserve: secondaryReserve,
+            allocationPrice: price.gt(0) ? price : undefined,
+            volume: Common.bn(value['volume']),
+            feeRate: feeRate,
+            share: share,
+            active: value['active']
+        };
+    }
     private static toAggregatedTrade(value: pq.Row): AggregatedTrade {
         return {
             timepoint: parseInt(value['timepoint']),
@@ -2748,11 +3638,22 @@ export class Exchange {
         };
     }
     private static toAggregatedLevel(value: pq.Row): AggregatedLevel {
+        const minPrice = Common.bn(value['min_price']);
+        const maxPrice = Common.bn(value['max_price']);
+        const primaryValue = Common.bn(value['primary_value']);
+        const secondaryValue = Common.bn(value['secondary_value']);
+        const feeRate = Common.bn(value['fee_rate']);
         return {
             id: Common.u256(value['id']) || new Uint256(0),
             price: Common.bn(value['price']) || new BigNumber(0),
             quantity: Common.bn(value['quantity']) || new BigNumber(0),
-            iceberg: value['iceberg'] || false
+            curve: minPrice || maxPrice || primaryValue || secondaryValue || feeRate ? {
+                minPrice: minPrice || null,
+                maxPrice: maxPrice || null,
+                primaryValue: primaryValue || new BigNumber(0),
+                secondaryValue: secondaryValue || new BigNumber(0),
+                feeRate: feeRate || new BigNumber(0)
+            } : undefined
         };
     }
     private static set(type: NodeCache, key: string, value?: string): boolean {

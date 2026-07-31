@@ -1,10 +1,10 @@
 import { randomBytes } from 'crypto';
-import { AssetId, ByteUtil, DEX, Readability, Signing, Uint256 } from 'tangentsdk';
+import { AssetId, ByteUtil, Readability, Signing, Spot, Uint256 } from 'tangentsdk';
 import { Log } from '../logging';
 import { Connection, Cursor, Notification, Exchange, PriceDescriptors, RouterPath, TimeCursor } from './exchange';
 import { FastifyInstance } from 'fastify/types/instance';
 import { Blockchain, BlockchainInfo } from './blockchain';
-import { AggregatedLog, AggregatedPair, Order, OrderSide, Pool, Market as MarketT } from '../types';
+import { AggregatedLog, AggregatedPair, Order, OrderSide, Pool, Market as MarketT, DelegatedPool, PseudoDelegatedPool, Delegator, PseudoDelegatedState } from '../types';
 import fastify, { FastifyReply, FastifyRequest } from 'fastify';
 import fastifyWebsocket, { WebSocket } from '@fastify/websocket';
 import cors from '@fastify/cors';
@@ -132,9 +132,8 @@ export class Relay {
                 Log.info('relay', `${request.ip}${request.url} call:`, variable(args), '=>', variable(response));
                 return response;
             } catch (exception: any) {
-                const response = Result.error(exception);
-                Log.error('relay', `${request.ip}${request.url} call:`, variable(args), '=>', variable(response));
-                return response;
+                Log.error('relay', `${request.ip}${request.url} call:`, variable(args), '=>', exception);
+                return  Result.error(exception);
             }
         };
     }
@@ -207,12 +206,13 @@ export namespace Router {
             Channel.register(server, 'get', '/asset/query', Asset, Asset.getQuery);
             Channel.register(server, 'get', '/asset', Asset, Asset.get);
         }
-        static async getPortfolio(): Promise<{ prices: PriceDescriptors, descriptors: BlockchainInfo[], markets: Market[] }> {
-            const [prices, descriptors, markets] = await Promise.all([this.getPrices(), this.getDescriptors(), Exchange.getMarkets()]);
+        static async getPortfolio(): Promise<{ prices: PriceDescriptors, descriptors: BlockchainInfo[], markets: Market[], delegators: Delegator[] }> {
+            const [prices, descriptors, markets, delegators] = await Promise.all([this.getPrices(), this.getDescriptors(), Exchange.getMarkets(), Exchange.getDelegators()]);
             return {
                 prices: prices,
                 descriptors: descriptors,
-                markets: markets
+                markets: markets,
+                delegators: delegators
             };
         }
         static async getPrices(): Promise<PriceDescriptors> {
@@ -235,12 +235,12 @@ export namespace Router {
                     return { id: id.toInteger(), asset: result };
             } else if (typeof args.handle == 'string' || typeof args.handle == 'number') {
                 const asset = new AssetId(args.handle);
-                const result = await Exchange.getAssetIdByHash(asset, false);
+                const result = await Exchange.getAssetIdByHash(asset, 'trusted');
                 if (result != null)
                     return { id: result.toInteger(), asset: asset };
             } else if (typeof args.chain == 'string') {
                 const asset = AssetId.fromHandle(args.chain, args.token, args.contractAddress);
-                const result = await Exchange.getAssetIdByHash(asset, true);
+                const result = await Exchange.getAssetIdByHash(asset, 'untrusted');
                 if (result != null)
                     return { id: result.toInteger(), asset: asset };
             }
@@ -254,10 +254,13 @@ export namespace Router {
             Channel.register(server, 'get', '/market/metrics', Asset, Market.getMetrics);
             Channel.register(server, 'get', '/market/order', Asset, Market.getOrder);
             Channel.register(server, 'get', '/market/pool', Asset, Market.getPool);
+            Channel.register(server, 'get', '/market/pool/delegated', Asset, Market.getDelegatedPool);
             Channel.register(server, 'get', '/market/pools', Asset, Market.getPools);
+            Channel.register(server, 'get', '/market/pools/delegated', Asset, Market.getDelegatedPools);
             Channel.register(server, 'get', '/market/paths', Asset, Market.getPaths);
             Channel.register(server, 'get', '/market/assets', Asset, Market.getPolyAssets);
             Channel.register(server, 'get', '/market/price', Asset, Market.getPrice);
+            Channel.register(server, 'get', '/market/price/history', Asset, Market.getPriceHistory);
             Channel.register(server, 'get', '/market/pair', Asset, Market.getPair);
             Channel.register(server, 'get', '/market/pair/assets', Asset, Market.getPairPolyAssets);
             Channel.register(server, 'get', '/market/pairs', Asset, Market.getPairs);
@@ -276,7 +279,11 @@ export namespace Router {
             return await Exchange.getOverallMetrics();
         }
         static async getMarkets() {
-            return await Exchange.getMarkets();
+            const [markets, delegators] = await Promise.all([Exchange.getMarkets(), Exchange.getDelegators()]);
+            return {
+                markets: markets,
+                delegators: delegators
+            }
         }
         static async getOrder(args: { id?: string | number }): Promise<Order> {
             if (typeof args.id != 'string' && typeof args.id != 'number')
@@ -300,14 +307,28 @@ export namespace Router {
 
             return pool;
         }
+        static async getDelegatedPool(args: { id?: string | number }): Promise<DelegatedPool> {
+            if (typeof args.id != 'string' && typeof args.id != 'number')
+                throw new Error('Delegated pool id is required');
+
+            const poolId = new Uint256(args.id);
+            const pool = await Exchange.getDelegatedPoolById(poolId);
+            if (!pool)
+                throw new Error('Delegated pool not found');
+
+            return pool;
+        }
         static async getPools(args: PageQuery): Promise<Pool[]> {
             return await Exchange.getBestPools(Cursor.page(args.page || 0));
+        }
+        static async getDelegatedPools(): Promise<PseudoDelegatedPool[]> {
+            return await Exchange.getBestDelegatedPools();
         }
         static async getPolyAssets(args: { assetHash?: string, liquidity?: boolean }): Promise<(AssetId & { liquidity?: BigNumber })[]> {
             if (typeof args.assetHash != 'string')
                 throw new Error('Asset hash is required');
 
-            const assetIdIn = await Exchange.getAssetIdByHash(new AssetId(args.assetHash), true);
+            const assetIdIn = await Exchange.getAssetIdByHash(new AssetId(args.assetHash), 'untrusted');
             if (!assetIdIn)
                 throw new Error('Asset hash in not found');
 
@@ -352,11 +373,11 @@ export namespace Router {
             if (slippage.lt(0) || slippage.gt(1))
                 throw new Error('Slippage must be between [0; 1]');
 
-            const assetIdIn = await Exchange.getAssetIdByHash(new AssetId(args.assetHashIn), true);
+            const assetIdIn = await Exchange.getAssetIdByHash(new AssetId(args.assetHashIn), 'untrusted');
             if (!assetIdIn)
                 throw new Error('Asset hash in not found');
 
-            const assetIdOut = await Exchange.getAssetIdByHash(new AssetId(args.assetHashOut), true);
+            const assetIdOut = await Exchange.getAssetIdByHash(new AssetId(args.assetHashOut), 'untrusted');
             if (!assetIdOut)
                 throw new Error('Asset hash out not found');
                 
@@ -374,16 +395,31 @@ export namespace Router {
             if (args.interval && !interval)
                 throw new Error('interval is not valid');
 
-            const primaryAssetId = await Exchange.getAssetIdByHash(new AssetId(args.primaryAssetHash), true);
+            const primaryAssetId = await Exchange.getAssetIdByHash(new AssetId(args.primaryAssetHash), 'untrusted');
             if (!primaryAssetId)
                 throw new Error('Primary asset id not found');
 
-            const secondaryAssetId = await Exchange.getAssetIdByHash(new AssetId(args.secondaryAssetHash), true);
+            const secondaryAssetId = await Exchange.getAssetIdByHash(new AssetId(args.secondaryAssetHash), 'untrusted');
             if (!secondaryAssetId)
                 throw new Error('Secondary asset id not found');
 
             const price = interval ? await Exchange.getAssetTWAP(primaryAssetId, secondaryAssetId, interval) : await Exchange.getAssetPrice(primaryAssetId, secondaryAssetId);
             return price;
+        }
+        static async getPriceHistory(args: { assetHashes: string, interval: BigNumber | string | number, points: BigNumber | string | number }): Promise<Record<string, AssetId & { history: [number, BigNumber][] }>> {      
+            const assets = typeof args.assetHashes == 'string' ? args.assetHashes.split(',').map(v => new AssetId(v.toString())) : [];
+            if (!Array.isArray(assets) || !assets.length)
+                throw new Error('Asset hashes must be a non-empty array');
+
+            const interval = typeof args.interval == 'string' || typeof args.interval == 'number' ? 1000 * new Uint256(args.interval).toInteger() : null;
+            if (!interval || interval < 1)
+                throw new Error('interval is not valid');
+
+            const points = typeof args.points == 'string' || typeof args.points == 'number' ? new Uint256(args.points).toInteger() : null;
+            if (!points || points <= 0 || points > 31)
+                throw new Error('points is not valid');
+
+            return await Exchange.getAssetPriceHistory(assets, interval, points);
         }
         static async getPair(args: { id?: string | number, primaryAssetHash?: string, secondaryAssetHash?: string, createIfNotExists?: boolean }): Promise<AggregatedPair> {
             if (typeof args.id != 'string' && typeof args.id != 'number')
@@ -396,8 +432,8 @@ export namespace Router {
                 throw new Error('Secondary asset hash is required');
 
             const marketId = new Uint256(args.id);
-            const primaryAssetId = await Exchange.getAssetIdByHash(new AssetId(args.primaryAssetHash), true);
-            const secondaryAssetId = await Exchange.getAssetIdByHash(new AssetId(args.secondaryAssetHash), true);
+            const primaryAssetId = await Exchange.getAssetIdByHash(new AssetId(args.primaryAssetHash), 'untrusted');
+            const secondaryAssetId = await Exchange.getAssetIdByHash(new AssetId(args.secondaryAssetHash), 'untrusted');
             const pairId = await Exchange.getPairByAssetIds(primaryAssetId, secondaryAssetId, marketId, !!args.createIfNotExists);
             if (!pairId)
                 throw new Error('Pair is not valid');
@@ -439,7 +475,7 @@ export namespace Router {
             }
             return compressedResult as any;
         }
-        static async getPairPriceLevels(args: { marketId?: string | number, pairId?: string | number, levels?: number }): Promise<{ ask: [number, BigNumber, BigNumber][], bid: [number, BigNumber, BigNumber][] }> {
+        static async getPairPriceLevels(args: { marketId?: string | number, pairId?: string | number, levels?: number }): Promise<{ ask: any[], bid: any[] }> {
             const marketId = typeof args.marketId == 'string' || typeof args.marketId == 'number' ? new Uint256(args.marketId) : null;
             if (!marketId)
                 throw new Error('Market id is required');
@@ -454,8 +490,8 @@ export namespace Router {
 
             const result = await Exchange.getAggregatedLevelsByMarketPair(marketId, pairId, levels);
             return {
-                ask: result.ask.map((v) => [v.id.toInteger(), v.price, v.quantity]),
-                bid: result.bid.map((v) => [v.id.toInteger(), v.price, v.quantity]),
+                ask: result.ask.map((v) => v.curve ? [v.id.toInteger(), v.price, v.quantity, v.curve.minPrice, v.curve.maxPrice, v.curve.primaryValue, v.curve.secondaryValue, v.curve.feeRate] : [v.id.toInteger(), v.price, v.quantity]),
+                bid: result.bid.map((v) => v.curve ? [v.id.toInteger(), v.price, v.quantity, v.curve.minPrice, v.curve.maxPrice, v.curve.primaryValue, v.curve.secondaryValue, v.curve.feeRate] : [v.id.toInteger(), v.price, v.quantity]),
             }
         }
         static async getPairLogs(args: { marketId?: string | number, pairId?: string | number } & PageQuery): Promise<AggregatedLog[]> {
@@ -504,6 +540,8 @@ export namespace Router {
             Channel.register(server, 'get', '/account/balances', Account, Account.getBalances);
             Channel.register(server, 'get', '/account/orders', Account, Account.getOrders);
             Channel.register(server, 'get', '/account/pools', Account, Account.getPools);
+            Channel.register(server, 'get', '/account/pools/delegated', Account, Account.getDelegatedPools);
+            Channel.register(server, 'get', '/account/delegations', Account, Account.getDelegations);
             Channel.register(server, 'get', '/account/tiers', Account, Account.getTiers);
         }
         static async getBalances(args: AccountQuery): Promise<{ asset: AssetId, unavailable: BigNumber, available: BigNumber, price: BigNumber | null }[]> {
@@ -536,7 +574,7 @@ export namespace Router {
                 throw new Error('Not a valid account');
 
             const fetchAccountTier = async (asset: AssetId, assetId: Uint256) => {
-                const currentTier = await Blockchain.call(market.account || '', Readability.toFunction(DEX.Spot.accountAssetOf), [account.address, ['$uint256', asset.toHex()]]);
+                const currentTier = await Blockchain.call(market.account || '', Readability.toFunction(Spot.DEX.accountAssetOf), [account.address, ['$uint256', asset.toHex()]]);
                 await Exchange.setSyncedAccountTierByAccountIdAndMarketAsset(account.id, marketId, assetId, new BigNumber(currentTier.account?.volume?.toString() || ''), new BigNumber(currentTier.maker_fee?.toString() || ''), new BigNumber(currentTier.taker_fee?.toString() || ''));
             };
 
@@ -591,6 +629,25 @@ export namespace Router {
 
             return await Exchange.getPoolsByAccountId(account.id, filter, Cursor.page(args.page || 0));
         }
+        static async getDelegatedPools(args: { marketId?: string | number, pairId?: string | number, active?: boolean } & AccountQuery & PageQuery): Promise<DelegatedPool[]> {
+            const filter = typeof args.active == 'boolean' ? args.active : null;
+            const account = await this.accountOf(args);
+            if (!account)
+                return [];
+
+            const cursor = Cursor.page(args.page || 0);
+            const marketId = typeof args.marketId == 'string' || typeof args.marketId == 'number' ? new Uint256(args.marketId) : null;
+            const pairId = typeof args.pairId == 'string' || typeof args.pairId == 'number' ? new Uint256(args.pairId) : null;
+            const marketPair = marketId != null && pairId != null;
+            return await (marketPair ? Exchange.getDelegatedPoolsByAccountIdAndMarketPair(account.id, marketId, pairId, filter, cursor) : Exchange.getDelegatedPoolsByAccountId(account.id, filter, cursor));
+        }
+        static async getDelegations(args: AccountQuery): Promise<PseudoDelegatedState[]> {
+            const account = await this.accountOf(args);
+            if (!account)
+                return [];
+
+            return await Exchange.getDelegationOf(account.id);
+        }
         static async get(args: AccountQuery): Promise<{ id: number, account: string }> {
             const account = await this.accountOf(args);
             if (!account) 
@@ -622,15 +679,6 @@ export namespace Router {
                 });
             }
             return syncedBalances || [];
-        }
-    }
-
-    export class Bot {
-        constructor(server: FastifyInstance) {
-            Channel.register(server, 'get', '/bot', Bot, Bot.get);
-        }
-        static async get(): Promise<{ }> {
-            return { };
         }
     }
 
