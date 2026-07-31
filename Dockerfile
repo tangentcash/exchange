@@ -8,4 +8,4 @@ FROM node:22-alpine AS deploy
 WORKDIR /home/make
 COPY --from=build /home/make /home/make
 EXPOSE 19420
-ENTRYPOINT ["yarn", "app", "/etc/tangentexchange.json"]
+ENTRYPOINT ["yarn", "indexer", "/etc/tangentexchange.json"]
