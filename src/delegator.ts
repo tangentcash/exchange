@@ -83,8 +83,11 @@ async function main() {
     if (!address) {
         Log.error('invalid address');
         return process.exit(1);
+    } else {
+        Log.info(`LP delegator account: ${address}`);
     }
 
+    let delegatedPoolsSize: number | null = null;
     const url = config.exchange;
     const checkInterval = config.checkInterval || 1_200;
     const twapInterval = config.twapInterval || 600;
@@ -101,6 +104,10 @@ async function main() {
             secondaryLiquidity: string;
             price: string;
         }[] = (await call(url, 'account/delegations', { account: address })) || [];
+        if (delegatedPools.length != delegatedPoolsSize) {
+            delegatedPoolsSize = delegatedPools.length;
+            Log.info(`LP delegations (${delegatedPools.length}):`, delegatedPools);
+        }
         for (let i = 0; i < delegatedPools.length; i++) {
             let maybePoolId: string | null = null;
             const delegatedPool = delegatedPools[i];
@@ -116,7 +123,7 @@ async function main() {
                 const primaryAsset = new AssetId(delegatedPool.primaryAsset);
                 const secondaryAsset = new AssetId(delegatedPool.secondaryAsset);
                 const prevPrice = new BigNumber(delegatedPool.price || '0');
-                const price = new BigNumber((await call('https://p2p.tangent.cash:19420', 'market/price', { primaryAssetHash: primaryAsset.id, secondaryAssetHash: secondaryAsset.id, interval: twapInterval })) || '0');
+                const price = new BigNumber((await call(url, 'market/price', { primaryAssetHash: primaryAsset.id, secondaryAssetHash: secondaryAsset.id, interval: twapInterval })) || '0');
                 const delta = prevPrice.gt(0) ? (price ? price : prevPrice).minus(prevPrice).dividedBy(prevPrice).abs() : new BigNumber(Math.max(threshold, 1))
                 if (!price.gt(0)) {
                     Log.info(`LP ${poolId} skipped: no market price (${i + 1}/${delegatedPools.length})`);
@@ -125,7 +132,7 @@ async function main() {
                     Log.info(`LP ${poolId} passed: ${ByteUtil.bigNumberToString(price as any)} +${delta.multipliedBy(100).toFixed(2)}% dev (${i + 1}/${delegatedPools.length})`);
                     continue;
                 } else {
-                    Log.info(`LP ${poolId} transfer: ${ByteUtil.bigNumberToString(prevPrice as any)} +${delta.multipliedBy(100).toFixed(2)}% dev (${i + 1}/${delegatedPools.length})`);
+                    Log.info(`LP ${poolId} staled: ${ByteUtil.bigNumberToString(prevPrice as any)} +${delta.multipliedBy(100).toFixed(2)}% dev (${i + 1}/${delegatedPools.length})`);
                 }
                 
                 const priceRange = range ? LiquidityPool.toRange(primaryReserve, secondaryReserve, price, range) : null;
@@ -136,6 +143,7 @@ async function main() {
 
                 let primaryValue: BigNumber | null = primaryReserve;
                 if (secondaryValue.gt(secondaryReserve)) {
+                    console.log('GT THAN RESERVE')
                     secondaryValue = secondaryReserve;
                     primaryValue = LiquidityPool.toPrimaryValue(secondaryReserve, price, minPrice, maxPrice);
                     if (!primaryValue)
@@ -167,13 +175,14 @@ async function main() {
                     SchemaUtil.store(stream, { ...transaction, signature: signature }, new Transactions.Call());
                     return stream;
                 });
-                Log.info(`LP ${poolId} transfer finalized (price: ${price.toString()}, tx: ${transactionHash})`);
+                Log.info(`LP ${poolId} renewal finalized (price: ${price.toString()}, tx: ${transactionHash})`);
             } catch (exception) {
-                Log.error(`LP ${maybePoolId || '(null)'} transfer failed:`, exception);
+                Log.error(`LP ${maybePoolId || '(null)'} renewal failed:`, exception);
+                process.exit(1);
             }
         }
 
-        Log.info(`LP delegation finalized (next: ${new Date(new Date().getTime() + checkInterval * 1_000)})`);
+        Log.info(`LP cycle finalized (next: ${new Date(new Date().getTime() + checkInterval * 1_000)})`);
         await new Promise((resolve) => setTimeout(resolve, checkInterval * 1_000));
     }
 }
