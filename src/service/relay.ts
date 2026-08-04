@@ -4,7 +4,7 @@ import { Log } from '../logging';
 import { Connection, Cursor, Notification, Exchange, PriceDescriptors, RouterPath, TimeCursor } from './exchange';
 import { FastifyInstance } from 'fastify/types/instance';
 import { Blockchain, BlockchainInfo } from './blockchain';
-import { AggregatedLog, AggregatedPair, Order, OrderSide, Pool, Market as MarketT, DelegatedPool, PseudoDelegatedPool, Delegator, PseudoDelegatedState } from '../types';
+import { AggregatedLog, AggregatedPair, Order, Pool, Market as MarketT, DelegatedPool, PseudoDelegatedPool, Delegator, PseudoDelegatedState } from '../types';
 import fastify, { FastifyReply, FastifyRequest } from 'fastify';
 import fastifyWebsocket, { WebSocket } from '@fastify/websocket';
 import cors from '@fastify/cors';
@@ -451,7 +451,7 @@ export namespace Router {
             const marketId = new Uint256(args.id);
             return await Exchange.getAggregatedPairs(marketId, null);
         }
-        static async getPairPriceSeries(args: { pairId?: string | number, interval?: string | number, page?: string | number }, reply?: FastifyReply): Promise<[number, number, BigNumber, BigNumber, BigNumber, BigNumber, BigNumber][]> {
+        static async getPairPriceSeries(args: { pairId?: string | number, interval?: string | number, page?: string | number }, reply?: FastifyReply): Promise<[number, BigNumber, BigNumber, BigNumber, BigNumber, BigNumber][]> {
             const pairId = typeof args.pairId == 'string' || typeof args.pairId == 'number' ? new Uint256(args.pairId) : null;
             if (!pairId)
                 throw new Error('Pair id is required');
@@ -466,7 +466,7 @@ export namespace Router {
 
             const cursor = TimeCursor.page(interval, page);
             const result = await Exchange.getAggregatedTradesByPairId(pairId, cursor);
-            const compressedResult = result.map((item) => [item.timepoint, item.side == OrderSide.Buy ? 1 : -1, item.volume, item.open, item.low, item.high, item.close]);
+            const compressedResult = result.map((item) => [item.timepoint, item.volume, item.open, item.low, item.high, item.close]);
             if (reply != null && cursor.toTime < cursor.maxTime) {
                 const expiration = new Date();
                 expiration.setDate(expiration.getDate() + 90);
