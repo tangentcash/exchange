@@ -64,10 +64,7 @@ export class Blockchain {
         }
         RPC.applyValidator(config.validator || null);
         RPC.applyImplementation({
-            onNodeMessage: undefined,
-            onNodeRequest: (method: string, message: any, _: number) => Log.query(`blockchain call (method: ${method}):`, message),
-            onNodeResponse: (method: string, message: any, _: number) => Log.query(`blockchain return (method: ${method}):`, message),
-            onNodeError: (method: string, error: unknown) => Log.error(`blockchain call ${method}: ${(error as any)?.message || error}`)
+            onNodeMessage: (method: string, message: { args: any; error: unknown; } | { args: any; result: any; }, _: number) => Log.query(`blockchain rpc`, method, message),
         });
         return await this.keepAlive(true);
     }
@@ -163,7 +160,7 @@ export class Blockchain {
             Log.error('blockchain sync failed:', exception);
         }
     
-        RPC.onNodeMessage = async (event) => {
+        RPC.onNodeEvent = async (event) => {
             if (event.type == 'block' && typeof event.result.number == 'number' && event.result.number > 0) {
                 await this.sync(event.result.number);
             }

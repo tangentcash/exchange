@@ -81,7 +81,6 @@ export type AggregatedPair = {
 
 export type AggregatedTrade = {
     timepoint: number,
-    side: OrderSide,
     volume: BigNumber,
     open: BigNumber,
     low: BigNumber,

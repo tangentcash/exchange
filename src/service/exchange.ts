@@ -140,7 +140,7 @@ export class Exchange {
             user: config.user,
             pass: config.password,
             database: config.database || 'ts',
-            max: config.connections || Math.max(16, os.cpus().length),
+            max: config.connections || Math.max(4, os.cpus().length),
             connection: {
                 application_name: config.application || 'ts',
             },
@@ -370,10 +370,17 @@ export class Exchange {
         );
         CREATE INDEX IF NOT EXISTS trades_pair_id_time ON trades (pair_id, time DESC);
         CREATE OR REPLACE FUNCTION system_clock() RETURNS BIGINT STABLE AS $$
-            SELECT extract(epoch from now())::BIGINT
+            SELECT (extract(epoch from now()) * 1000)::BIGINT
         $$ LANGUAGE sql;
         SELECT create_hypertable('trades', 'time', chunk_time_interval => 604800000) WHERE NOT EXISTS (SELECT TRUE FROM timescaledb_information.hypertables WHERE hypertable_name = 'trades');
         SELECT set_integer_now_func('trades', 'system_clock') WHERE NOT EXISTS (SELECT TRUE FROM timescaledb_information.hypertables WHERE hypertable_name = 'trades');
+        ALTER TABLE trades SET
+        (
+            timescaledb.compress,
+            timescaledb.compress_segmentby = 'pair_id',
+            timescaledb.compress_orderby = 'time DESC'
+        );
+        SELECT add_compression_policy('trades', 604800000);
         
         CREATE MATERIALIZED VIEW IF NOT EXISTS pairs_view AS (
             WITH timings AS (
@@ -3109,7 +3116,6 @@ export class Exchange {
         SELECT
             pair_id,
             time_bucket(${cursor.interval}, time + ${cursor.interval}) - ${cursor.interval} AS timepoint,
-            AVG(side) AS side,
             SUM(quantity) AS volume,
             FIRST(price, time) AS open,
             MIN(price) AS low,
@@ -3142,7 +3148,6 @@ export class Exchange {
                 const parent = sibling && position >= 1 ? primary[position - 1] : null;
                 primary.splice(position, sibling ? 1 : 0, {
                     timepoint: target.timepoint,
-                    side: sibling ? (target.side + sibling.side) / 2 : target.side,
                     volume: sibling ? target.volume.dividedBy(relative.close).plus(sibling.volume) : target.volume.dividedBy(relative.close),
                     open: sibling ? (parent ? parent.close : sibling.open) : target.open.dividedBy(relative.close),
                     low: sibling ? BigNumber.min(target.low.dividedBy(relative.close), sibling.low) : target.low.dividedBy(relative.close),
@@ -3159,7 +3164,6 @@ export class Exchange {
                 const parent = sibling && position >= 1 ? primary[position - 1] : null;
                 primary.splice(position, sibling ? 1 : 0, {
                     timepoint: target.timepoint,
-                    side: sibling ? (target.side + sibling.side) / 2 : target.side,
                     volume: sibling ? target.volume.dividedBy(target.close).plus(sibling.volume) : target.volume.dividedBy(target.close),
                     open: sibling ? (parent ? parent.close : sibling.open) : relative.close.dividedBy(target.open),
                     low: sibling ? BigNumber.min(relative.close.dividedBy(target.low), sibling.low) : relative.close.dividedBy(target.low),
@@ -3167,10 +3171,6 @@ export class Exchange {
                     close: sibling ? relative.close.dividedBy(target.close).plus(sibling.close).dividedBy(2) : relative.close.dividedBy(target.close)
                 });
             }
-        }
-        for (let i = 0; i < primary.length; i++) {
-            const item = primary[i];
-            item.side = item.side > 0.5 ? OrderSide.Sell : OrderSide.Buy;
         }
         return this.toFixedSeries(primary, cursor.fromTime, cursor.toTime, cursor.interval, (base: AggregatedTrade) => ({
             ...base,
@@ -3629,7 +3629,6 @@ export class Exchange {
     private static toAggregatedTrade(value: pq.Row): AggregatedTrade {
         return {
             timepoint: parseInt(value['timepoint']),
-            side: parseFloat(value['side']) || OrderSide.Buy,
             volume: Common.bn(value['volume']) || new BigNumber(0),
             open: Common.bn(value['open']) || new BigNumber(0),
             low: Common.bn(value['low']) || new BigNumber(0),
