@@ -380,7 +380,7 @@ export class Exchange {
             timescaledb.compress_segmentby = 'pair_id',
             timescaledb.compress_orderby = 'time DESC'
         );
-        SELECT add_compression_policy('trades', 604800000);
+        SELECT add_compression_policy('trades', 604800000) WHERE NOT EXISTS (SELECT TRUE FROM timescaledb_information.hypertables WHERE hypertable_name = 'trades');
         
         CREATE MATERIALIZED VIEW IF NOT EXISTS pairs_view AS (
             WITH timings AS (
