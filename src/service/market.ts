@@ -36,13 +36,19 @@ export function patchOut(index: number, path: string, output: any): any {
 export type QuoteSources = {
     realtime: Record<string, string | [string, Record<string, string>]>;
     fallback: Record<string, string | [string, Record<string, string>]>;
+    logging: boolean;
+};
+
+export type QuoteResult = {
+    value: BigNumber,
+    source: 'realtime' | 'fallback' | 'cache'
 };
 
 export class Quotes {
     static currencies: string[][] = [
         ["USD", "USDT", "USDC", "DAI"]
     ];
-    static quotes: QuoteSources = { realtime: { }, fallback: { } };
+    static quotes: QuoteSources = { realtime: { }, fallback: { }, logging: false };
     static blacklist: Record<string, Set<string>> = { };
     static cache: Record<string, Record<string, { ttl: Date, price: BigNumber }>> = { };
     static offset: number = Math.floor(Math.random() * 65536);
@@ -50,10 +56,10 @@ export class Quotes {
     static setSources(quotes: QuoteSources): void {
         this.quotes = quotes;
     }
-    private static async providerPriceOf(source: 'realtime' | 'fallback', primaryAsset: AssetId, secondaryAsset: AssetId): Promise<BigNumber> {
+    private static async providerPriceOf(source: 'realtime' | 'fallback', primaryAsset: AssetId, secondaryAsset: AssetId): Promise<QuoteResult> {
         const primary = symbolOf(primaryAsset), secondary = symbolOf(secondaryAsset);
         if (primary == secondary)
-            return new BigNumber(1);
+            return { value: new BigNumber(1), source: 'cache' };
 
         const pair = primary + secondary;
         try {
@@ -125,9 +131,11 @@ export class Quotes {
                 if (price.isNaN() || !price.isFinite() || !price.isGreaterThanOrEqualTo(0))
                     throw new Error(`Invalid price extracted from ${patchUrl}: ${price}`);
                 
-                Log.info(`${source} price query ${patchUrl} for ${pair} pair: ${price.toString()} ${symbolOf(secondaryAsset)}`);
+                if (this.quotes.logging)
+                    Log.info(`${source} price query ${patchUrl} for ${pair} pair: ${price.toString()} ${symbolOf(secondaryAsset)}`);
+
                 registry[pair] = { ttl: new Date(time.getTime() + TTL[source]), price: new BigNumber(price) };
-                return price;
+                return { value: price, source: source };
             } catch (exception: any) {
                 if (!networkError) {
                     Log.error(`${source} price query ${patchUrl} for ${pair} pair error: ${exception.message || 'failed'} (now blacklisted)`);
@@ -139,18 +147,18 @@ export class Quotes {
         }
 
         if (bestOldQuote != null)
-            return bestOldQuote.price;
+            return { value: bestOldQuote.price, source: 'cache' };
 
         throw new Error(`Price of ${pair} cannot be found: no applicable providers`);
     }
-    static async directPriceOf(primaryAsset: AssetId, secondaryAsset: AssetId, source?: 'realtime' | 'fallback'): Promise<BigNumber> {
+    static async directPriceOf(primaryAsset: AssetId, secondaryAsset: AssetId, source?: 'realtime' | 'fallback'): Promise<QuoteResult> {
         if (source != null)
             return await this.providerPriceOf(source, primaryAsset, secondaryAsset);
 
         try { return await this.providerPriceOf('realtime', primaryAsset, secondaryAsset); } catch { }
         return await this.providerPriceOf('fallback', primaryAsset, secondaryAsset);
     }
-    static async crossPriceOf(primaryAsset: AssetId, secondaryAsset: AssetId): Promise<BigNumber> {
+    static async crossPriceOf(primaryAsset: AssetId, secondaryAsset: AssetId): Promise<QuoteResult> {
         try {
             if (!Whitelist.has(primaryAsset))
                 throw new Error(`${symbolOf(primaryAsset)} requires whitelisting`);
@@ -161,12 +169,15 @@ export class Quotes {
             throw exception
         }
 
-        const fetchDirectly = async (primary: AssetId, secondary: AssetId): Promise<BigNumber> => {
+        const fetchDirectly = async (primary: AssetId, secondary: AssetId): Promise<QuoteResult> => {
             try { return await this.directPriceOf(primary, secondary); } catch { }
-            try { return new BigNumber(1).dividedBy(await this.directPriceOf(secondary, primary)); } catch { }
+            try {
+                const result = await this.directPriceOf(secondary, primary);
+                return { value: new BigNumber(1).dividedBy(result.value), source: result.source };
+            } catch { }
             throw new Error(`No direct price found for ${symbolOf(primary)}${symbolOf(secondary)}`);
         };
-        const fetchIndirectly = async (asset: AssetId): Promise<{ asset: string, price: BigNumber }> => {
+        const fetchIndirectly = async (asset: AssetId): Promise<{ asset: string, price: QuoteResult }> => {
             for (let i = 0; i < this.currencies.length; i++) {
                 const currencies = this.currencies[i];
                 for (let j = 0; j < currencies.length; j++) {
@@ -180,14 +191,14 @@ export class Quotes {
         const primary = await fetchIndirectly(primaryAsset);
         const secondary = await fetchIndirectly(secondaryAsset);
         if (primary.asset == secondary.asset)
-            return primary.price.dividedBy(secondary.price);
+            return { value: primary.price.value.dividedBy(secondary.price.value), source: primary.price.source };
 
         const primaryBase = await fetchIndirectly(AssetId.fromHandle(primary.asset));
         const secondaryBase = await fetchIndirectly(AssetId.fromHandle(secondary.asset));
         if (primaryBase.asset != secondaryBase.asset)
             throw new Error(`No cross price for ${symbolOf(primaryAsset)}${symbolOf(secondaryAsset)} (${primary.asset}${secondary.asset} -> ${primaryBase.asset}${primaryBase.asset})`);
 
-        return primary.price.multipliedBy(primaryBase.price).dividedBy(secondary.price.multipliedBy(secondaryBase.price));
+        return { value: primary.price.value.multipliedBy(primaryBase.price.value).dividedBy(secondary.price.value.multipliedBy(secondaryBase.price.value)), source: primary.price.source };
     }
     static globalBase(): string | null {
         const currencies = this.currencies[0];

@@ -76,7 +76,8 @@ async function main(): Promise<void> {
             if (typeof setup.realtime == 'object' && typeof setup.fallback == 'object' && typeof setup.frequency == 'number') {
                 Quotes.setSources({
                     realtime: setup.realtime || { },
-                    fallback: setup.fallback || { }
+                    fallback: setup.fallback || { },
+                    logging: setup.logging || false
                 });
                 Jobs.runAssetPrices(setup.frequency);
                 Log.info('background jobs: asset price resolver now running');

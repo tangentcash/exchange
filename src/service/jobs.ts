@@ -1,7 +1,7 @@
 import pq from 'postgres';
 import { AssetId } from 'tangentsdk';
 import { Exchange, Notification } from './exchange'
-import { Quotes, symbolOf } from './market';
+import { QuoteResult, Quotes, symbolOf } from './market';
 import { OrderSide, Trade } from '../types';
 import { Log } from '../logging';
 import BigNumber from 'bignumber.js';
@@ -33,6 +33,7 @@ export class Jobs {
                     const assets = await Exchange.getAssetHandles();
                     const cache: Record<string, Omit<Trade, 'id' | 'pairId'>> = { };
                     const trades: { asset: AssetId, trade: Omit<Trade, 'id' | 'pairId'> }[] = [];
+                    const fits = { realtime: 0, fallback: 0, cache: 0 };
                     const native = new AssetId().id;
                     for (let i = 0; i < assets.length; i++) {
                         const asset = assets[i];
@@ -42,14 +43,15 @@ export class Jobs {
                         const symbol = symbolOf(asset);
                         const parent = cache[symbol];
                         try {
-                            const price = parent ? parent.price : await Quotes.crossPriceOf(asset, base);
+                            const price: QuoteResult = parent ? { value: parent.price, source: 'cache' } : await Quotes.crossPriceOf(asset, base);
                             const delta = 2 * Math.random() - 1;
                             let trade: Omit<Trade, 'id' | 'pairId'> = parent ? parent : {
                                 side: delta > 0 ? OrderSide.Buy : OrderSide.Sell,
-                                price: price.multipliedBy(1 + delta * 0.0001),
+                                price: price.value.multipliedBy(1 + delta * 0.0001),
                                 quantity: new BigNumber(0),
                                 time: new Date()
                             };
+                            ++fits[price.source];
                             if (!parent)
                                 cache[symbol] = trade;
 
@@ -61,7 +63,7 @@ export class Jobs {
                         }
                     }
 
-                    Log.info(`job market sync: OK found ${trades.length}/${assets.length} trades`);
+                    Log.info(`job market sync: OK complete (trades: ${trades.length}/${assets.length}, realtime: ${fits.realtime}, fallback: ${fits.fallback}, cache: ${fits.cache})`);
                     await Exchange.isolate(async (connection: pq.TransactionSql) => {
                         for (let i = 0; i < trades.length; i++) {
                             const trade = trades[i];
@@ -92,7 +94,6 @@ export class Jobs {
                                     this.assetPrices.blacklist.add(trade.asset.id);
                             }
                         }
-                        Log.info(`job market sync: OK push ${trades.length} trades`);
                     });
                     this.assetPrices.timeout = null;
                     resolve();

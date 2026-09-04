@@ -6,7 +6,8 @@ import { BigNumber } from "bignumber.js";
 export type Options = {
     validator?: string;
     contracts?: Record<string, Record<string, string>>;
-    network?: 'regtest' | 'testnet' | 'mainnet'
+    network?: 'regtest' | 'testnet' | 'mainnet';
+    tip?: number;
 }
 
 export type Events = {
@@ -103,7 +104,7 @@ export class Blockchain {
         this.syncing = true;
         try {
             let pendingQueue: number[] = [];
-            let syncedBlock = await Exchange.getLatestBlock();
+            let syncedBlockNumber = (await Exchange.getLatestBlock())?.blockNumber || null;
             for (let i = 0; i < this.contracts.topics.length; i++) {
                 const queue: number[] = [];
                 while (true) {
@@ -114,9 +115,9 @@ export class Blockchain {
                     let finalize = false;
                     for (let i = 0; i < transactions.length && !finalize; i++) {
                         const blockNumber = parseInt(transactions[i].receipt.block_number.toString());
-                        if (syncedBlock && blockNumber <= syncedBlock.blockNumber) {
+                        if (syncedBlockNumber && blockNumber <= syncedBlockNumber) {
                             let collision = 0;
-                            const child = blockNumber == syncedBlock.blockNumber ? syncedBlock : await Exchange.getBlockByNumber(blockNumber);
+                            const child = await Exchange.getBlockByNumber(blockNumber);
                             const parent = child ? await this.findBlock(child.blockHash) : null;
                             finalize = child && parent;
                             while (!finalize) {
@@ -125,7 +126,7 @@ export class Blockchain {
                                 if (!tipBlock || collisionBlock != null) {
                                     Log.info(`blockchain reorganize: ${tipBlock ? 'rollback to block ' + tipBlock.blockNumber.toString() : 'rebuild from scratch'} (collision: ${tipBlock ? tipBlock.blockHash.toHex() : 'null'})`);
                                     await Exchange.rollbackToBlock(tipBlock?.blockNumber || 0);
-                                    syncedBlock = tipBlock;
+                                    syncedBlockNumber = tipBlock?.blockNumber || null;
                                     break;
                                 }
                             }

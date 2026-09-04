@@ -9,6 +9,8 @@ import NodeCache from 'node-cache';
 import pq from 'postgres';
 import os from 'os';
 
+const MARKET_CLEANUP = false;
+
 export type PriceDescriptors = Record<string, { whitelist: boolean, base: string | null, price: { open: BigNumber | null, close: BigNumber | null } }>;
 
 export type Connection = pq.TransactionSql;
@@ -483,13 +485,15 @@ export class Exchange {
                 throw new Error('cannot decode contract account ' + contract.account);
 
             accounts[contract.account] = accountId;
-            switch (contract.type) {
-                case 'dex': {
-                    const market = await this.getMarketByAccountId(accountId, connection);
-                    if (market != null) {
-                        await this.cleanupLogs(market.id, block.number, connection);
+            if (MARKET_CLEANUP) {
+                switch (contract.type) {
+                    case 'dex': {
+                        const market = await this.getMarketByAccountId(accountId, connection);
+                        if (market != null) {
+                            await this.cleanupLogs(market.id, block.number, connection);
+                        }
+                        break;
                     }
-                    break;
                 }
             }
         }
