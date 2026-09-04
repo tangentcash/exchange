@@ -795,7 +795,7 @@ supports-preserve-symlinks-flag@^1.0.0:
 
 "tangentsdk@https://github.com/tangentcash/sdk.git":
   version "1.0.0"
-  resolved "https://github.com/tangentcash/sdk.git#91977ac65bf183f90e7601e66dc121f0d13d562e"
+  resolved "https://github.com/tangentcash/sdk.git#e920133aff713ac6b61381dcdfd2f1030e1903dd"
   dependencies:
     "@ethersproject/random" "5.8.0"
     "@noble/hashes" "1.8.0"
