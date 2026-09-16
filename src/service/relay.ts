@@ -1,5 +1,5 @@
 import { randomBytes } from 'crypto';
-import { AssetId, ByteUtil, Readability, Signing, Spot, Uint256 } from 'tangentsdk';
+import { AssetId, ByteUtil, UiUtil, Signing, Spot, Uint256 } from 'tangentsdk';
 import { Log } from '../logging';
 import { Connection, Cursor, Notification, Exchange, PriceDescriptors, RouterPath, TimeCursor } from './exchange';
 import { FastifyInstance } from 'fastify/types/instance';
@@ -574,7 +574,7 @@ export namespace Router {
                 throw new Error('Not a valid account');
 
             const fetchAccountTier = async (asset: AssetId, assetId: Uint256) => {
-                const currentTier = await Blockchain.call(market.account || '', Readability.toFunction(Spot.DEX.accountAssetOf), [account.address, ['$uint256', asset.toHex()]]);
+                const currentTier = await Blockchain.call(market.account || '', UiUtil.toFunction(Spot.DEX.accountAssetOf), [account.address, ['$uint256', asset.toHex()]]);
                 await Exchange.setSyncedAccountTierByAccountIdAndMarketAsset(account.id, marketId, assetId, new BigNumber(currentTier.account?.volume?.toString() || ''), new BigNumber(currentTier.maker_fee?.toString() || ''), new BigNumber(currentTier.taker_fee?.toString() || ''));
             };
 

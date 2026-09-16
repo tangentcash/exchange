@@ -1,5 +1,5 @@
 import { BigNumber } from "bignumber.js";
-import { AssetId, ByteUtil, Hashing, Pubkeyhash, Readability, Signing, Spot, Uint256, Whitelist } from 'tangentsdk';
+import { AssetId, ByteUtil, Hashing, Pubkeyhash, UiUtil, Signing, Spot, Uint256, Whitelist } from 'tangentsdk';
 import { MarketPolicy, Market, Order, OrderCondition, OrderPolicy, OrderSide, Trade, AggregatedPair, AggregatedTrade, AggregatedLevel, AggregatedLog, Block, RefType, Pool, Depth, Delegator, DelegatedPool, PseudoDelegatedPool, PseudoDelegatedState } from './../types';
 import { Log } from './../logging';
 import { Common } from './../common';
@@ -511,7 +511,7 @@ export class Exchange {
                     switch (log.event.type) {
                         case Spot.DEX.Events.Config: {
                             try {
-                                const market = await Blockchain.call(contract.account, Readability.toFunction(Spot.DEX.paramsOf), []);
+                                const market = await Blockchain.call(contract.account, UiUtil.toFunction(Spot.DEX.paramsOf), []);
                                 if (market != null) {
                                     if (!accounts[market.deployer_account]) {
                                         const accountId = await this.getAccountIdByAddress(market.deployer_account, false, connection);
@@ -562,22 +562,22 @@ export class Exchange {
                                         policy: parseInt(log.args[3].toString()) as OrderPolicy,
                                         value: log.pays.reduce((x, y) => x.plus(y.value), new BigNumber(0))
                                     });
-                                    switch (log.method ? Readability.toFunction(log.method) : null) {
-                                        case Readability.toFunction(Spot.DEX.marketOrder):
+                                    switch (log.method ? UiUtil.toFunction(log.method) : null) {
+                                        case UiUtil.toFunction(Spot.DEX.marketOrder):
                                             pseudo = {
                                                 ...orderParameters(),
                                                 condition: OrderCondition.Market,
                                                 slippage: Common.bn(log.args[4]),
                                             };
                                             break;
-                                        case Readability.toFunction(Spot.DEX.limitOrder):
+                                        case UiUtil.toFunction(Spot.DEX.limitOrder):
                                             pseudo = {
                                                 ...orderParameters(),
                                                 condition: OrderCondition.Limit,
                                                 price: Common.bn(log.args[4]),
                                             };
                                             break;
-                                        case Readability.toFunction(Spot.DEX.stopOrder):
+                                        case UiUtil.toFunction(Spot.DEX.stopOrder):
                                             pseudo = {
                                                 ...orderParameters(),
                                                 condition: OrderCondition.Stop,
@@ -585,7 +585,7 @@ export class Exchange {
                                                 slippage: Common.bn(log.args[5])
                                             };
                                             break;
-                                        case Readability.toFunction(Spot.DEX.stopLimitOrder):
+                                        case UiUtil.toFunction(Spot.DEX.stopLimitOrder):
                                             pseudo = {
                                                 ...orderParameters(),
                                                 condition: OrderCondition.StopLimit,
@@ -593,7 +593,7 @@ export class Exchange {
                                                 price: Common.bn(log.args[5])
                                             };
                                             break;
-                                        case Readability.toFunction(Spot.DEX.trailingStopOrder):
+                                        case UiUtil.toFunction(Spot.DEX.trailingStopOrder):
                                             pseudo = {
                                                 ...orderParameters(),
                                                 condition: OrderCondition.TrailingStop,
@@ -603,7 +603,7 @@ export class Exchange {
                                                 trailingDistance: Common.bn(log.args[7]),
                                             };
                                             break;
-                                        case Readability.toFunction(Spot.DEX.trailingStopLimitOrder):
+                                        case UiUtil.toFunction(Spot.DEX.trailingStopLimitOrder):
                                             pseudo = {
                                                 ...orderParameters(),
                                                 condition: OrderCondition.TrailingStopLimit,
@@ -631,8 +631,8 @@ export class Exchange {
                             let pseudo: PseudoPool | null = null;
                             if (!pseudos[log.hash]) {
                                 try {
-                                    switch (log.method ? Readability.toFunction(log.method) : null) {
-                                        case Readability.toFunction(Spot.DEX.depositPool):
+                                    switch (log.method ? UiUtil.toFunction(log.method) : null) {
+                                        case UiUtil.toFunction(Spot.DEX.depositPool):
                                             pseudo = {
                                                 transaction: log,
                                                 primaryAsset: new AssetId(log.args[0]),
@@ -711,7 +711,7 @@ export class Exchange {
                                 if (!market)
                                     throw new Error('Failed to get market: ' + contract.account);
 
-                                const tier = await Blockchain.call(contract.account, Readability.toFunction(Spot.DEX.assetOf), [asset.toUint256()]);
+                                const tier = await Blockchain.call(contract.account, UiUtil.toFunction(Spot.DEX.assetOf), [asset.toUint256()]);
                                 const assetId = await this.getAssetIdByHash(asset, 'trusted', connection);
                                 if (!assetId)
                                     throw new Error('Failed to get asset id');
@@ -733,7 +733,7 @@ export class Exchange {
                     switch (log.event.type) {
                         case Spot.DLP.Events.Config: {
                             try {
-                                const delegator = await Blockchain.call(contract.account, Readability.toFunction(Spot.DLP.paramsOf), []);
+                                const delegator = await Blockchain.call(contract.account, UiUtil.toFunction(Spot.DLP.paramsOf), []);
                                 if (delegator != null) {
                                     if (!accounts[delegator.deployer_account]) {
                                         const accountId = await this.getAccountIdByAddress(delegator.deployer_account, false, connection);
@@ -827,7 +827,7 @@ export class Exchange {
                                                 throw new Error('Failed to get delegated pool account id: ' + delegatedPool.accountId);
 
                                             owner = Signing.encodeAddress(account);
-                                            const share = await Blockchain.call(contract.account, Readability.toFunction(Spot.DLP.shareOf), [primaryAsset.toUint256(), secondaryAsset.toUint256(), owner]);
+                                            const share = await Blockchain.call(contract.account, UiUtil.toFunction(Spot.DLP.shareOf), [primaryAsset.toUint256(), secondaryAsset.toUint256(), owner]);
                                             const result = await this.setDelegatedPool({
                                                 pairId: pairId,
                                                 marketId: market.id,
@@ -900,7 +900,7 @@ export class Exchange {
 
                                     let delegatedPoolId: Uint256 | null = null;
                                     try {
-                                        const share = await Blockchain.call(contract.account, Readability.toFunction(Spot.DLP.shareOf), [primaryAsset.toUint256(), secondaryAsset.toUint256(), owner]);
+                                        const share = await Blockchain.call(contract.account, UiUtil.toFunction(Spot.DLP.shareOf), [primaryAsset.toUint256(), secondaryAsset.toUint256(), owner]);
                                         const result = await this.setDelegatedPool({
                                             pairId: pairId,
                                             marketId: market.id,
@@ -957,7 +957,7 @@ export class Exchange {
                 try {
                     const pseudoOrder: PseudoOrder = event.pseudoRef as any;
                     try {
-                        order = await Blockchain.call(contract.account, Readability.toFunction(Spot.DEX.orderOf), [event.orderId]);
+                        order = await Blockchain.call(contract.account, UiUtil.toFunction(Spot.DEX.orderOf), [event.orderId]);
                     } catch (exception) {
                         if (!event.pseudoRef)
                             throw exception;
@@ -974,7 +974,7 @@ export class Exchange {
                         accounts[account] = accountId;
                     }
                     
-                    const pair = order ? await Blockchain.call(contract.account, Readability.toFunction(Spot.DEX.pairOf), [order.pair_id]) : { primary_asset: pseudoOrder.primaryAsset.toHex(), secondary_asset: pseudoOrder.secondaryAsset.toHex() };
+                    const pair = order ? await Blockchain.call(contract.account, UiUtil.toFunction(Spot.DEX.pairOf), [order.pair_id]) : { primary_asset: pseudoOrder.primaryAsset.toHex(), secondary_asset: pseudoOrder.secondaryAsset.toHex() };
                     if (!pair)
                         throw new Error('cannot find asset pair of contract account ' + contract.account);
 
@@ -1062,7 +1062,7 @@ export class Exchange {
                 try {
                     const pseudoPool: PseudoPool = event.pseudoRef as any;
                     try {
-                        pool = await Blockchain.call(contract.account, Readability.toFunction(Spot.DEX.poolOf), [event.poolId]);
+                        pool = await Blockchain.call(contract.account, UiUtil.toFunction(Spot.DEX.poolOf), [event.poolId]);
                     } catch (exception) {
                         if (!event.pseudoRef)
                             throw exception;
@@ -1079,7 +1079,7 @@ export class Exchange {
                         accounts[account] = accountId;
                     }
                     
-                    const pair = pool ? await Blockchain.call(contract.account, Readability.toFunction(Spot.DEX.pairOf), [pool.pair_id]) : { primary_asset: pseudoPool.primaryAsset.toHex(), secondary_asset: pseudoPool.secondaryAsset.toHex() };
+                    const pair = pool ? await Blockchain.call(contract.account, UiUtil.toFunction(Spot.DEX.pairOf), [pool.pair_id]) : { primary_asset: pseudoPool.primaryAsset.toHex(), secondary_asset: pseudoPool.secondaryAsset.toHex() };
                     if (!pair)
                         throw new Error('cannot find asset pair of contract account ' + contract.account);
 

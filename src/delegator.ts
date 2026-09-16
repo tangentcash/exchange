@@ -1,4 +1,4 @@
-import { AssetId, ByteUtil, Chain, Hashsig, LiquidityPool, Messages, Readability, RPC, SchemaUtil, Signing, Spot, Stream, Transactions, Uint256 } from 'tangentsdk';
+import { AssetId, ByteUtil, Chain, Hashsig, LiquidityPool, Messages, UiUtil, RPC, SchemaUtil, Signing, Spot, Stream, Transactions, Uint256 } from 'tangentsdk';
 import { Log } from './logging';
 import BigNumber from 'bignumber.js';
 import process from 'node:process';
@@ -161,7 +161,7 @@ async function main() {
                         gasLimit: gasLimit,
                         callable: Signing.decodeAddress(delegatedPool.delegatorAccount),
                         pays: [],
-                        function: Readability.toFunction(Spot.DLP.transferLiquidity),
+                        function: UiUtil.toFunction(Spot.DLP.transferLiquidity),
                         args: [primaryAsset.toUint256(), secondaryAsset.toUint256(), primaryValue, secondaryValue, price, range ? minPrice : new BigNumber(-1), range ? maxPrice : new BigNumber(-1), feeRate]        
                     };
                     
