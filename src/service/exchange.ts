@@ -9,8 +9,6 @@ import NodeCache from 'node-cache';
 import pq from 'postgres';
 import os from 'os';
 
-const MARKET_CLEANUP = false;
-
 export type PriceDescriptors = Record<string, { whitelist: boolean, base: string | null, price: { open: BigNumber | null, close: BigNumber | null } }>;
 
 export type Connection = pq.TransactionSql;
@@ -73,6 +71,7 @@ export type Options = {
     database?: string;
     application?: string;
     connections?: number;
+    intervals?: number[]
 }
 
 export type Caches = {
@@ -122,6 +121,7 @@ export class TimeCursor {
 
 export class Exchange {
     static listeners: Record<string, pq.ListenMeta> = { };
+    static intervals: number[] = [2628000, 604800, 259200, 86400, 14400, 3600, 1800, 900, 300, 60];
     static connection: pq.Sql;
     static cache: Caches;
 
@@ -159,6 +159,7 @@ export class Exchange {
             throw new Error('postgresql database must have \'timescaledb\' extension loaded');
 
         this.connection = sql;
+        this.intervals = (config.intervals || this.intervals).sort((a, b) => a - b);
         this.clearCache();
         return this.deploy();
     }
@@ -375,14 +376,14 @@ export class Exchange {
             SELECT (extract(epoch from now()) * 1000)::BIGINT
         $$ LANGUAGE sql;
         SELECT create_hypertable('trades', 'time', chunk_time_interval => 604800000) WHERE NOT EXISTS (SELECT TRUE FROM timescaledb_information.hypertables WHERE hypertable_name = 'trades');
-        SELECT set_integer_now_func('trades', 'system_clock') WHERE NOT EXISTS (SELECT TRUE FROM timescaledb_information.hypertables WHERE hypertable_name = 'trades');
+        SELECT set_integer_now_func('trades', 'system_clock', replace_if_exists => true);
         ALTER TABLE trades SET
         (
             timescaledb.compress,
             timescaledb.compress_segmentby = 'pair_id',
             timescaledb.compress_orderby = 'time DESC'
         );
-        SELECT add_compression_policy('trades', 604800000) WHERE NOT EXISTS (SELECT TRUE FROM timescaledb_information.hypertables WHERE hypertable_name = 'trades');
+        SELECT add_compression_policy('trades', 604800000, if_not_exists => true);
         
         CREATE MATERIALIZED VIEW IF NOT EXISTS pairs_view AS (
             WITH timings AS (
@@ -442,6 +443,71 @@ export class Exchange {
             FROM sources
                 INNER JOIN timings ON TRUE
         )`.simple());
+        await this.deployPriceSeries(sql);
+    }
+    private static async deployPriceSeries(connection?: pq.Sql | pq.TransactionSql): Promise<void> {
+        const sql = connection || this.connection;
+        const intervals = this.intervals.filter((v, index, self) => Number.isInteger(v) && v > 0 && self.indexOf(v) == index).sort((a, b) => a - b);
+        const sources: number[] = new Array(intervals.length).fill(0);
+        const fingerprints: string[] = new Array(intervals.length);
+        const present: boolean[] = new Array(intervals.length).fill(false);
+        const found: (string | null)[] = new Array(intervals.length).fill(null);
+        for (let i = 0; i < intervals.length; i++) {
+            for (let j = i - 1; j >= 0; j--) {
+                if (intervals[i] % intervals[j] == 0) {
+                    sources[i] = intervals[j];
+                    break;
+                }
+            }
+
+            fingerprints[i] = `tangent:price-series:v1:${intervals[i] * 1000}:${sources[i] > 0 ? 'trades_' + sources[i] + '_view' : 'trades'}`;
+            const existing = await this.resultOf(sql`SELECT to_regclass(${'trades_' + intervals[i] + '_view'}) IS NOT NULL AS present, obj_description(to_regclass(${'trades_' + intervals[i] + '_view'}), 'pg_class') AS fingerprint`);
+            present[i] = existing.length > 0 && existing[0]['present'] === true;
+            found[i] = existing.length > 0 ? existing[0]['fingerprint'] : null;
+        }
+
+        const rebuildFrom = fingerprints.findIndex((v, index) => present[index] && found[index] !== v);
+        for (let j = intervals.length - 1; j >= 0 && rebuildFrom >= 0 && j >= rebuildFrom; j--) {
+            await this.resultOf(sql.unsafe(`DROP MATERIALIZED VIEW IF EXISTS trades_${intervals[j]}_view`));
+            present[j] = false;
+        }
+        
+        for (let i = 0; i < intervals.length; i++) {
+            const interval = intervals[i];
+            const bucket = interval * 1000;
+            const source = sources[i];
+            const name = 'trades_' + interval + '_view';
+            await this.resultOf(sql.unsafe((source > 0 ? `
+            CREATE MATERIALIZED VIEW IF NOT EXISTS ${name} WITH (timescaledb.continuous) AS
+            SELECT 
+                pair_id,
+                time_bucket(${bucket}, timepoint) AS timepoint,
+                SUM(volume) AS volume,
+                FIRST(open, timepoint) AS open,
+                MIN(low) AS low,
+                MAX(high) AS high,
+                LAST(close, timepoint) AS close
+            FROM trades_${source}_view
+            GROUP BY pair_id, time_bucket(${bucket}, timepoint)` : `
+            CREATE MATERIALIZED VIEW IF NOT EXISTS ${name} WITH (timescaledb.continuous) AS
+            SELECT 
+                pair_id,
+                time_bucket(${bucket}, time) AS timepoint,
+                SUM(quantity) AS volume,
+                FIRST(price, time) AS open,
+                MIN(price) AS low,
+                MAX(price) AS high,
+                LAST(price, time) AS close
+            FROM trades
+            GROUP BY pair_id, time_bucket(${bucket}, time)`)));
+            await this.resultOf(sql.unsafe(`COMMENT ON VIEW ${name} IS '${fingerprints[i].replace(/'/g, "''")}'`));
+            await this.resultOf(sql.unsafe(`CREATE INDEX IF NOT EXISTS ${name}_pair_id_timepoint ON ${name} (pair_id, timepoint DESC)`));
+            const policies = await this.resultOf(sql`SELECT 1 AS configured FROM timescaledb_information.jobs WHERE proc_name = 'policy_refresh_continuous_aggregate' AND hypertable_schema = 'public' AND hypertable_name = ${name}`);
+            if (policies.length < 1)
+                await this.resultOf(sql.unsafe(`SELECT add_continuous_aggregate_policy('${name}', start_offset => ${Math.max(bucket * 4, 86400000)}, end_offset => ${bucket * 2}, schedule_interval => INTERVAL '${interval <= 3600 ? 1 : 60} minutes')`));
+            if (!present[i])
+                await this.resultOf(sql.unsafe(`CALL refresh_continuous_aggregate('${name}', NULL, NULL)`));
+        }
     }
     static async isolate<T>(callback: (sql: pq.TransactionSql) => T | Promise<T>) {
         return await this.connection.begin(callback);
@@ -485,17 +551,6 @@ export class Exchange {
                 throw new Error('cannot decode contract account ' + contract.account);
 
             accounts[contract.account] = accountId;
-            if (MARKET_CLEANUP) {
-                switch (contract.type) {
-                    case 'dex': {
-                        const market = await this.getMarketByAccountId(accountId, connection);
-                        if (market != null) {
-                            await this.cleanupLogs(market.id, block.number, connection);
-                        }
-                        break;
-                    }
-                }
-            }
         }
         
         let step = 0;
@@ -3102,6 +3157,10 @@ export class Exchange {
     }
     static async getAggregatedTradesByPairId(pairId: Uint256, cursor: TimeCursor, connection?: pq.TransactionSql): Promise<AggregatedTrade[]> {
         const sql = connection || this.connection;
+        const bucket = cursor.interval > 0 && cursor.interval % 1000 == 0 && this.intervals.includes(cursor.interval / 1000) ? cursor.interval / 1000 : null;
+        if (bucket == null)
+            throw new Error('interval is not precomputed: ' + cursor.interval);
+
         const bindings = await this.resultOf(sql`
         SELECT
             ppair.id AS secondary_id,
@@ -3109,8 +3168,7 @@ export class Exchange {
         FROM pairs
             INNER JOIN pairs ppair ON ppair.primary_asset_id = pairs.primary_asset_id AND ppair.secondary_asset_id IS NULL
             INNER JOIN pairs spair ON spair.primary_asset_id = pairs.secondary_asset_id AND spair.secondary_asset_id IS NULL
-        WHERE pairs.id = ${pairId.toString()}`);
-        
+        WHERE pairs.id = ${pairId.toString()}`);    
         const pairings = {
             primary: pairId.toInteger(),
             secondary: bindings.length > 0 ? parseInt(bindings[0]['secondary_id']) : null,
@@ -3119,15 +3177,14 @@ export class Exchange {
         const trades = await this.resultOf(sql`
         SELECT
             pair_id,
-            time_bucket(${cursor.interval}, time + ${cursor.interval}) - ${cursor.interval} AS timepoint,
-            SUM(quantity) AS volume,
-            FIRST(price, time) AS open,
-            MIN(price) AS low,
-            MAX(price) AS high,
-            LAST(price, time) AS close
-        FROM trades
-        WHERE ${pairings.secondary != null && pairings.tertiary != null ? sql`pair_id IN (${pairings.primary}, ${pairings.secondary}, ${pairings.tertiary})` : sql`pair_id = ${pairings.primary}`} AND time BETWEEN ${cursor.fromTime} AND ${cursor.toTime}
-        GROUP BY pair_id, timepoint
+            timepoint,
+            volume,
+            open,
+            low,
+            high,
+            close
+        FROM ${sql.unsafe('trades_' + bucket + '_view')}
+        WHERE pair_id = ANY(${(pairings.secondary != null && pairings.tertiary != null ? [pairings.primary, pairings.secondary, pairings.tertiary] : [pairings.primary]).map(v => v.toString())}) AND timepoint BETWEEN ${cursor.fromTime} AND ${cursor.toTime}
         ORDER BY timepoint`);
         if (!trades.length)
             return [];
@@ -3143,7 +3200,6 @@ export class Exchange {
             else if (pairId == pairings.tertiary)
                 tertiary.push(this.toAggregatedTrade(trade));
         }
-
         for (let i = 0; i < secondary.length; i++) {
             const target = secondary[i];
             const [relative] = this.toBestSeriesItem(tertiary, target.timepoint) as ([AggregatedTrade | null, number]);
