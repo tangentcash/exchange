@@ -1,6 +1,6 @@
 import { BigNumber } from "bignumber.js";
 import { AssetId, ByteUtil, Hashing, Pubkeyhash, UiUtil, Signing, Spot, Uint256, Whitelist } from 'tangentsdk';
-import { MarketPolicy, Market, Order, OrderCondition, OrderPolicy, OrderSide, Trade, AggregatedPair, AggregatedTrade, AggregatedLevel, AggregatedLog, Block, RefType, Pool, Depth, Delegator, DelegatedPool, PseudoDelegatedPool, PseudoDelegatedState } from './../types';
+import { MarketPolicy, Market, Order, OrderCondition, OrderPolicy, OrderSide, Trade, AggregatedPair, AggregatedTrade, AggregatedLevel, AggregatedLog, Block, RefType, Pool, Depth, Delegator, DelegatedPool, PseudoDelegatedPool, PseudoDelegatedState, Balance } from './../types';
 import { Log } from './../logging';
 import { Common } from './../common';
 import { Blockchain, EventInfo } from './blockchain';
@@ -1998,7 +1998,7 @@ export class Exchange {
         }
         await this.resultOf(sql`DELETE FROM balances WHERE account_id = ${id.toString()} AND value <= 0`);
     }
-    static async getSyncedAccountBalancesByAccountId(id: Uint256, connection?: pq.TransactionSql): Promise<{ asset: AssetId, unavailable: BigNumber, available: BigNumber, price: BigNumber | null }[] | null> {
+    static async getSyncedAccountBalancesByAccountId(id: Uint256, connection?: pq.TransactionSql): Promise<Balance[] | null> {
         const sql = connection || this.connection;
         const synced = await this.getAccountSyncByAccountId(id, connection);
         if (!synced)
@@ -2037,6 +2037,7 @@ export class Exchange {
         )
         SELECT
             (SELECT hash FROM assets WHERE assets.id = asset_id) AS hash,
+            (SELECT TRUE FROM poly_assets WHERE poly_assets.asset_id = weights.asset_id OR poly_assets.poly_asset_id = weights.asset_id LIMIT 1) AS poly_asset,
             (
                 SELECT COALESCE(SUM(value), 0.0) FROM orders
                     INNER JOIN pairs ON pairs.id = orders.pair_id AND ((pairs.primary_asset_id = asset_id AND orders.side = ${OrderSide.Sell}) OR (pairs.secondary_asset_id = asset_id AND orders.side = ${OrderSide.Buy}))
@@ -2067,6 +2068,7 @@ export class Exchange {
                 const base = Quotes.assetBaseOf(asset);
                 balances.push({
                     asset: asset,
+                    poly: balance['poly_asset'] || false,
                     unavailable: new BigNumber(balance['unavailable'] || 0),
                     available: new BigNumber(balance['available'] || 0),
                     price: Common.bn(balance['price']) || (base ? new BigNumber(1.0) : null),
@@ -3564,11 +3566,13 @@ export class Exchange {
     }
     private static toMarket(value: pq.Row): Market {
         const account = value['account_hash'] ? Signing.encodeAddress(new Pubkeyhash(new Uint8Array(value['account_hash']))) || undefined : undefined;
+        const version = account ? Blockchain.accountOf(account)?.version || undefined : undefined;
         return {
             id: new Uint256(value['id']),
             accountId: new Uint256(value['account_id']),
             account: account,
-            version: account ? Blockchain.accountOf(account)?.version || undefined : undefined,
+            version: version,
+            unifiedAssetProxyAccount: version ? Blockchain.contracts.versions[version].uap : undefined,
             deployerAccountId: new Uint256(value['deployer_account_id']),
             deployerAccount: value['deployer_account_hash'] ? Signing.encodeAddress(new Pubkeyhash(new Uint8Array(value['deployer_account_hash']))) || undefined : undefined,
             blockNumber: Common.num(value['block_number']) || 0,

@@ -130,11 +130,11 @@
     "@types/node" "*"
 
 "@types/node@*":
-  version "22.20.3"
-  resolved "https://registry.yarnpkg.com/@types/node/-/node-22.20.3.tgz#f77d48b4cb336b4e6dc44850ddb6da69caade396"
-  integrity sha512-DZmzkmwHzXrLPAXPyKNDzlIwMMUZCVacoD25ywdy5YTKGbOx/2ld+Q38Im2zJ0vBuZP5Prd3VZutKZyXwkOS8A==
+  version "26.6.2"
+  resolved "https://registry.yarnpkg.com/@types/node/-/node-26.6.2.tgz#11bfb8e00bafe728d2113e474a7637becc9ab279"
+  integrity sha512-X1P21scMv4zGKLYqjdGjaKa7COa0RKVYYZZN/NfvLQ1JegxFhdhpZG/Lyn8AXx6CDUavKAd11v6BvfpkDByK8g==
   dependencies:
-    undici-types "~6.21.0"
+    undici-types "~8.9.0"
 
 "@types/node@24.2.1":
   version "24.2.1"
@@ -795,7 +795,7 @@ supports-preserve-symlinks-flag@^1.0.0:
 
 "tangentsdk@https://github.com/tangentcash/sdk.git":
   version "1.0.0"
-  resolved "https://github.com/tangentcash/sdk.git#53c7b2553d760cf38881f94b825a8e5f6411f976"
+  resolved "https://github.com/tangentcash/sdk.git#c0717c51e856f93364c0634b5eed56d85764cb5e"
   dependencies:
     "@ethersproject/random" "5.8.0"
     "@noble/hashes" "1.8.0"
@@ -857,15 +857,15 @@ typescript@5.9.2:
   resolved "https://registry.yarnpkg.com/typescript/-/typescript-5.9.2.tgz#d93450cddec5154a2d5cabe3b8102b83316fb2a6"
   integrity sha512-CWBzXQrc/qOkhidw1OzBTQuYRbfyxDXJMVJ1XNwUHGROVmuaeiEm3OslpZ1RV96d7SKKjZKrSJu3+t/xlw3R9A==
 
-undici-types@~6.21.0:
-  version "6.21.0"
-  resolved "https://registry.yarnpkg.com/undici-types/-/undici-types-6.21.0.tgz#691d00af3909be93a7faa13be61b3a5b50ef12cb"
-  integrity sha512-iwDZqg0QAGrg9Rav5H4n0M64c3mkR59cJ6wQp+7C4nI0gsmExaedaYLNO44eT4AtBBwjbTiGPMlt2Md0T9H9JQ==
-
 undici-types@~7.10.0:
   version "7.10.0"
   resolved "https://registry.yarnpkg.com/undici-types/-/undici-types-7.10.0.tgz#4ac2e058ce56b462b056e629cc6a02393d3ff350"
   integrity sha512-t5Fy/nfn+14LuOc2KNYg75vZqClpAiqscVvMygNnlsHBFpSXdJaYtXMcdNLpl/Qvc3P2cB3s6lOV51nqsFq4ag==
+
+undici-types@~8.9.0:
+  version "8.9.0"
+  resolved "https://registry.yarnpkg.com/undici-types/-/undici-types-8.9.0.tgz#e240d97c8b5d85e5347ce73d25865c7906c1ec9f"
+  integrity sha512-KTDyRTYX8sWmKXAikPHHSyc63CRPETMctyjKFupcC6OBLXT3xsN0e9aF7m+mIXutFWpUXuedtowG7iLOzp0kQg==
 
 util-deprecate@^1.0.1:
   version "1.0.2"

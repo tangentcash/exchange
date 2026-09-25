@@ -1,4 +1,4 @@
-import { Uint256 } from "tangentsdk";
+import { AssetId, Uint256 } from "tangentsdk";
 
 export enum MarketPolicy {
     Spot,
@@ -41,6 +41,7 @@ export type Market = {
     accountId: Uint256;
     account?: string;
     version?: string;
+    unifiedAssetProxyAccount?: string;
     deployerAccountId: Uint256;
     deployerAccount?: string;
     blockNumber: number;
@@ -258,3 +259,11 @@ export type PseudoDelegatedState = {
     secondaryLiquidity: BigNumber;
     price: BigNumber;
 }
+
+export type Balance = {
+    asset: AssetId,
+    poly: boolean,
+    unavailable: BigNumber,
+    available: BigNumber,
+    price: BigNumber | null
+};

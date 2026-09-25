@@ -4,7 +4,7 @@ import { Log } from '../logging';
 import { Connection, Cursor, Notification, Exchange, PriceDescriptors, RouterPath, TimeCursor } from './exchange';
 import { FastifyInstance } from 'fastify/types/instance';
 import { Blockchain, BlockchainInfo } from './blockchain';
-import { AggregatedLog, AggregatedPair, Order, Pool, Market as MarketT, DelegatedPool, PseudoDelegatedPool, Delegator, PseudoDelegatedState } from '../types';
+import { AggregatedLog, AggregatedPair, Order, Pool, Market as MarketT, DelegatedPool, PseudoDelegatedPool, Delegator, PseudoDelegatedState, Balance } from '../types';
 import fastify, { FastifyReply, FastifyRequest } from 'fastify';
 import fastifyWebsocket, { WebSocket } from '@fastify/websocket';
 import cors from '@fastify/cors';
@@ -43,13 +43,6 @@ export type ChannelQuery = {
     channelId?: string;
     channelAccounts?: string[];
 }
-
-export type Balance = {
-    asset: AssetId,
-    unavailable: BigNumber,
-    available: BigNumber,
-    price: BigNumber | null
-};
 
 export class Result {
     static data(result: any, id?: string) {
