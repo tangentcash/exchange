@@ -502,9 +502,11 @@ export class Exchange {
             GROUP BY pair_id, time_bucket(${bucket}, time)`)));
             await this.resultOf(sql.unsafe(`COMMENT ON VIEW ${name} IS '${fingerprints[i].replace(/'/g, "''")}'`));
             await this.resultOf(sql.unsafe(`CREATE INDEX IF NOT EXISTS ${name}_pair_id_timepoint ON ${name} (pair_id, timepoint DESC)`));
-            const policies = await this.resultOf(sql`SELECT 1 AS configured FROM timescaledb_information.jobs WHERE proc_name = 'policy_refresh_continuous_aggregate' AND hypertable_schema = 'public' AND hypertable_name = ${name}`);
-            if (policies.length < 1)
-                await this.resultOf(sql.unsafe(`SELECT add_continuous_aggregate_policy('${name}', start_offset => ${Math.max(bucket * 4, 86400000)}, end_offset => ${bucket * 2}, schedule_interval => INTERVAL '${interval <= 3600 ? 1 : 60} minutes')`));
+            const policies = await this.resultOf(sql`SELECT 1 AS configured FROM timescaledb_information.jobs WHERE proc_name = 'policy_refresh_continuous_aggregate' AND hypertable_schema = 'public' AND hypertable_name = ${name} AND config ->> 'end_offset' = ${String(bucket)} AND schedule_interval = INTERVAL '1 minutes'`);
+            if (policies.length < 1) {
+                await this.resultOf(sql.unsafe(`SELECT remove_continuous_aggregate_policy('${name}', if_not_exists => true)`));
+                await this.resultOf(sql.unsafe(`SELECT add_continuous_aggregate_policy('${name}', start_offset => ${Math.max(bucket * 4, 86400000)}, end_offset => ${bucket}, schedule_interval => INTERVAL '1 minutes')`));
+            }
             if (!present[i])
                 await this.resultOf(sql.unsafe(`CALL refresh_continuous_aggregate('${name}', NULL, NULL)`));
         }
@@ -3174,18 +3176,39 @@ export class Exchange {
             secondary: bindings.length > 0 ? parseInt(bindings[0]['secondary_id']) : null,
             tertiary: bindings.length > 0 ? parseInt(bindings[0]['tertiary_id']) : null
         };
-        const trades = await this.resultOf(sql`
-        SELECT
-            pair_id,
-            timepoint,
-            volume,
-            open,
-            low,
-            high,
-            close
-        FROM ${sql.unsafe('trades_' + bucket + '_view')}
-        WHERE pair_id = ANY(${(pairings.secondary != null && pairings.tertiary != null ? [pairings.primary, pairings.secondary, pairings.tertiary] : [pairings.primary]).map(v => v.toString())}) AND timepoint BETWEEN ${cursor.fromTime} AND ${cursor.toTime}
-        ORDER BY timepoint`);
+        const bucketMs = bucket * 1000;
+        const pairIds = (pairings.secondary != null && pairings.tertiary != null ? [pairings.primary, pairings.secondary, pairings.tertiary] : [pairings.primary]).map(v => v.toString());
+        const tailStart = Math.ceil((Date.now() - bucketMs * 2 - 120000) / bucketMs) * bucketMs;
+        const trades: Record<string, any>[] = [];
+        if (cursor.fromTime < tailStart) {
+            trades.push(...await this.resultOf(sql`
+            SELECT
+                pair_id,
+                timepoint,
+                volume,
+                open,
+                low,
+                high,
+                close
+            FROM ${sql.unsafe('trades_' + bucket + '_view')}
+            WHERE pair_id = ANY(${pairIds}) AND timepoint BETWEEN ${cursor.fromTime} AND ${Math.min(cursor.toTime, tailStart - 1)}
+            ORDER BY timepoint`));
+        }
+        if (cursor.toTime >= tailStart) {
+            trades.push(...await this.resultOf(sql`
+            SELECT
+                pair_id,
+                time_bucket(${bucketMs}, time) AS timepoint,
+                SUM(quantity) AS volume,
+                FIRST(price, time) AS open,
+                MIN(price) AS low,
+                MAX(price) AS high,
+                LAST(price, time) AS close
+            FROM trades
+            WHERE pair_id = ANY(${pairIds}) AND time BETWEEN ${Math.max(cursor.fromTime, tailStart)} AND ${cursor.toTime}
+            GROUP BY pair_id, timepoint
+            ORDER BY timepoint`));
+        }
         if (!trades.length)
             return [];
 
