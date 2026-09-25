@@ -3098,6 +3098,32 @@ export class Exchange {
             return null;
         }
     }
+    static async setOracleTrades(trades: { asset: AssetId, trade: Omit<Trade, 'id' | 'pairId'> }[], connection: pq.TransactionSql): Promise<void> {
+        const base = Quotes.globalBase();
+        for (let i = 0; i < trades.length; i++) {
+            const trade = trades[i];
+            const pairId = await this.getPairByAssetHashes(trade.asset, null, null, true, true, connection);
+            if (!pairId)
+                throw new Error(`${symbolOf(trade.asset)}: invalid pair id`);
+
+            const result = await this.setTrade({ pairId: pairId, ...trade.trade }, connection);
+            if (!result)
+                throw new Error(`${symbolOf(trade.asset)}: invalid trade`);
+
+            await this.notify(Notification.TradeUpdate, {
+                query: { },
+                args: {
+                    primaryAsset: trade.asset,
+                    secondaryAsset: null,
+                    secondaryBase: base,
+                    account: null,
+                    side: result.side,
+                    price: result.price,
+                    quantity: result.quantity,
+                }
+            }, connection);
+        }
+    }
     static async cleanupLogs(marketId: Uint256, blockNumber: number, connection?: pq.TransactionSql): Promise<void> {
         const sql = connection || this.connection;
         try {

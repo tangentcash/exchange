@@ -260,6 +260,8 @@ class address
 	void pay(const payable&in) const;
 	void mint(const string&in, const real320&in, const real320&in = real320()) const;
 	void burn(const string&in, const real320&in, const real320&in = real320()) const;
+	real320 balance_delta_of(const uint256&in) const;
+	real320 reserve_delta_of(const uint256&in) const;
 	real320 token_balance_of(const string&in) const;
 	real320 token_reserve_of(const string&in) const;
 	real320 balance_of(const uint256&in) const;

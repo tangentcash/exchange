@@ -6,9 +6,15 @@ namespace dex
     string withdraw_order() { return "void withdraw_order(pmut@, const uint256&in order_id)"; }
 }
 
-void pay_asset(pmut@, const uint256&in primary_asset, const uint256&in secondary_asset, const address&in dex_account)
+void pay_unified_asset(pmut@, const uint256&in primary_asset, const uint256&in secondary_asset, const address&in dex_account)
 {
     payable value = tx::value();
     uint256 order_id = dex_account.call<uint256>(dex::limit_order(), value, primary_asset, secondary_asset, dex::order_side::buy, dex::order_policy::deferred_all, real320(0.000000000000000001));
     dex_account.call<void>(dex::withdraw_order(), payable(), order_id);
+
+    real320 quantity = value.total();
+    bool primary_quantity = quantity == tx::to().balance_delta_of(primary_asset);
+    bool secondary_quantity = !primary_quantity && quantity == tx::to().balance_delta_of(secondary_asset);
+    require(primary_quantity || secondary_quantity, "cannot repay 1:1 with unified asset");
+    tx::from().pay(primary_quantity ? primary_asset : secondary_asset, quantity);
 }

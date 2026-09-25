@@ -1,6 +1,6 @@
-import pq from 'postgres';
 import { AssetId } from 'tangentsdk';
-import { Exchange, Notification } from './exchange'
+import { Exchange } from './exchange'
+import { Peers } from './peers';
 import { QuoteResult, Quotes, symbolOf } from './market';
 import { OrderSide, Trade } from '../types';
 import { Log } from '../logging';
@@ -63,38 +63,14 @@ export class Jobs {
                         }
                     }
 
+                    try {
+                        await Exchange.isolate((connection) => Exchange.setOracleTrades(trades, connection));
+                    } catch (exception) {
+                        Log.info('job market sync failed:', exception);
+                    }
+
                     Log.info(`job market sync: OK complete (trades: ${trades.length}/${assets.length}, realtime: ${fits.realtime}, fallback: ${fits.fallback}, cache: ${fits.cache})`);
-                    await Exchange.isolate(async (connection: pq.TransactionSql) => {
-                        for (let i = 0; i < trades.length; i++) {
-                            const trade = trades[i];
-                            try {
-                                const pairId = await Exchange.getPairByAssetHashes(trade.asset, null, null, true, true, connection);
-                                if (!pairId)
-                                    throw new Error('invalid pair id');
-
-                                const result = await Exchange.setTrade({ pairId: pairId, ...trade.trade }, connection);
-                                if (!result)
-                                    throw new Error('invalid trade');
-
-                                await Exchange.notify(Notification.TradeUpdate, {
-                                    query: { },
-                                    args: {
-                                        primaryAsset: trade.asset,
-                                        secondaryAsset: null,
-                                        secondaryBase: base.handle,
-                                        account: null,
-                                        side: result.side,
-                                        price: result.price,
-                                        quantity: result.quantity,
-                                    }
-                                }, connection);
-                            } catch (exception: any) {
-                                Log.info(`job ${symbolOf(trade.asset)} market sync failed:`, exception);
-                                if (Quotes.isWhitelistingError(exception))
-                                    this.assetPrices.blacklist.add(trade.asset.id);
-                            }
-                        }
-                    });
+                    Peers.broadcast(trades);
                     this.assetPrices.timeout = null;
                     resolve();
                 } catch (exception) {
@@ -116,7 +92,6 @@ export class Jobs {
                         Log.error(`job asset cleanup error:`, exception);
                     }
 
-                    Exchange
                     this.assetCleanup = null;
                     resolve();
                 } catch (exception) {

@@ -3,6 +3,7 @@ import { Exchange } from './service/exchange';
 import { Jobs } from './service/jobs';
 import { Blockchain } from './service/blockchain';
 import { Relay } from './service/relay';
+import { Peers } from './service/peers';
 import { Common } from './common';
 import { BigNumber } from 'bignumber.js';
 import { Quotes } from './service/market';
@@ -90,6 +91,16 @@ async function main(): Promise<void> {
     }
 
     try {
+        if (Array.isArray(options.peers)) {
+            Log.info('price peers setup (trusted peers: ' + options.peers.length + ')');
+            Peers.setupClients(options.peers);
+        }
+    } catch (exception) {
+        Log.error('price peers setup error:', exception);
+        return process.exit(1);
+    }
+
+    try {
         const relay: any = options.relay || { };
         Log.info('relay server setup (http: ' + (relay.host || '?') + ':' + (relay.port || '?') + ')');
         await Relay.setup({
@@ -102,6 +113,13 @@ async function main(): Promise<void> {
     }
 
     const shutdown = async () => {
+        try {
+            Log.info('price peers shutdown');
+            await Peers.shutdown();
+        } catch (exception) {
+            Log.error('price peers shutdown error:', exception);
+        }
+
         try {
             Log.info('relay server shutdown');
             await Relay.shutdown();

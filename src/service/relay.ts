@@ -9,6 +9,7 @@ import fastify, { FastifyReply, FastifyRequest } from 'fastify';
 import fastifyWebsocket, { WebSocket } from '@fastify/websocket';
 import cors from '@fastify/cors';
 import BigNumber from 'bignumber.js';
+import { Peers } from './peers';
 
 function variable(data: any): string {
     try {
@@ -82,6 +83,7 @@ export class Relay {
         });
         server.register(async (server) => {
             this.bindings(server);
+            server.get('/prices', { websocket: true }, (socket: WebSocket) => Peers.attach(socket));
             for (const channel in Notification) {
                 const type = (Notification as any)[channel];
                 await Exchange.listen(type, (notification) => this.notify(type as Notification, notification.query, notification.args));
