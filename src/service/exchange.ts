@@ -411,7 +411,7 @@ export class Exchange {
         CREATE MATERIALIZED VIEW IF NOT EXISTS pools_view AS (
             WITH timings AS (
                 SELECT
-                    (SELECT EXTRACT(EPOCH FROM CURRENT_DATE::TIMESTAMP)::BIGINT * 1000) AS min_time,
+                    (SELECT EXTRACT(EPOCH FROM CURRENT_DATE::TIMESTAMP - INTERVAL '30 days')::BIGINT * 1000) AS min_time,
                     (SELECT EXTRACT(EPOCH FROM CURRENT_DATE::TIMESTAMP + INTERVAL '1 day')::BIGINT * 1000) AS max_time
             )
             SELECT
@@ -431,7 +431,7 @@ export class Exchange {
                 GROUP BY delegators.id, delegators.account_id, delegated_pools.pair_id
             ), timings AS (
                 SELECT
-                    (SELECT EXTRACT(EPOCH FROM CURRENT_DATE::TIMESTAMP)::BIGINT * 1000) AS min_time,
+                    (SELECT EXTRACT(EPOCH FROM CURRENT_DATE::TIMESTAMP - INTERVAL '30 days')::BIGINT * 1000) AS min_time,
                     (SELECT EXTRACT(EPOCH FROM CURRENT_DATE::TIMESTAMP + INTERVAL '1 day')::BIGINT * 1000) AS max_time
             )
             SELECT
@@ -3732,7 +3732,6 @@ export class Exchange {
             secondaryTotal: secondaryTotal,
             primaryReserve: primaryReserve,
             secondaryReserve: secondaryReserve,
-            allocationPrice: price.gt(0) ? price : undefined,
             volume: Common.bn(value['volume']),
             feeRate: feeRate,
             share: share,

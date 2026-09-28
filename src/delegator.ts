@@ -143,7 +143,6 @@ async function main() {
 
                 let primaryValue: BigNumber | null = primaryReserve;
                 if (secondaryValue.gt(secondaryReserve)) {
-                    console.log('GT THAN RESERVE')
                     secondaryValue = secondaryReserve;
                     primaryValue = LiquidityPool.toPrimaryValue(secondaryReserve, price, minPrice, maxPrice);
                     if (!primaryValue)

@@ -229,7 +229,6 @@ export type DelegatedPool = {
     secondaryTotal?: BigNumber;
     primaryReserve?: BigNumber;
     secondaryReserve?: BigNumber;
-    allocationPrice?: BigNumber;
     volume?: BigNumber;
     share?: BigNumber;
     feeRate?: BigNumber;
