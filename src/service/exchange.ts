@@ -25,6 +25,12 @@ export enum Notification {
     LevelUpdate = 'update:level'
 }
 
+export type NotificationData = {
+    channelId?: string;
+    accounts?: string[];
+    args: Record<string, any>
+}
+
 export type Pair = {
     id: Uint256,
     primaryAsset: { id: Uint256, hash: AssetId } | null,
@@ -514,7 +520,7 @@ export class Exchange {
     static async isolate<T>(callback: (sql: pq.TransactionSql) => T | Promise<T>) {
         return await this.connection.begin(callback);
     }
-    static async listen(channel: Notification, callback: (notification: { query: Record<string, any>, args: Record<string, any> }) => any, connection?: pq.TransactionSql): Promise<void> {
+    static async listen(channel: Notification, callback: (notification: NotificationData) => any, connection?: pq.TransactionSql): Promise<void> {
         const sql = connection || this.connection;
         await this.unlisten(channel);
         this.listeners[channel] = await sql.listen(channel, (message: string) => {
@@ -527,7 +533,7 @@ export class Exchange {
         });
         Log.info(`exchange ${channel} channel: now listening`);
     }
-    static async notify(channel: Notification, notification: { query: Record<string, any>, args: Record<string, any> }, connection?: pq.TransactionSql): Promise<boolean> {
+    static async notify(channel: Notification, notification: NotificationData, connection?: pq.TransactionSql): Promise<boolean> {
         const sql = connection || this.connection;
         try {
             await sql.notify(channel, JSON.stringify(notification));
@@ -596,7 +602,6 @@ export class Exchange {
                                     }, connection);
                                     if (result != null) {
                                         await this.notify(Notification.MarketUpdate, {
-                                            query: { },
                                             args: { marketId: result.id }
                                         }, connection);
                                     }
@@ -830,7 +835,6 @@ export class Exchange {
                                     }, connection);
                                     if (result != null) {
                                         await this.notify(Notification.DelegatorUpdate, {
-                                            query: { },
                                             args: { delegatorId: result.id }
                                         }, connection);
                                     }
@@ -878,6 +882,7 @@ export class Exchange {
                                         const delegatedPool = delegatedPools[i];
                                         let delegatedPoolId: Uint256 | null = null;
                                         let owner: string | null = null;
+                                        let active = true;
                                         try {
                                             const account = await this.getAccountHashById(delegatedPool.accountId, connection);
                                             if (!account)
@@ -906,15 +911,15 @@ export class Exchange {
                                             if (prevDelegatedPool) {
                                                 delegatedPoolId = prevDelegatedPool.id;
                                                 prevDelegatedPool.blockNumber = block.number;
-                                                prevDelegatedPool.active = false;
+                                                prevDelegatedPool.active = active = false;
                                                 await this.setDelegatedPool(prevDelegatedPool, false, connection);
                                             }
                                         }
 
                                         if (owner && delegatedPoolId) {
                                             await this.notify(Notification.DelegatedPoolUpdate, {
-                                                query: { accounts: [owner] },
-                                                args: { delegatedPoolId: delegatedPoolId }
+                                                accounts: [owner],
+                                                args: { delegatedPoolId: delegatedPoolId, active: active }
                                             }, connection);
                                         }
                                     }
@@ -926,6 +931,7 @@ export class Exchange {
                             }
 
                             if (!ownerPubkeyhash.equals(new Pubkeyhash())) {
+                                let active = true;
                                 try {
                                     const ownerId = owner ? await this.getAccountIdByAddress(owner, false, connection) : null;
                                     if (!ownerId)
@@ -979,14 +985,14 @@ export class Exchange {
                                         if (prevDelegatedPool) {
                                             delegatedPoolId = prevDelegatedPool.id;
                                             prevDelegatedPool.blockNumber = block.number;
-                                            prevDelegatedPool.active = false;
+                                            prevDelegatedPool.active = active = false;
                                             await this.setDelegatedPool(prevDelegatedPool, false, connection);
                                         }
                                     }             
 
                                     await this.notify(Notification.DelegatedPoolUpdate, {
-                                        query: { accounts: [owner] },
-                                        args: { delegatedPoolId: delegatedPoolId || new Uint256(0) }
+                                        accounts: owner ? [owner] : undefined,
+                                        args: { delegatedPoolId: delegatedPoolId || new Uint256(0), active: active }
                                     }, connection);
                                     Log.info(`exchange ${contract.account} delegated pool update (market_id: ${market.id.toString()}, pair_id: ${pairId.toString()}, delegator_id: ${delegator.id.toString()}, ownerId: ${ownerId.toString()})`);
                                 } catch (exception) {
@@ -1092,11 +1098,10 @@ export class Exchange {
 
                     await Promise.all([
                         this.notify(Notification.OrderUpdate, {
-                            query: { accounts: [account] },
+                            accounts: [account],
                             args: { orderId: result.id }
                         }, connection),
                         this.notify(Notification.LevelUpdate, {
-                            query: { },
                             args: result.active && result.lastPrice.gt(0) && result.lastQuantity.gt(0) ? {
                                 id: result.id,
                                 side: result.side,
@@ -1116,6 +1121,7 @@ export class Exchange {
             const event = pools[target];
             try {
                 let result: Pool | null = null, pool: any;
+                let active = true;
                 try {
                     const pseudoPool: PseudoPool = event.pseudoRef as any;
                     try {
@@ -1205,7 +1211,7 @@ export class Exchange {
                     const prevPool = await this.getPoolByPoolId(event.poolId, connection);
                     if (prevPool) {
                         prevPool.blockNumber = block.number;
-                        prevPool.active = false;
+                        prevPool.active = active = false;
                         result = await this.setPool(prevPool, connection);
                         if (result != null) {
                             await this.setDepth({
@@ -1230,12 +1236,11 @@ export class Exchange {
                     const minPrice = result.minPrice || result.lastBidPrice.multipliedBy(0.9999);
                     const maxPrice = result.maxPrice || result.lastAskPrice.multipliedBy(1.0001);
                     const events = [this.notify(Notification.PoolUpdate, {
-                        query: { accounts: [account] },
-                        args: { poolId: result.id }
+                        accounts: [account],
+                        args: { poolId: result.id, active: active }
                     }, connection)];
                     if (result.active && ((result.lastAskPrice.gt(0) && result.lastAskPrice.lt(maxPrice) && result.primaryValue.gt(0)) || (result.lastBidPrice.gt(0) && result.lastBidPrice.gt(minPrice) && result.secondaryValue.gt(0)))) {
                         events.push(this.notify(Notification.LevelUpdate, {
-                            query: { },
                             args: result.lastAskPrice.gt(0) && result.lastAskPrice.lt(maxPrice) && result.primaryValue.gt(0) ? {
                                 id: result.id,
                                 side: OrderSide.Sell,
@@ -1251,7 +1256,6 @@ export class Exchange {
                             } as AggregatedLevel : { id: result.id }
                         }, connection));
                         events.push(this.notify(Notification.LevelUpdate, {
-                            query: { },
                             args: result.active && result.lastBidPrice.gt(0) && result.lastBidPrice.gt(minPrice) && result.secondaryValue.gt(0) ? {
                                 id: result.id,
                                 side: OrderSide.Buy,
@@ -1268,7 +1272,6 @@ export class Exchange {
                         }, connection));
                     } else {
                         events.push(this.notify(Notification.LevelUpdate, {
-                            query: { },
                             args: { id: result.id }
                         }, connection));
                     }
@@ -1318,7 +1321,6 @@ export class Exchange {
                     const accountId = takerOrder?.accountId || makerOrder?.accountId || makerPool?.accountId;
                     const account = accountId ? await this.getAccountHashById(accountId, connection) : null;
                     await this.notify(Notification.TradeUpdate, {
-                        query: { },
                         args: {
                             primaryAsset: assets.primaryAsset.hash,
                             secondaryAsset: assets.secondaryAsset.hash,
@@ -1382,7 +1384,6 @@ export class Exchange {
         }
         
         await this.notify(Notification.ChainUpdate, {
-            query: { },
             args: { tip: block.blockNumber }
         }, connection);
         try {
@@ -3113,7 +3114,6 @@ export class Exchange {
                 throw new Error(`${symbolOf(trade.asset)}: invalid trade`);
 
             await this.notify(Notification.TradeUpdate, {
-                query: { },
                 args: {
                     primaryAsset: trade.asset,
                     secondaryAsset: null,

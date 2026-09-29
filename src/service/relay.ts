@@ -1,7 +1,7 @@
 import { randomBytes } from 'crypto';
 import { AssetId, ByteUtil, UiUtil, Signing, Spot, Uint256 } from 'tangentsdk';
 import { Log } from '../logging';
-import { Connection, Cursor, Notification, Exchange, PriceDescriptors, RouterPath, TimeCursor } from './exchange';
+import { Connection, Cursor, Notification, Exchange, PriceDescriptors, RouterPath, TimeCursor, NotificationData } from './exchange';
 import { FastifyInstance } from 'fastify/types/instance';
 import { Blockchain, BlockchainInfo } from './blockchain';
 import { AggregatedLog, AggregatedPair, Order, Pool, Market as MarketT, DelegatedPool, PseudoDelegatedPool, Delegator, PseudoDelegatedState, Balance } from '../types';
@@ -39,11 +39,6 @@ export type ChannelNode = {
     accounts: Set<string>
 }
 
-export type ChannelQuery = {
-    channelId?: string;
-    channelAccounts?: string[];
-}
-
 export class Result {
     static data(result: any, id?: string) {
         return { id: id || undefined, error: null, result: result };
@@ -79,7 +74,7 @@ export class Relay {
             server.get('/prices', { websocket: true }, (socket: WebSocket) => Peers.attach(socket));
             for (const channel in Notification) {
                 const type = (Notification as any)[channel];
-                await Exchange.listen(type, (notification) => this.notify(type as Notification, notification.query, notification.args));
+                await Exchange.listen(type, (notification) => this.notify(type as Notification, notification));
             }
         });
         await server.listen({
@@ -158,23 +153,23 @@ export class Relay {
             });
         };
     }
-    static notify(type: Notification, query: ChannelQuery, args: Record<string, any>): number {
+    static notify(type: Notification, body: NotificationData): number {
         let notifications = 0;
-        let data = { type: type, data: args };
-        if (query.channelId == null) {
+        let data = { type: type, data: body.args };
+        if (body.channelId == null) {
             for (let id in this.channels) {
                 try {
                     const channel = this.channels[id];
-                    if (!query.channelAccounts || setHasAnyOf(channel.accounts, query.channelAccounts)) {
+                    if (!body.accounts || setHasAnyOf(channel.accounts, body.accounts)) {
                         channel.socket.send(JSON.stringify({ id: id, error: null, notification: data }));
                         ++notifications;
                     }
                 } catch { }
             }
         } else {
-            const channel = this.channels[query.channelId];
-            if (channel != null && (!query.channelAccounts || setHasAnyOf(channel.accounts, query.channelAccounts))) {
-                channel.socket.send(JSON.stringify({ id: query.channelId, error: null, notification: data }));
+            const channel = this.channels[body.channelId];
+            if (channel != null && (!body.accounts || setHasAnyOf(channel.accounts, body.accounts))) {
+                channel.socket.send(JSON.stringify({ id: body.channelId, error: null, notification: data }));
                 ++notifications;
             }
         }
