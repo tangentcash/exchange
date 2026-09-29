@@ -142,11 +142,6 @@ async function rebalance(confirmTimeout: number, address: string, secretKey: Sec
     primaryValue = BigNumber.min(pool.primaryReserve, primaryValue);
     secondaryValue = BigNumber.min(pool.secondaryReserve, secondaryValue);
     Log.info(`LP ${pool.name} rebalancing${pool.pull ? ' (pulled)' : ''} at ${pool.price.toString()} (range: ${minPrice != null && maxPrice != null ? `${minPrice.toString()}-${maxPrice.toString()}` : 'uniform'}, fee: ${pool.feeRate.toString()})`);
-    return console.log('SIMULATION:', {
-        callable: pool.delegatedAccount,
-        function: UiUtil.toFunction(Spot.DLP.transferLiquidity),
-        args: [pool.primaryAsset.toUint256().toString(), pool.secondaryAsset.toUint256().toString(), primaryValue.toString(), secondaryValue.toString(), pool.price.toString(), (pool.range ? minPrice : new BigNumber(-1))?.toString(), (pool.range ? maxPrice : new BigNumber(-1))?.toString(), pool.feeRate.toString()]
-    });
     const transactionHash = await send(confirmTimeout, address, (nonce: Uint256, gasPrice: BigNumber, gasLimit: Uint256) => {
         const transaction = {
             signature: new Hashsig(),
