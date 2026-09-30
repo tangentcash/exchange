@@ -3735,6 +3735,7 @@ export class Exchange {
             secondaryTotal: secondaryTotal,
             primaryReserve: primaryReserve,
             secondaryReserve: secondaryReserve,
+            allocationPrice: price,
             volume: Common.bn(value['volume']),
             feeRate: feeRate,
             share: share,
