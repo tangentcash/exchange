@@ -10,6 +10,7 @@ import fastifyWebsocket, { WebSocket } from '@fastify/websocket';
 import cors from '@fastify/cors';
 import BigNumber from 'bignumber.js';
 import { Peers } from './peers';
+import { Quotes } from './market';
 
 function variable(data: any): string {
     try {
@@ -196,13 +197,14 @@ export namespace Router {
             Channel.register(server, 'get', '/asset/query', Asset, Asset.getQuery);
             Channel.register(server, 'get', '/asset', Asset, Asset.get);
         }
-        static async getPortfolio(): Promise<{ prices: PriceDescriptors, descriptors: BlockchainInfo[], markets: Market[], delegators: Delegator[] }> {
-            const [prices, descriptors, markets, delegators] = await Promise.all([this.getPrices(), this.getDescriptors(), Exchange.getMarkets(), Exchange.getDelegators()]);
+        static async getPortfolio(args?: { base?: string }): Promise<{ prices: PriceDescriptors, descriptors: BlockchainInfo[], markets: Market[], delegators: Delegator[], rate: BigNumber | null }> {
+            const [prices, descriptors, markets, delegators, rate] = await Promise.all([this.getPrices(), this.getDescriptors(), Exchange.getMarkets(), Exchange.getDelegators(), Market.rateOf(args?.base)]);
             return {
                 prices: prices,
                 descriptors: descriptors,
                 markets: markets,
-                delegators: delegators
+                delegators: delegators,
+                rate: rate
             };
         }
         static async getPrices(): Promise<PriceDescriptors> {
@@ -258,6 +260,27 @@ export namespace Router {
             Channel.register(server, 'get', '/market/pair/price/series', Asset, Market.getPairPriceSeries);
             Channel.register(server, 'get', '/market/pair/price/levels', Asset, Market.getPairPriceLevels);
             Channel.register(server, 'get', '/markets', Asset, Market.getMarkets);
+            Channel.register(server, 'get', '/market/rate', Asset, Market.getRate);
+        }
+        static async rateOf(base?: string): Promise<BigNumber | null> {
+            if (typeof base != 'string' || base.length == 0)
+                return new BigNumber(1);
+
+            const globalBase = Quotes.globalBase();
+            if (!globalBase)
+                return null;
+
+            try {
+                return (await Quotes.currencyPriceOf(AssetId.fromHandle(globalBase), AssetId.fromHandle(base))).value;
+            } catch {
+                return null;
+            }
+        }
+        static async getRate(args: { base?: string }): Promise<BigNumber | null> {
+            if (typeof args.base != 'string' || args.base.length == 0)
+                throw new Error('Base is required');
+
+            return await Market.rateOf(args.base);
         }
         static async getMetrics(_: any, reply?: FastifyReply) {
             if (reply != null) {

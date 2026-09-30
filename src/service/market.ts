@@ -4,7 +4,8 @@ import BigNumber from 'bignumber.js';
 
 const TTL = {
     realtime: 30_000,
-    fallback: 240_000
+    fallback: 240_000,
+    currency: 86_400_000
 };
 
 export function symbolOf(asset: AssetId): string {
@@ -36,19 +37,20 @@ export function patchOut(index: number, path: string, output: any): any {
 export type QuoteSources = {
     realtime: Record<string, string | [string, Record<string, string>]>;
     fallback: Record<string, string | [string, Record<string, string>]>;
+    currency: Record<string, string | [string, Record<string, string>]>;
     logging: boolean;
 };
 
 export type QuoteResult = {
     value: BigNumber,
-    source: 'realtime' | 'fallback' | 'cache'
+    source: 'realtime' | 'fallback' | 'currency' | 'cache'
 };
 
 export class Quotes {
     static currencies: string[][] = [
         ["USD", "USDT", "USDC", "DAI"]
     ];
-    static quotes: QuoteSources = { realtime: { }, fallback: { }, logging: false };
+    static quotes: QuoteSources = { realtime: { }, fallback: { }, currency: { }, logging: false };
     static blacklist: Record<string, Set<string>> = { };
     static cache: Record<string, Record<string, { ttl: Date, price: BigNumber }>> = { };
     static offset: number = Math.floor(Math.random() * 65536);
@@ -56,7 +58,7 @@ export class Quotes {
     static setSources(quotes: QuoteSources): void {
         this.quotes = quotes;
     }
-    private static async providerPriceOf(source: 'realtime' | 'fallback', primaryAsset: AssetId, secondaryAsset: AssetId): Promise<QuoteResult> {
+    private static async providerPriceOf(source: 'realtime' | 'fallback' | 'currency', primaryAsset: AssetId, secondaryAsset: AssetId): Promise<QuoteResult> {
         const primary = symbolOf(primaryAsset), secondary = symbolOf(secondaryAsset);
         if (primary == secondary)
             return { value: new BigNumber(1), source: 'cache' };
@@ -150,6 +152,9 @@ export class Quotes {
             return { value: bestOldQuote.price, source: 'cache' };
 
         throw new Error(`Price of ${pair} cannot be found: no applicable providers`);
+    }
+    static async currencyPriceOf(primaryAsset: AssetId, secondaryAsset: AssetId): Promise<QuoteResult> {
+        return await this.providerPriceOf('currency', primaryAsset, secondaryAsset);
     }
     static async directPriceOf(primaryAsset: AssetId, secondaryAsset: AssetId, source?: 'realtime' | 'fallback'): Promise<QuoteResult> {
         if (source != null)

@@ -78,6 +78,7 @@ async function main(): Promise<void> {
                 Quotes.setSources({
                     realtime: setup.realtime || { },
                     fallback: setup.fallback || { },
+                    currency: setup.currency || { },
                     logging: setup.logging || false
                 });
                 Jobs.runAssetPrices(setup.frequency);

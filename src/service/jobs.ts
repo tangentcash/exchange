@@ -33,7 +33,7 @@ export class Jobs {
                     const assets = await Exchange.getAssetHandles();
                     const cache: Record<string, Omit<Trade, 'id' | 'pairId'>> = { };
                     const trades: { asset: AssetId, trade: Omit<Trade, 'id' | 'pairId'> }[] = [];
-                    const fits = { realtime: 0, fallback: 0, cache: 0 };
+                    const fits = { realtime: 0, fallback: 0, currency: 0, cache: 0 };
                     const native = new AssetId().id;
                     for (let i = 0; i < assets.length; i++) {
                         const asset = assets[i];
@@ -69,7 +69,7 @@ export class Jobs {
                         Log.info('job market sync failed:', exception);
                     }
 
-                    Log.info(`job market sync: OK complete (trades: ${trades.length}/${assets.length}, realtime: ${fits.realtime}, fallback: ${fits.fallback}, cache: ${fits.cache})`);
+                    Log.info(`job market sync: OK complete (trades: ${trades.length}/${assets.length}, realtime: ${fits.realtime}, fallback: ${fits.fallback}, currency: ${fits.currency}, cache: ${fits.cache})`);
                     Peers.broadcast(trades);
                     this.assetPrices.timeout = null;
                     resolve();
