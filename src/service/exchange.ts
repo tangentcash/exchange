@@ -330,6 +330,7 @@ export class Exchange {
             UNIQUE (market_id, pool_id)
         );
         CREATE INDEX IF NOT EXISTS pools_pool_id ON pools USING hash (pool_id);
+        CREATE INDEX IF NOT EXISTS pools_price_not_initial_price ON pools ((price <> initial_price));
 
         CREATE TABLE IF NOT EXISTS delegated_pools
         (
@@ -394,19 +395,20 @@ export class Exchange {
         CREATE MATERIALIZED VIEW IF NOT EXISTS pairs_view AS (
             WITH timings AS (
                 SELECT
-                    (SELECT EXTRACT(EPOCH FROM CURRENT_DATE::TIMESTAMP)::BIGINT * 1000) AS min_time,
+                    (SELECT EXTRACT(EPOCH FROM CURRENT_DATE::TIMESTAMP)::BIGINT * 1000) AS min_time_24h,
+                    (SELECT EXTRACT(EPOCH FROM CURRENT_DATE::TIMESTAMP - INTERVAL '180 days')::BIGINT * 1000) AS min_time_180d,
                     (SELECT EXTRACT(EPOCH FROM CURRENT_DATE::TIMESTAMP + INTERVAL '1 day')::BIGINT * 1000) AS max_time
             )
             SELECT
                 pairs.id,
-                COALESCE((SELECT SUM(price * quantity) FROM trades WHERE pair_id = pairs.id AND time BETWEEN timings.min_time AND timings.max_time AND maker_order_id IS NOT NULL), 0.0) AS order_volume,
-                COALESCE((SELECT SUM(price * quantity) FROM trades WHERE pair_id = pairs.id AND time BETWEEN timings.min_time AND timings.max_time AND maker_pool_id IS NOT NULL), 0.0) AS pool_volume,
-                (SELECT ARRAY[price, time] FROM trades WHERE pair_id = pairs.id AND time BETWEEN timings.min_time AND timings.max_time ORDER BY time ASC LIMIT 1) AS open_price_and_time,
-                (SELECT ARRAY[MIN(price), MAX(price)] FROM trades WHERE pair_id = pairs.id AND time BETWEEN timings.min_time AND timings.max_time LIMIT 1) AS low_price_and_high_price,
-                (SELECT ARRAY[price, time] FROM trades WHERE pair_id = ppair.id AND time BETWEEN timings.min_time AND timings.max_time ORDER BY time ASC LIMIT 1) AS psynthetic_open_price_and_time,
-                (SELECT ARRAY[price, time] FROM trades WHERE pair_id = spair.id AND time BETWEEN timings.min_time AND timings.max_time ORDER BY time ASC LIMIT 1) AS ssynthetic_open_price_and_time,
-                (SELECT ARRAY[MIN(price), MAX(price)] FROM trades WHERE pair_id = ppair.id AND time BETWEEN timings.min_time AND timings.max_time LIMIT 1) AS psynthetic_low_price_and_high_price,
-                (SELECT ARRAY[MIN(price), MAX(price)] FROM trades WHERE pair_id = spair.id AND time BETWEEN timings.min_time AND timings.max_time LIMIT 1) AS ssynthetic_low_price_and_high_price
+                COALESCE((SELECT SUM(price * quantity) FROM trades WHERE pair_id = pairs.id AND time BETWEEN timings.min_time_180d AND timings.max_time AND maker_order_id IS NOT NULL), 0.0) AS order_volume,
+                COALESCE((SELECT SUM(price * quantity) FROM trades WHERE pair_id = pairs.id AND time BETWEEN timings.min_time_180d AND timings.max_time AND maker_pool_id IS NOT NULL), 0.0) AS pool_volume,
+                (SELECT ARRAY[price, time] FROM trades WHERE pair_id = pairs.id AND time BETWEEN timings.min_time_24h AND timings.max_time ORDER BY time ASC LIMIT 1) AS open_price_and_time,
+                (SELECT ARRAY[MIN(price), MAX(price)] FROM trades WHERE pair_id = pairs.id AND time BETWEEN timings.min_time_24h AND timings.max_time LIMIT 1) AS low_price_and_high_price,
+                (SELECT ARRAY[price, time] FROM trades WHERE pair_id = ppair.id AND time BETWEEN timings.min_time_24h AND timings.max_time ORDER BY time ASC LIMIT 1) AS psynthetic_open_price_and_time,
+                (SELECT ARRAY[price, time] FROM trades WHERE pair_id = spair.id AND time BETWEEN timings.min_time_24h AND timings.max_time ORDER BY time ASC LIMIT 1) AS ssynthetic_open_price_and_time,
+                (SELECT ARRAY[MIN(price), MAX(price)] FROM trades WHERE pair_id = ppair.id AND time BETWEEN timings.min_time_24h AND timings.max_time LIMIT 1) AS psynthetic_low_price_and_high_price,
+                (SELECT ARRAY[MIN(price), MAX(price)] FROM trades WHERE pair_id = spair.id AND time BETWEEN timings.min_time_24h AND timings.max_time LIMIT 1) AS ssynthetic_low_price_and_high_price
             FROM pairs
                 LEFT JOIN pairs ppair ON ppair.primary_asset_id = pairs.primary_asset_id AND ppair.secondary_asset_id IS NULL
                 LEFT JOIN pairs spair ON spair.primary_asset_id = pairs.secondary_asset_id AND spair.secondary_asset_id IS NULL
@@ -417,7 +419,7 @@ export class Exchange {
         CREATE MATERIALIZED VIEW IF NOT EXISTS pools_view AS (
             WITH timings AS (
                 SELECT
-                    (SELECT EXTRACT(EPOCH FROM CURRENT_DATE::TIMESTAMP - INTERVAL '30 days')::BIGINT * 1000) AS min_time,
+                    (SELECT EXTRACT(EPOCH FROM CURRENT_DATE::TIMESTAMP - INTERVAL '180 days')::BIGINT * 1000) AS min_time,
                     (SELECT EXTRACT(EPOCH FROM CURRENT_DATE::TIMESTAMP + INTERVAL '1 day')::BIGINT * 1000) AS max_time
             )
             SELECT
@@ -425,6 +427,7 @@ export class Exchange {
                 COALESCE((SELECT SUM(price * quantity) FROM trades WHERE pair_id = pools.pair_id AND time BETWEEN timings.min_time AND timings.max_time AND maker_pool_id = pools.id), 0.0) AS volume
             FROM pools
                 INNER JOIN timings ON TRUE
+            WHERE initial_price <> price
         );
         CREATE MATERIALIZED VIEW IF NOT EXISTS delegators_view AS (
             WITH sources AS (
@@ -437,7 +440,7 @@ export class Exchange {
                 GROUP BY delegators.id, delegators.account_id, delegated_pools.pair_id
             ), timings AS (
                 SELECT
-                    (SELECT EXTRACT(EPOCH FROM CURRENT_DATE::TIMESTAMP - INTERVAL '30 days')::BIGINT * 1000) AS min_time,
+                    (SELECT EXTRACT(EPOCH FROM CURRENT_DATE::TIMESTAMP - INTERVAL '180 days')::BIGINT * 1000) AS min_time,
                     (SELECT EXTRACT(EPOCH FROM CURRENT_DATE::TIMESTAMP + INTERVAL '1 day')::BIGINT * 1000) AS max_time
             )
             SELECT
