@@ -24,7 +24,6 @@ type DelegatorConfig = {
     secretKey?: string,
     secretKeyEnv?: string,
     confirmTimeout: number,
-    refreshInterval: number,
     callTimeout: number,
     simulation: boolean,
     watch?: {
@@ -262,7 +261,6 @@ function resolveConfig(raw: string): DelegatorConfig {
         secretKey: stringOr(source, 'secretKey'),
         secretKeyEnv: stringOr(source, 'secretKeyEnv'),
         confirmTimeout: numberOr(source, 'confirmTimeout', 120),
-        refreshInterval: numberOr(source, 'refreshInterval', 300),
         callTimeout: numberOr(source, 'callTimeout', 30),
         simulation: source.simulation === true,
         watch: typeof source.watch == 'object' && source.watch != null ? source.watch as { connectTimeout?: number } : undefined,
@@ -519,24 +517,24 @@ async function main(): Promise<void> {
             }
         }
 
+        let timeout = Number.MAX_SAFE_INTEGER;
         for (let name in pools) {
             const mutation = mutations[name];
+            if (typeof mutation != 'string' && typeof mutation != 'boolean') {
+                Log.info(`LP ${name} watching stopped`);
+                delete pools[name];
+                continue;
+            }
+
+            timeout = Math.min(timeout, Math.max(pools[name].nextCheckAt, pools[name].backoffUntil));
             if (typeof mutation == 'string') {
                 Log.info(`LP ${name} now watching: ${mutation}`);
-            } else if (typeof mutation != 'boolean') {
-                delete pools[name];
-                Log.info(`LP ${name} watching stopped`);
             }
         }
 
+        timeout = Math.max(timeout, Date.now() + 60_000);
         Exchange.subscribe([address, ...new Set(rows.map((x) => x.delegatorAccount))]);
-        let nextCycle = time + config.refreshInterval * 1_000;
-        for (let name in pools) {
-            nextCycle = Math.min(nextCycle, Math.max(pools[name].nextCheckAt, pools[name].backoffUntil));
-        }
-        
-        nextCycle = Math.max(nextCycle, Date.now() + 1_000);
-        Log.info(`LP loop: cycle finished in ${Date.now() - time}ms, next cycle in ${Math.max(0, Math.ceil((nextCycle - Date.now()) / 1_000))}s (at ${new Date(nextCycle).toISOString()})`);
+        Log.info(`LP loop: cycle finished in ${Date.now() - time}ms, next cycle in ${Math.max(0, Math.ceil((timeout - Date.now()) / 1_000))}s (at ${new Date(timeout).toISOString()})`);
         if (wakeups == sequence) {
             await new Promise<void>((resolve) => {
                 const finish = () => {
@@ -546,7 +544,7 @@ async function main(): Promise<void> {
                         wakeListeners.splice(index, 1);
                     resolve();
                 };
-                const timer = setTimeout(finish, Math.max(0, nextCycle - Date.now()));
+                const timer = setTimeout(finish, Math.max(0, timeout - Date.now()));
                 wakeListeners.push(finish);
             });
         }
