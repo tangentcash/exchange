@@ -7,6 +7,8 @@ class array<t>
 	array<t>& opAssign(const array<t>&in);
 	t& opIndex(uint);
 	const t& opIndex(uint) const;
+	t& at(uint);
+	const t& at(uint) const;
 	t& front();
 	const t& front() const;
 	t& back();
@@ -77,17 +79,17 @@ class string
 	uint find_last_of(const string&in, uint) const;
 	uint find_last_not_of(const string&in, uint) const;
 	array<string>@ split(const string&in) const;
-	int8 i8(int = 10);
-	int16 i16(int = 10);
-	int i32(int = 10);
-	int64 i64(int = 10);
-	uint8 u8(int = 10);
-	uint16 u16(int = 10);
-	uint u32(int = 10);
-	uint64 u64(int = 10);
-	uint128 u128(int = 10);
-	uint256 u256(int = 10);
-	real320 r320(int = 10);
+	int8 i8(int = 10) const;
+	int16 i16(int = 10) const;
+	int i32(int = 10) const;
+	int64 i64(int = 10) const;
+	uint8 u8(int = 10) const;
+	uint16 u16(int = 10) const;
+	uint u32(int = 10) const;
+	uint64 u64(int = 10) const;
+	uint128 u128(int = 10) const;
+	uint256 u256(int = 10) const;
+	real320 r320(int = 10) const;
 }
 class uint128
 {
@@ -108,6 +110,7 @@ class uint128
 	uint128& opDivAssign(const uint128&in);
 	uint128& opAddAssign(const uint128&in);
 	uint128& opSubAssign(const uint128&in);
+	uint128& opModAssign(const uint128&in);
 	uint128& opPreInc();
 	uint128& opPreDec();
 	uint128& opPostInc();
@@ -154,6 +157,7 @@ class uint256
 	uint256& opDivAssign(const uint256&in);
 	uint256& opAddAssign(const uint256&in);
 	uint256& opSubAssign(const uint256&in);
+	uint256& opModAssign(const uint256&in);
 	uint256& opPreInc();
 	uint256& opPreDec();
 	uint256& opPostInc();
@@ -379,14 +383,46 @@ class ranging_slice
 	ranging_slice& asc();
 	ranging_slice& desc();
 }
+namespace block
+{
+	class tx
+	{
+		~tx();
+		tx(const uint256&in);
+		tx(const block::tx&in);
+		block::tx& opAssign(const block::tx&in);
+		bool exists() const;
+		bool paid() const;
+		address from() const;
+		address to() const;
+		payable value() const;
+		string function() const;
+		string blockchain() const;
+		string token() const;
+		string contract() const;
+		real320 gas_price() const;
+		uint256 gas_use() const;
+		uint256 gas_left() const;
+		uint256 gas_limit() const;
+		uint256 asset() const;
+		uint256 hash() const;
+		uint64 block_number() const;
+		real320 balance_delta_of(const address&in, const uint256&in) const;
+		real320 reserve_delta_of(const address&in, const uint256&in) const;
+		payable payments_from(const address&in) const;
+		payable payments_to(const address&in) const;
+		payable reservations_from(const address&in) const;
+		payable reservations_to(const address&in) const;
+	}
+}
 namespace real320 { real320 enan(); }
 namespace real320 { real320 from(const string&in, uint8); }
 namespace log { void emit(const ?&in); }
 namespace log { void event(const ?&in, const ?&in); }
-namespace log { bool into(int, ?&out); }
-namespace log { bool event_into(const ?&in, int, ?&out); }
-namespace log { t get<t>(int); }
-namespace log { t get_event<t>(const ?&in, int); }
+namespace log { bool into(int, ?&out, const address&in = address()); }
+namespace log { bool event_into(const ?&in, int, ?&out, const address&in = address()); }
+namespace log { t get<t>(int, const address&in = address()); }
+namespace log { t get_event<t>(const ?&in, int, const address&in = address()); }
 namespace block { address proposer(); }
 namespace block { uint256 parent_hash(); }
 namespace block { uint256 gas_use(); }
@@ -404,14 +440,25 @@ namespace tx { payable value(); }
 namespace tx { string blockchain(); }
 namespace tx { string token(); }
 namespace tx { string contract(); }
+namespace tx { string function(); }
 namespace tx { real320 gas_price(); }
 namespace tx { uint256 gas_use(); }
 namespace tx { uint256 gas_left(); }
 namespace tx { uint256 gas_limit(); }
 namespace tx { uint256 asset(); }
+namespace tx { uint256 hash(); }
+namespace tx { block::tx self(); }
+namespace tx { bool pipelined(); }
+namespace bridge { void link(const uint256&in, const uint256&in, const string&in); }
+namespace bridge { void send(const uint256&in, const uint256&in, const string&in, const real320&in, const real320&in); }
+namespace bridge { bool requires_link(); }
+namespace bridge { bool requires_send(); }
+namespace coin { bool valid(const uint256&in); }
+namespace coin { bool bridged(const uint256&in); }
 namespace coin { uint256 native(); }
 namespace coin { uint256 token(const string&in); }
 namespace coin { uint256 id_of(const string&in, const string&in = string(), const string&in = string()); }
+namespace coin { uint256 base_of(const uint256&in); }
 namespace coin { string blockchain_of(const uint256&in); }
 namespace coin { string token_of(const uint256&in); }
 namespace coin { string contract_of(const uint256&in); }
@@ -424,6 +471,7 @@ namespace alg { string from_e16(const string&in); }
 namespace alg { string to_e16(const string&in); }
 namespace alg { address erecover160(const uint256&in, const string&in); }
 namespace alg { string erecover264(const uint256&in, const string&in); }
+namespace alg { bool epoint264(const string&in); }
 namespace alg { uint256 prandom256(); }
 namespace alg { string crc32(const string&in); }
 namespace alg { string ripemd160(const string&in); }
