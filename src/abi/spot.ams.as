@@ -38,7 +38,7 @@ namespace ams
         }
         return output;
     }
-    void cleanup_deposits()
+    void expire_deposit_transactions()
     {
         uint256 spent_hash; array<uint256> spent_hashes;
         ranging_slice spent_slice = deposits.y(true).lte(block::number());
@@ -53,6 +53,13 @@ class booking_ref
 {
     uint256 asset;
     real320 amount;
+}
+
+class post_booking : booking_ref
+{
+    string public_key;
+    uint256 block_number;
+    uint256 withdraw_hash;
 }
 
 class fee_ref
@@ -82,10 +89,11 @@ class config
     address deployer_account;
     real320 fee_overflow = 0.01;
     uint64 book_validity_blocks = 7200;
+    uint64 deposit_validity_blocks = 21600;
 }
 
 ranging<booking_ref, bool, string> bookings;
-ranging<uint256, bool, bool> deposits;
+ranging<uint256, bool, post_booking> deposits;
 mapping<uint256, real320> fees;
 varying<config> params;
 
@@ -102,6 +110,7 @@ void reconstruct(pmut@, const config&in new_params)
     require(params.empty() || params.ref.deployer_account == tx::from(), "prev. deployer account must be the tx sender");
     require(!new_params.deployer_account.empty() && !new_params.dex_account.empty(), "deployer/dex accounts must not be empty");
     require(new_params.book_validity_blocks >= 2400, "booking validity period is too low");
+    require(new_params.deposit_validity_blocks >= 7200, "deposit validity period is too low");
     require(new_params.fee_overflow >= 0 && new_params.fee_overflow <= 1, "fee overflow must be within [0; 1] range");
     params = new_params;
     log::event(new_params, null);
@@ -159,12 +168,11 @@ void spend_deposit(pmut@, const uint256&in deposit_hash, const uint256&in bridge
     block::tx deposit = block::tx(deposit_hash);
     require(!tx::paid(), "payment not permitted");
     require(bridge::requires_send(), "send not permitted");
-    require(deposit_hash > 0, "deposit hash must be set");
     require(bridge_hash > 0, "bridge hash must be set");
     require(!routing_address.empty(), "routing address must be set");
-    require(!deposits.has(deposit_hash, true), "deposit transaction spent");
+    require(deposit_hash > 0 && !deposits.has(deposit_hash, true), "deposit transaction spent");
     require(!signature.empty(), "signature must be set");
-    require(deposit.exists(), "deposit transaction not found");
+    require(deposit.exists() && deposit.success(), "deposit transaction not found");
 
     payable payments = deposit.payments_to(tx::to());
     require(payments.size() == 1, "deposit transaction must pay once");
@@ -204,10 +212,9 @@ void spend_deposit(pmut@, const uint256&in deposit_hash, const uint256&in bridge
 
     string provided_public_key = alg::erecover264(alg::blake2b256(message.data()), signature);
     require(booking_public_key == provided_public_key, "booking signature does not match");
-    ams::cleanup_deposits();
-    deposits.insert(deposit_hash, true, true, block::number() + params.ref.book_validity_blocks * 2);
+    ams::expire_deposit_transactions();
     bookings.erase(input, true);
-    
+
     booking_ref output = ams::execute_swap_path(input, token_path, 0);
     uint256 output_network = coin::base_of(output.asset);
     require(fees.has(output_network), "send for " + coin::name_of(output_network) + " is not yet available");
@@ -246,26 +253,110 @@ void spend_deposit(pmut@, const uint256&in deposit_hash, const uint256&in bridge
     event.output = output;
     log::emit(event);
 
+    post_booking booking;
+    booking.asset = output.asset;
+    booking.amount = output.amount;
+    booking.public_key = booking_public_key;
+    booking.block_number = block::number() + params.ref.deposit_validity_blocks;
+    booking.withdraw_hash = tx::hash();
+    deposits.insert(deposit_hash, true, booking, booking.block_number);
+    log::emit(booking);
+
     require(coin::bridged(output.asset), "must use off-chain base asset to send");
     require(bridge::requires_send(), "send requires withdrawal feature flag");
     bridge::send(bridge_hash, output.asset, routing_address, output.amount, fee);
+}
+void respend_deposit(pmut@, const uint256&in deposit_hash, const uint256&in broadcast_hash, const uint256&in bridge_hash, const string&in routing_address, const string&in signature)
+{
+    block::tx deposit = block::tx(deposit_hash);
+    require(!tx::paid(), "payment not permitted");
+    require(bridge::requires_send(), "send not permitted");
+    require(bridge_hash > 0, "bridge hash must be set");
+    require(!routing_address.empty(), "routing address must be set");
+    require(!signature.empty(), "signature must be set");
+    require(deposit_hash > 0 && deposit.exists() && deposit.success(), "deposit transaction not found");
+    require(deposits.has(deposit_hash, true), "deposit transaction unspent");
+    require(block::number() - deposit.block_number() <= params.ref.deposit_validity_blocks, "deposit transaction is too old to resend");
+    ams::expire_deposit_transactions();
+
+    post_booking ref = deposits[deposit_hash, true];
+    uint256 network = coin::base_of(ref.asset);
+    require(coin::bridged(ref.asset) && !ref.public_key.empty() && ref.amount.positive(), "deposit cannot be resent");
+    require(fees.has(network), "send for " + coin::name_of(network) + " is not yet available");
+    require(block::number() - ref.block_number.u64() <= params.ref.deposit_validity_blocks, "deposit is too old to resend");
+
+    block::tx broadcast = block::tx(broadcast_hash);
+    require(broadcast_hash > 0 && broadcast.exists(), "broadcast transaction not found");
+    require(!broadcast.success() && broadcast.by(ref.withdraw_hash), "broadcast transaction must not have sent a proof and must be initiated by this booking");
+
+    abi message;
+    message.wu256(deposit_hash);
+    message.wu256(broadcast_hash);
+    message.wu256(bridge_hash);
+    message.wu256(ref.asset);
+    message.wr320(ref.amount);
+    message.wu160(tx::to());
+    message.wu160(tx::from());
+    message.wstr(routing_address);
+    require(ref.public_key == alg::erecover264(alg::blake2b256(message.data()), signature), "resend signature does not match booking key");
+
+    post_booking resent;
+    resent.asset = ref.asset;
+    resent.amount = ref.amount;
+    resent.public_key = ref.public_key;
+    resent.block_number = block::number() + params.ref.deposit_validity_blocks;
+    resent.withdraw_hash = tx::hash();
+    deposits.insert(deposit_hash, true, resent, resent.block_number);
+    log::emit(resent);
+
+    bridge::send(bridge_hash, ref.asset, routing_address, ref.amount, fees[network]);
 }
 void repay_deposit(pmut@, const uint256&in deposit_hash)
 {
     block::tx deposit = block::tx(deposit_hash);
     require(!tx::paid(), "payment not permitted");
     require(params.ref.deployer_account == tx::from(), "deployer account must be the tx sender");
-    require(deposit_hash > 0, "deposit hash must be set");
-    require(deposit.exists(), "deposit transaction not found");
+    require(deposit_hash > 0 && deposit.exists() && deposit.success(), "deposit transaction not found");
     require(!deposits.has(deposit_hash, true), "deposit transaction spent");
     require(block::number() - deposit.block_number() > params.ref.book_validity_blocks, "deposit transaction is time locked");
-    require(block::number() - deposit.block_number() <= params.ref.book_validity_blocks * 2, "deposit transaction is too old to repay");
-    ams::cleanup_deposits();
-    deposits.insert(deposit_hash, true, true, block::number() + params.ref.book_validity_blocks * 2);
+    require(block::number() - deposit.block_number() <= params.ref.deposit_validity_blocks, "deposit transaction is too old to repay");
+    ams::expire_deposit_transactions();
 
-    address self = tx::to();
-    payable payments = deposit.payments_to(self);
+    post_booking booking;
+    booking.amount = real320::enan();
+    booking.block_number = block::number() + params.ref.deposit_validity_blocks;
+    deposits.insert(deposit_hash, true, booking, booking.block_number);
+
+    payable payments = deposit.payments_to(tx::to());
     require(!payments.empty(), "deposit transaction must pay");
     for (usize i = 0; i < payments.size(); i++)
         params.ref.deployer_account.pay(payments[i], payments.of(payments[i]));
+}
+real320 fee_of(pconst@, const uint256&in asset)
+{
+    require(fees.has(asset), "fee not found");
+    return fees[asset];
+}
+bool deposit_spent(pconst@, const uint256&in deposit_hash)
+{
+    return deposits.has(deposit_hash, true);
+}
+bool booking_alive(pconst@, const uint256&in asset, const real320&in amount)
+{
+    booking_ref ref;
+    ref.asset = asset;
+    ref.amount = amount;
+    return bookings.has(ref, true);
+}
+post_booking booking_of(pconst@, const uint256&in asset, const real320&in amount)
+{
+    post_booking ref;
+    ref.asset = asset;
+    ref.amount = amount;
+    require(bookings.x(booking_ref(ref)).next(null, ref.public_key, ref.block_number), "booking not found");
+    return ref;
+}
+config params_of(pconst@)
+{
+    return params.ref;
 }
