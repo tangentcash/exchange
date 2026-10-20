@@ -1,7 +1,9 @@
 .git/
+.env/
 node_modules/
 dist/
 cache/
 log/
-test/
+src/abi/.test/transactions/
+src/abi/.test/*.js
 **/.DS_Store

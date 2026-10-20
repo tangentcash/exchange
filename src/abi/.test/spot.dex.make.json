@@ -1,0 +1,13 @@
+[
+    ["trap", "err"],
+    ["from", "tcrt1x00g22stp0qcprrxra7x2pz2au33armtfc50460"],
+    ["to", "tcrt1x6wn5uxmwz25xhz7rvkauajdsw7kmauf2xy8fcc"],
+    ["compile", "./../spot.dex.as"],
+    ["call", "construct"],
+    ["assemble", "deploy", "./transactions/spot.dex.bin"],
+    ["assemble", "call", "./transactions/spot.dex.unify_eth_usdt.bin", "unify_asset", { "$asset": ["ETH", "USDT", "0xdAC17F958D2ee523a2206206994597C13D831ec7"] }, "USDT"],
+    ["assemble", "call", "./transactions/spot.dex.unify_sol_usdt.bin", "unify_asset", { "$asset": ["SOL", "USDT", "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"] }, "USDT"],
+    ["assemble", "call", "./transactions/spot.dex.unify_trx_usdt.bin", "unify_asset", { "$asset": ["TRX", "USDT", "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"] }, "USDT"],
+    ["assemble", "call", "./transactions/spot.dex.unify_eth_usdc.bin", "unify_asset", { "$asset": ["ETH", "USDC", "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"] }, "USDC"],
+    ["assemble", "call", "./transactions/spot.dex.unify_sol_usdc.bin", "unify_asset", { "$asset": ["SOL", "USDC", "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"] }, "USDC"]
+]

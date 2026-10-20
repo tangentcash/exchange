@@ -1,0 +1,7 @@
+[
+    ["trap", "err"],
+    ["from", "tcrt1x00g22stp0qcprrxra7x2pz2au33armtfc50460"],
+    ["to", "tcrt1x3vw5dlz44jz4xckace09mllus92gj9k85wcyvz"],
+    ["compile", "./../spot.uap.as"],
+    ["assemble", "deploy", "./transactions/spot.uap.bin"]
+]

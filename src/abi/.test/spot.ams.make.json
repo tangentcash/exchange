@@ -1,0 +1,16 @@
+[
+    ["trap", "err"],
+    ["from", "tcrt1x00g22stp0qcprrxra7x2pz2au33armtfc50460"],
+    ["to", "tcrt1x3vw5dlz44jz4xckace09mllus92gj9k85wcyvz"],
+    ["compile", "./../spot.ams.as"],
+    ["call", "construct", "tcrt1x6wn5uxmwz25xhz7rvkauajdsw7kmauf2xy8fcc"],
+    ["assemble", "deploy", "./transactions/spot.ams.bin", "tcrt1x6wn5uxmwz25xhz7rvkauajdsw7kmauf2xy8fcc"],
+    ["assemble", "call", "./transactions/spot.ams.link_ada.bin", "reconstruct_link", 45987804190883151934575026078299734328476763737790245711744916364274187987028],
+    ["assemble", "call", "./transactions/spot.ams.link_bch.bin", "reconstruct_link", 8401881144010691738221876443831996142614924794048037925038424768267419891395],
+    ["assemble", "call", "./transactions/spot.ams.link_btc.bin", "reconstruct_link", 110967312376811618222064956676021568595860350397555172599242796183486641871378],
+    ["assemble", "call", "./transactions/spot.ams.link_doge.bin", "reconstruct_link", 82088332182815552730971056066372006909195213143755938601584436203279212853265],
+    ["assemble", "call", "./transactions/spot.ams.link_ltc.bin", "reconstruct_link", 26219571044668134593020795451867474744493945307641841717351161263797035497975],
+    ["assemble", "call", "./transactions/spot.ams.link_xlm.bin", "reconstruct_link", 17485030261664128936127842965640069105084808546311157467490345962882924101832],
+    ["assemble", "call", "./transactions/spot.ams.link_xmr.bin", "reconstruct_link", 45392539613381489633311480448077606227588516357401155904898584912041212674684],
+    ["assemble", "call", "./transactions/spot.ams.link_xrp.bin", "reconstruct_link", 28254190602763178201477773871425034756937134111684958873587957855266468240737]
+]

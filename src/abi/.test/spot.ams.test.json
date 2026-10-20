@@ -1,0 +1,111 @@
+[
+    ["from", "tcrt1x25x782mml6cty0xg6hfmvukqgmp9fq09d9v9av"],
+    ["to", "tcrt1xn58mly6f7er0zs6swtetqgfqs36jaarq7yd7gc"],
+    ["compile", "./../spot.dex.as"],
+    ["call", "construct"],
+    ["call", "unify_asset", { "$asset": ["ETH", "USDT", "0xdAC17F958D2ee523a2206206994597C13D831ec7"] }, "USDT"],
+    ["pay_funded", "160", "ETH"],
+    ["pay_funded", "10", "BTC"],
+    ["call", "deposit_pool", { "$asset": ["ETH"] }, { "$asset": ["BTC"] }, "0.0625", "nan", "nan", "0.003"],
+    ["pay", "0", "ETH"],
+    ["pay", "0", "BTC"],
+    ["pay_funded", "200", "ETH"],
+    ["pay_funded", "200000", "ETH", "USDT", "0xdAC17F958D2ee523a2206206994597C13D831ec7"],
+    ["call", "deposit_pool", { "$asset": ["ETH", "USDT", "0xdAC17F958D2ee523a2206206994597C13D831ec7"] }, { "$asset": ["ETH"] }, "0.001", "nan", "nan", "0.003"],
+    ["pay", "0", "ETH"],
+    ["pay", "0", "ETH", "USDT", "0xdAC17F958D2ee523a2206206994597C13D831ec7"],
+    ["pay_funded", "200", "ETH"],
+    ["pay_funded", "200000", "ETH", "USDT", "0xdAC17F958D2ee523a2206206994597C13D831ec7"],
+    ["call", "deposit_pool", { "$asset": ["ETH"] }, { "$asset": ["ETH", "USDT", "0xdAC17F958D2ee523a2206206994597C13D831ec7"] }, "1000", "nan", "nan", "0.003"],
+    ["pay", "0", "ETH"],
+    ["pay", "0", "ETH", "USDT", "0xdAC17F958D2ee523a2206206994597C13D831ec7"],
+    ["to", "tcrt1xqvvsy3ayfp8w7fs4wg3pt5y6r69c56jjuf87ys"],
+    ["compile", "./../spot.ams.as"],
+    ["call", "construct", "tcrt1xn58mly6f7er0zs6swtetqgfqs36jaarq7yd7gc"],
+    ["try", "call", "spend_deposit",
+        46783905484937927252641697298875282640738056103046437190496647096544233777256,
+        39287329603871521044089446498565968162583641481606160757927148334459949194829,
+        "bc1qw5sz2b7dl8mkvcz5kw83dzbn3xhg8c7klqkkzh",
+        [
+            ["", { "$asset": ["ETH"] }, "0.0625", "0.05", "0.05", true],
+            ["USDT", { "$asset": ["ETH", "USDT", "0xdAC17F958D2ee523a2206206994597C13D831ec7"] }, "0.001", "0.05", "0.05", true]
+        ],
+        [
+            ["", { "$asset": ["ETH"] }, "1000", "0.001", "0.05", true]
+        ],
+        { "$blob": "0xbadacb4bf0a7dd7b524db4217aa3a78ee11b3a60f632c8d9d10bbf69c108ec8057122633e5b4c906ad9ec3e5def037e331d6ac9c5d070ef5b3f2a1de94639db900" }
+    ],
+    ["try", "call", "spend_deposit",
+        46783905484937927252641697298875282640738056103046437190496647096544233777256,
+        39287329603871521044089446498565968162583641481606160757927148334459949194829,
+        "",
+        [
+            ["", { "$asset": ["ETH"] }, "0.0625", "0.05", "0.05", true],
+            ["USDT", { "$asset": ["ETH", "USDT", "0xdAC17F958D2ee523a2206206994597C13D831ec7"] }, "0.001", "0.05", "0.05", true]
+        ],
+        [
+            ["", { "$asset": ["ETH"] }, "1000", "0.001", "0.05", true]
+        ],
+        { "$blob": "0x4f49308b596eca002c968f3a1ce11efc2d4796b87cf95e41698999017a569eae6a2f9ee2946d0d51eaa902fd5aeef16f33fa9395d965de2ee5fb37860349416701" }
+    ],
+    ["block", -2],
+    ["call", "book_deposit", { "$asset": ["BTC"] }, "0.1", { "$blob": "0x0381aaadc8a5e83f4576df823cf22a5b1969cf704a0d5f6f68bd757410c9917aac" }],
+    { "cmd": ["call", "booking_alive", { "$asset": ["BTC"] }, "0.1"], "note": "booking exists after book_deposit", "expect": { "contains": "true" } },
+    { "cmd": ["call", "booking_of", { "$asset": ["BTC"] }, "0.1"], "note": "booking resolves with the booked public key", "expect": { "contains": "0x0381aaadc8a5e83f" } },
+    { "cmd": ["call", "deposit_spent", 46783905484937927252641697298875282640738056103046437190496647096544233777256], "note": "BTC deposit not spent yet", "expect": { "contains": "false" } },
+    { "cmd": ["call", "params_of"], "note": "deployer and dex accounts in effect", "expect": { "contains": "tcrt1x25x782mml6cty0xg6hfmvukqgmp9fq09d9v9av" } },
+    ["from", "tcrt1xvaaaaqnshh36rvj22nkx90xjh5605x3hm839ug"],
+    { "cmd": ["call", "reconstruct", { "dex_account": "tcrt1xn58mly6f7er0zs6swtetqgfqs36jaarq7yd7gc", "deployer_account": "tcrt1xvaaaaqnshh36rvj22nkx90xjh5605x3hm839ug", "fee_overflow": "0.01", "book_validity_blocks": "7200", "deposit_validity_blocks": "21600" }], "note": "reconstruct rejected for non-deployer sender", "expect": { "error": "prev. deployer account must be the tx sender" } },
+    ["from", "tcrt1x25x782mml6cty0xg6hfmvukqgmp9fq09d9v9av"],
+    { "cmd": ["call", "reconstruct", { "dex_account": "tcrt1xn58mly6f7er0zs6swtetqgfqs36jaarq7yd7gc", "deployer_account": "tcrt1x25x782mml6cty0xg6hfmvukqgmp9fq09d9v9av", "fee_overflow": "0.01", "book_validity_blocks": "100", "deposit_validity_blocks": "21600" }], "note": "validity floors enforced", "expect": { "error": "booking validity period is too low" } },
+    ["block", "+1"],
+    ["flags", "withdraw_with_revert"],
+    ["try", "call", "spend_deposit",
+        46783905484937927252641697298875282640738056103046437190496647096544233777256,
+        39287329603871521044089446498565968162583641481606160757927148334459949194829,
+        "bc1qw5sz2b7dl8mkvcz5kw83dzbn3xhg8c7klqkkzh",
+        [
+            ["", { "$asset": ["ETH"] }, "0.0625", "0.05", "0.05", true],
+            ["USDT", { "$asset": ["ETH", "USDT", "0xdAC17F958D2ee523a2206206994597C13D831ec7"] }, "0.001", "0.05", "0.05", true]
+        ],
+        [
+            ["", { "$asset": ["ETH"] }, "1000", "0.001", "0.05", true]
+        ],
+        { "$blob": "0x00" }
+    ],
+    ["call", "spend_deposit",
+        46783905484937927252641697298875282640738056103046437190496647096544233777256,
+        39287329603871521044089446498565968162583641481606160757927148334459949194829,
+        "bc1qw5sz2b7dl8mkvcz5kw83dzbn3xhg8c7klqkkzh",
+        [
+            ["", { "$asset": ["ETH"] }, "0.0625", "0.05", "0.05", true],
+            ["USDT", { "$asset": ["ETH", "USDT", "0xdAC17F958D2ee523a2206206994597C13D831ec7"] }, "0.001", "0.05", "0.05", true]
+        ],
+        [
+            ["", { "$asset": ["ETH"] }, "1000", "0.000960568", "0.05", true]
+        ],
+        { "$blob": "0xbadacb4bf0a7dd7b524db4217aa3a78ee11b3a60f632c8d9d10bbf69c108ec8057122633e5b4c906ad9ec3e5def037e331d6ac9c5d070ef5b3f2a1de94639db900" }
+    ],
+    ["log"],
+    { "cmd": ["call", "booking_alive", { "$asset": ["BTC"] }, "0.1"], "note": "booking consumed by the spend", "expect": { "contains": "false" } },
+    { "cmd": ["call", "deposit_spent", 46783905484937927252641697298875282640738056103046437190496647096544233777256], "note": "BTC deposit recorded as spent", "expect": { "contains": "true" } },
+    ["flags", "withdraw"],
+    ["call", "respend_deposit",
+        46783905484937927252641697298875282640738056103046437190496647096544233777256,
+        47379183764595744809567775830349152889946784548663803031925639933788846667806,
+        39287329603871521044089446498565968162583641481606160757927148334459949194829,
+        "bc1qw5sz2b7dl8mkvcz5kw83dzbn3xhg8c7klqkkzh",
+        { "$blob": "0xe8f3b19a02fbd1477960fad80fa308e6879cdd7e371e8bc1cd92d797eaaea7614202f4cc31803043c8b908b3898b189a1be98c92125b7173c6f4d01d4271c57400" }
+    ],
+    { "cmd": ["call", "deposit_spent", 33858336582242677103876590952323141828732928068020152863387286025527637439362], "note": "fresh ETH deposit unspent", "expect": { "contains": "false" } },
+    ["block", "+7200"],
+    ["call", "repay_deposit", 33858336582242677103876590952323141828732928068020152863387286025527637439362],
+    { "cmd": ["call", "deposit_spent", 33858336582242677103876590952323141828732928068020152863387286025527637439362], "note": "repay marks the deposit consumed", "expect": { "contains": "true" } },
+    ["flags", "route"],
+    ["asset", "ETH"],
+    ["call", "reconstruct_link", 39287329603871521044089446498565968162583641481606160757927148334459949194829, "0xdAC17F958D2ee523a2206206994597C13D831ec7"],
+    ["asset", "off"],
+    ["flags", "off"],
+    { "cmd": ["call", "reconstruct", { "dex_account": "tcrt1xn58mly6f7er0zs6swtetqgfqs36jaarq7yd7gc", "deployer_account": "tcrt1x25x782mml6cty0xg6hfmvukqgmp9fq09d9v9av", "fee_overflow": "0.01", "book_validity_blocks": "7200", "deposit_validity_blocks": "21600" }], "note": "reconstruct by the deployer succeeds", "expect": { "ok": true } },
+    { "cmd": ["call", "params_of"], "note": "params remain in effect", "expect": { "contains": "tcrt1x25x782mml6cty0xg6hfmvukqgmp9fq09d9v9av" } }
+]

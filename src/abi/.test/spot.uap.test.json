@@ -1,0 +1,14 @@
+[
+    ["trap", "err"],
+    ["from", "tcrt1x25x782mml6cty0xg6hfmvukqgmp9fq09d9v9av"],
+    ["to", "tcrt1x6wn5uxmwz25xhz7rvkauajdsw7kmauf2xy8fcc"],
+    ["compile", "./../spot.dex.as"],
+    ["call", "construct"],
+    ["call", "unify_asset", { "$asset": ["ETH", "USDC", "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"] }, "USDC"],
+    ["to", "tcrt1xx9gpzce730pmlzjwc3ld67ghq8q3jq8xyx4s3s"],
+    ["compile", "./../spot.uap.as"],
+    ["call", "construct"],
+    ["pay_funded", 100, "ETH", "USDC", "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"],
+    ["call", "pay_unified_asset", { "$asset": "BTC" }, { "$asset": ["TAN", "USDC", "tcrt1x6wn5uxmwz25xhz7rvkauajdsw7kmauf2xy8fcc"] }, "tcrt1x6wn5uxmwz25xhz7rvkauajdsw7kmauf2xy8fcc"],
+    ["state_check", "0x82d14a84d4f4178f7c1344c95937845875fd8a35d2de49fea45a51833a3ca99e"]
+]
