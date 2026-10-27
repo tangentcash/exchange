@@ -1,5 +1,6 @@
 import { AssetId } from 'tangentsdk';
 import { Exchange } from './exchange'
+import { Blockchain } from './blockchain';
 import { Peers } from './peers';
 import { QuoteResult, Quotes, symbolOf } from './market';
 import { OrderSide, Trade } from '../types';
@@ -17,7 +18,14 @@ export class Jobs {
     static assetCleanup: NodeJS.Timeout | null = null;
     static pairCleanup: NodeJS.Timeout | null = null;
     static marketData: NodeJS.Timeout | null = null;
-    
+    static amsDeposits: {
+        interval: number,
+        timeout: NodeJS.Timeout | null
+    } = {
+        interval: 90_000,
+        timeout: null
+    };
+
     static async runAssetPrices(interval: number, runDeferred?: boolean): Promise<void> {
         return new Promise<void>((resolve, reject) => {
             if (this.assetPrices.timeout != null)
@@ -39,7 +47,7 @@ export class Jobs {
                         const asset = assets[i];
                         if (asset.id == native || this.assetPrices.blacklist.has(asset.id))
                             continue;
-                        
+
                         const symbol = symbolOf(asset);
                         const parent = cache[symbol];
                         try {
@@ -145,5 +153,31 @@ export class Jobs {
                 this.runMarketData(interval, true);
             }, runDeferred ? interval : 0);
         });
+    }
+    static async runPreattestationsData(config?: { interval?: number }, runDeferred?: boolean): Promise<void> {
+        const { promise, resolve } = Promise.withResolvers<void>();
+        if (this.amsDeposits.timeout != null) {
+            resolve();
+            return promise;
+        }
+
+        if (typeof config?.interval == 'number' && config.interval > 0)
+            this.amsDeposits.interval = config.interval;
+
+        this.amsDeposits.timeout = setTimeout(async () => {
+            try {
+                if (await Exchange.hasPendingBookings()) {
+                    await Blockchain.pollPreattestations();
+                    Log.info('job preattestations pull: OK complete');
+                }
+            } catch (exception) {
+                Log.error('job preattestations pull error:', exception);
+            }
+
+            this.amsDeposits.timeout = null;
+            this.runPreattestationsData(config, true);
+            resolve();
+        }, runDeferred ? this.amsDeposits.interval : 0);
+        return promise;
     }
 }

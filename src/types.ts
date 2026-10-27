@@ -1,4 +1,5 @@
-import { AssetId, Uint256 } from "tangentsdk";
+import BigNumber from 'bignumber.js';
+import { AssetId, ByteUtil, Hashing, Uint256 } from "tangentsdk";
 
 export enum MarketPolicy {
     Spot,
@@ -36,15 +37,14 @@ export type Block = {
     blockHash: Uint256;
 }
 
-export type Market = {
-    id: Uint256;
-    accountId: Uint256;
-    account?: string;
-    version?: string;
-    unifiedAssetProxyAccount?: string;
-    deployerAccountId: Uint256;
-    deployerAccount?: string;
-    blockNumber: number;
+export enum ContractType {
+    DEX = 'dex',
+    DLP = 'dlp',
+    UAP = 'uap',
+    AMS = 'ams'
+}
+
+export type DexParameters = {
     poolExitFee: BigNumber;
     maxPoolFeeRate: BigNumber;
     minMakerFee: BigNumber;
@@ -57,6 +57,41 @@ export type Market = {
     assetResetDays: number;
     accountResetDays: number;
     marketPolicy: MarketPolicy;
+};
+
+export type DlpParameters = {
+    rewardEmission: BigNumber;
+    rewardBalance: BigNumber;
+    permissions: {
+        primaryAssetId: Uint256;
+        primaryAsset: string;
+        secondaryAssetId: Uint256;
+        secondaryAsset: string;
+    }[];
+};
+
+export type AmsParameters = {
+    dex?: string;
+    feeOverflow: BigNumber;
+    bookValidityBlocks: number;
+    depositValidityBlocks: number;
+    depositPrecision: number;
+    sequencer?: string | null;
+};
+
+export type UapParameters = { };
+
+export type ContractParameters = DexParameters | DlpParameters | AmsParameters | UapParameters;
+
+export type Contract<T extends ContractParameters = ContractParameters> = {
+    id: Uint256;
+    type: string;
+    accountId: Uint256;
+    account?: string;
+    deployerAccountId: Uint256 | null;
+    deployerAccount?: string | null;
+    blockNumber: number | null;
+    parameters: T;
 }
 
 export type AggregatedPair = {
@@ -116,8 +151,6 @@ export type Order = {
     pairId: Uint256;
     primaryAsset?: string;
     secondaryAsset?: string;
-    marketId: Uint256;
-    marketAccount?: string;
     accountId: Uint256;
     blockNumber: number;
     condition: OrderCondition;
@@ -142,8 +175,6 @@ export type Pool = {
     pairId: Uint256;
     primaryAsset?: string;
     secondaryAsset?: string;
-    marketId: Uint256;
-    marketAccount?: string;
     accountId: Uint256;
     blockNumber: number;
     initialPrice: BigNumber;
@@ -167,7 +198,6 @@ export type Pool = {
 
 export type Trade = {
     pairId: Uint256;
-    marketId?: Uint256;
     makerOrderId?: Uint256;
     makerPoolId?: Uint256;
     makerAccountId?: Uint256;
@@ -182,7 +212,6 @@ export type Trade = {
 
 export type Depth = {
     pairId: Uint256;
-    marketId: Uint256;
     poolId: Uint256;
     accountId: Uint256;
     blockNumber: number;
@@ -191,30 +220,9 @@ export type Depth = {
     time: Date;
 }
 
-export type Delegator = {
-    id: Uint256;
-    marketId: Uint256;
-    accountId: Uint256;
-    account?: string;
-    deployerAccountId: Uint256;
-    deployerAccount?: string;
-    blockNumber: number;
-    rewardEmission: BigNumber;
-    rewardBalance: BigNumber;
-    permissions: {
-        primaryAssetId: Uint256;
-        primaryAsset: string;
-        secondaryAssetId: Uint256;
-        secondaryAsset: string;
-    }[];
-}
-
 export type DelegatedPool = {
     id: Uint256;
     pairId: Uint256;
-    marketId: Uint256;
-    marketAccount?: string;
-    delegatorId: Uint256;
     delegatorAccount?: string;
     accountId: Uint256;
     primaryAsset?: string;
@@ -237,10 +245,7 @@ export type DelegatedPool = {
 }
 
 export type PseudoDelegatedPool = {
-    marketId: Uint256;
     pairId: Uint256;
-    delegatorId: Uint256;
-    marketAccount?: string;
     delegatorAccount?: string;
     primaryAsset?: string;
     secondaryAsset?: string;
@@ -267,3 +272,98 @@ export type Balance = {
     available: BigNumber,
     price: BigNumber | null
 };
+
+export type Booking = {
+    id: Uint256,
+    asset: AssetId,
+    assetId: Uint256,
+    amount: BigNumber,
+    publicKey: string,
+    status: string,
+    expiresBlock: number,
+    txHash: string,
+    blockNumber: number,
+    depositHash: string | null,
+    depositStatus: string | null,
+    depositBlock: number | null,
+    depositPayer: string | null,
+    withdrawHash: string | null,
+    bridgeHash: string | null,
+    outAsset: AssetId | null,
+    outAmount: BigNumber | null,
+    broadcastHash: string | null,
+    proofTransactionId: string | null,
+    relayError: string | null,
+    routingAddress: string | null,
+    attestateHash: string | null
+};
+
+export enum BookingStatus {
+    AwaitingDeposit = 'awaiting_deposit',
+    FinalizingDeposit = 'finalizing_deposit',
+    AwaitingExecution = 'awaiting_execution',
+    AwaitingWithdrawal = 'awaiting_withdrawal',
+    FinalizingWithdrawal = 'finalizing_withdrawal',
+    FailingWithdrawal = 'failing_withdrawal',
+    Finalized = 'finalized',
+    Expired = 'expired'
+}
+
+export type BookingSwap = {
+    symbol: string,
+    asset: AssetId,
+    price: BigNumber,
+    amount: BigNumber,
+    slippage: BigNumber,
+    buying: boolean
+};
+
+export type SpendMessageParams = {
+    depositHash: Uint256,
+    bridgeHash: Uint256,
+    inputAsset: AssetId,
+    inputAmount: BigNumber,
+    contractAddress: string,
+    sequencerAddress: string,
+    routingAddress: string,
+    tokenPath: BookingSwap[],
+    feePath: BookingSwap[]
+};
+
+export type RespendMessageParams = {
+    depositHash: Uint256,
+    broadcastHash: Uint256,
+    bridgeHash: Uint256,
+    asset: AssetId,
+    amount: BigNumber,
+    contractAddress: string,
+    sequencerAddress: string,
+    routingAddress: string
+};
+
+export type PreattestationEvent = {
+    txHash: Uint256,
+    payerAccount: string | null,
+    asset: AssetId,
+    amount: BigNumber,
+    source: 'preattestation' | 'mined',
+    isSinglePayment: boolean
+};
+
+export type BroadcastEvent = {
+    txHash: Uint256,
+    withdrawHash: Uint256,
+    proofTransactionId: string | null,
+    error: string | null
+};
+
+export type AttestationEvent = {
+    txHash: Uint256,
+    hashdata: string
+};
+
+export enum PseudoEvent {
+    Preattestation = Hashing.hash32(ByteUtil.byteStringToUint8Array('PreattestationEvent')),
+    Broadcast = Hashing.hash32(ByteUtil.byteStringToUint8Array('BroadcastEvent')),
+    Attestation = Hashing.hash32(ByteUtil.byteStringToUint8Array('AttestationEvent'))
+}

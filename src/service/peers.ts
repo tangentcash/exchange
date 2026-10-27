@@ -131,9 +131,8 @@ export class Peers {
                 return;
             if ((this.seen[batch.origin] ?? -1) >= batch.time)
                 return;
+            
             this.seen[batch.origin] = batch.time;
-
-            // stream to all other connected peers (loop-safe: origin + timestamp dedup)
             this.send(from, batch);
             void Peers.applyPrices(batch);
         } catch (exception) {

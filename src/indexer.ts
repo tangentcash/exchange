@@ -5,9 +5,11 @@ import { Blockchain } from './service/blockchain';
 import { Relay } from './service/relay';
 import { Peers } from './service/peers';
 import { Common } from './common';
+import { ContractType } from './types';
 import { BigNumber } from 'bignumber.js';
 import { Quotes } from './service/market';
 import fs from 'fs';
+import { Chain } from 'tangentsdk';
 
 BigNumber.config({ DECIMAL_PLACES: 18, ROUNDING_MODE: 1 });
 
@@ -36,6 +38,10 @@ async function main(): Promise<void> {
         return process.exit(1);
     }
 
+    const blockchain: any = options.blockchain || { };
+    if (typeof blockchain.network == 'string' && ['regtest', 'testnet', 'mainnet'].includes(blockchain.network))
+        Chain.props = (Chain as unknown as Record<string, typeof Chain.props>)[blockchain.network];
+
     try {
         const exchange: any = options.exchange || { };
         Log.info('exchange client setup (' + (exchange.database || 'db') + ': ' + (exchange.host || '?') + ':' + (exchange.port || '?') + ')');
@@ -46,7 +52,6 @@ async function main(): Promise<void> {
     }
 
     try {
-        const blockchain: any = options.blockchain || { };
         Log.info('blockchain client setup (network: ' + (blockchain.network || 'default') + ', validator: ' + (blockchain.validator || 'null') + ')');
         await Blockchain.setup({
             validator: blockchain.validator,
@@ -57,20 +62,50 @@ async function main(): Promise<void> {
         Log.error('blockchain setup error:', exception);
         return process.exit(1);
     }
+    try {
+        Log.info('running blockchain boot check');
+        const configured = Blockchain.contracts;
+        const contracts = await Exchange.getContracts();
+        let mismatch = contracts.length != Object.keys(configured).length;
+        for (let type in configured) {
+            const row = contracts.find((v) => v.account == configured[type as ContractType]);
+            if (row == null || row.type != type)
+                mismatch = true;
+        }
+        if (!mismatch) {
+            Log.info('blockchain boot check: configured contracts match the database');
+        } else if (contracts.length > 0) {
+            Log.info('blockchain boot check: configured contracts do not match the database, forcing a full rescan');
+            await Exchange.rollbackToBlock(0);
+        } else {
+            Log.info('blockchain boot check: no contracts registered yet (the first sync will register them)');
+        }
+    } catch (exception: any) {
+        Log.error('blockchain boot check error:', exception);
+        return process.exit(1);
+    }
 
     try {
         Log.info('running background jobs');
         if (options.jobs?.blockSync === true) {
             await Blockchain.sync();
+            Log.info('background jobs: initial block sync complete (event-driven from now on)');
         }
         if (typeof options.jobs?.assetsCleanup == 'number') {
             await Jobs.runAssetCleanup(options.jobs.assetsCleanup);
+            Log.info('background jobs: asset cleanup now running');
         }
         if (typeof options.jobs?.pairsCleanup == 'number') {
             await Jobs.runPairCleanup(options.jobs.pairsCleanup);
+            Log.info('background jobs: pair cleanup now running');
         }
         if (typeof options.jobs?.marketData == 'number') {
             await Jobs.runMarketData(options.jobs.marketData);
+            Log.info('background jobs: market polling now running');
+        }
+        if (typeof options.jobs?.amsDeposits == 'object') {
+            await Jobs.runPreattestationsData(options.jobs.amsDeposits);
+            Log.info('background jobs: preattestation polling now running');
         }
         if (typeof options.jobs?.assetPrices == 'object') {
             const setup = options.jobs.assetPrices;
@@ -127,14 +162,14 @@ async function main(): Promise<void> {
         } catch (exception: any) {
             Log.error('relay shutdown error:', exception);
         }
-        
+
         try {
             Log.info('blockchain client shutdown');
             await Blockchain.shutdown();
         } catch (exception: any) {
             Log.error('blockchain shutdown error:', exception);
         }
-                
+
         try {
             Log.info('exchange client shutdown');
             await Exchange.shutdown();

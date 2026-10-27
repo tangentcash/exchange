@@ -22,8 +22,7 @@ namespace ams
             require(order.amount.positive(), id + " amount must be positive");
             require(order.asset != output.asset, id + " cannot swap an asset into itself");
             require(order.slippage >= 0 && order.slippage < 1,  id + " slippage must be within [0; 1) range");
-            require(order.amount <= output.amount, id + " paying amount must be less than or equal to " + string::from(output.amount));
-
+            
             payable order_value; order_value.plus(output.asset, output.amount);
             uint256 receiving_asset = order.symbol.empty() ? order.asset : coin::id_of(blockchain, order.symbol, address);
             real320 receiving_value = self.balance_delta_of(receiving_asset);
@@ -37,7 +36,7 @@ namespace ams
 
             real320 price = order.buying ? (output.amount / receiving_value) : (receiving_value / output.amount);
             require(price.positive() && (order.buying ? price <= slippage_price : price >= slippage_price), id + " executed at price " + string::from(price) + " but expected no worse than " + string::from(slippage_price));
-            output.asset = order.asset;
+            output.asset = receiving_asset;
             output.amount = receiving_value;
         }
         return output;
@@ -100,6 +99,7 @@ class config
     real320 fee_overflow = 0.01;
     uint64 book_validity_blocks = 7200;
     uint64 deposit_validity_blocks = 21600;
+    uint8 deposit_precision = 6;
 }
 
 ranging<booking_ref, bool, string> bookings;
@@ -136,10 +136,12 @@ void reconstruct_link(pmut@, const uint256&in bridge_hash, const string&in routi
 }
 void book_deposit(pmut@, const uint256&in asset, const real320&in amount, const string&in public_key)
 {
+    real320 indexed_amount = amount.trim(params.ref.deposit_precision);
     require(!tx::paid(), "payment not permitted");
     require(coin::bridged(asset), "must book off-chain asset");
     require(alg::epoint264(public_key), "must book with a valid public key");
-    
+    require(indexed_amount.positive(), "amount must be positive");
+
     booking_ref ref;
     array<booking_ref> refs;
     ranging_slice slice = bookings.y(true).lte(block::number());
@@ -149,7 +151,7 @@ void book_deposit(pmut@, const uint256&in asset, const real320&in amount, const 
         bookings.erase(refs[i], true);
     
     ref.asset = asset;
-    ref.amount = amount;
+    ref.amount = indexed_amount;
     require(!bookings.has_x(ref), "provided network and amount is already booked");
     bookings.insert(ref, true, public_key, block::number() + params.ref.book_validity_blocks);
     log::emit(ref);
@@ -171,7 +173,7 @@ void spend_deposit(pmut@, const uint256&in deposit_hash, const uint256&in bridge
 
     booking_ref input;
     input.asset = payments[0];
-    input.amount = payments.of(input.asset);
+    input.amount = payments.of(input.asset).trim(params.ref.deposit_precision);
     require(coin::bridged(input.asset), "must pay off-chain asset");
     require(input.amount.positive(), "must pay positive amount");
     require(bookings.has(input, true), "booking not found");
@@ -207,6 +209,7 @@ void spend_deposit(pmut@, const uint256&in deposit_hash, const uint256&in bridge
     require(booking_public_key == provided_public_key, "booking signature does not match");
     ams::expire_deposit_transactions();
     bookings.erase(input, true);
+    input.amount = payments.of(input.asset);
 
     booking_ref output = ams::execute_swap_path(input, token_path, 0);
     if (!token_path.empty() && output.asset != token_path.back().asset)
@@ -295,7 +298,7 @@ void respend_deposit(pmut@, const uint256&in deposit_hash, const uint256&in broa
     message.wu256(broadcast_hash);
     message.wu256(bridge_hash);
     message.wu256(ref.asset);
-    message.wr320(ref.amount);
+    message.wr320(ref.amount.trim(params.ref.deposit_precision));
     message.wu160(tx::to());
     message.wu160(tx::from());
     message.wstr(routing_address);
@@ -343,14 +346,14 @@ bool booking_alive(pconst@, const uint256&in asset, const real320&in amount)
 {
     booking_ref ref;
     ref.asset = asset;
-    ref.amount = amount;
+    ref.amount = amount.trim(params.ref.deposit_precision);
     return bookings.has(ref, true);
 }
 post_booking booking_of(pconst@, const uint256&in asset, const real320&in amount)
 {
     post_booking ref;
     ref.asset = asset;
-    ref.amount = amount;
+    ref.amount = amount.trim(params.ref.deposit_precision);
     require(bookings.x(booking_ref(ref)).next(ref.public_key, null, ref.block_number), "booking not found");
     return ref;
 }

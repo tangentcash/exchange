@@ -1,6 +1,6 @@
 import { BigNumber } from "bignumber.js";
-import { AssetId, ByteUtil, Hashing, Pubkeyhash, UiUtil, Signing, Spot, Uint256, Whitelist } from 'tangentsdk';
-import { MarketPolicy, Market, Order, OrderCondition, OrderPolicy, OrderSide, Trade, AggregatedPair, AggregatedTrade, AggregatedLevel, AggregatedLog, Block, RefType, Pool, Depth, Delegator, DelegatedPool, PseudoDelegatedPool, PseudoDelegatedState, Balance } from './../types';
+import { AssetId, ByteUtil, Hashing, Pubkeyhash, UiUtil, Signing, Spot, Uint256, Whitelist, Seckey } from 'tangentsdk';
+import { MarketPolicy, Contract, ContractType, ContractParameters, DlpParameters, AmsParameters, Order, OrderCondition, OrderPolicy, OrderSide, Trade, AggregatedPair, AggregatedTrade, AggregatedLevel, AggregatedLog, Block, RefType, Pool, Depth, DelegatedPool, PseudoDelegatedPool, PseudoDelegatedState, Balance, Booking, BookingStatus, PseudoEvent, PreattestationEvent, BroadcastEvent, AttestationEvent } from './../types';
 import { Log } from './../logging';
 import { Common } from './../common';
 import { Blockchain, EventInfo } from './blockchain';
@@ -9,6 +9,17 @@ import NodeCache from 'node-cache';
 import pq from 'postgres';
 import os from 'os';
 
+const BOOKING_STATUS_EDGES: Record<string, string[]> = {
+    [BookingStatus.AwaitingDeposit]: [BookingStatus.FinalizingDeposit, BookingStatus.AwaitingExecution, BookingStatus.Expired],
+    [BookingStatus.FinalizingDeposit]: [BookingStatus.AwaitingExecution, BookingStatus.AwaitingDeposit, BookingStatus.Expired],
+    [BookingStatus.AwaitingExecution]: [BookingStatus.AwaitingWithdrawal, BookingStatus.AwaitingDeposit, BookingStatus.Expired],
+    [BookingStatus.AwaitingWithdrawal]: [BookingStatus.FinalizingWithdrawal, BookingStatus.FailingWithdrawal, BookingStatus.AwaitingExecution],
+    [BookingStatus.FinalizingWithdrawal]: [BookingStatus.Finalized, BookingStatus.FailingWithdrawal, BookingStatus.AwaitingWithdrawal],
+    [BookingStatus.FailingWithdrawal]: [BookingStatus.AwaitingWithdrawal, BookingStatus.FinalizingWithdrawal],
+    [BookingStatus.Finalized]: [],
+    [BookingStatus.Expired]: []
+};
+
 export type PriceDescriptors = Record<string, { whitelist: boolean, base: string | null, price: { open: BigNumber | null, close: BigNumber | null } }>;
 
 export type Connection = pq.TransactionSql;
@@ -16,13 +27,13 @@ export type Connection = pq.TransactionSql;
 export enum Notification {
     AuthorizerResponse = 'response:authorizer',
     ChainUpdate = 'update:chain',
-    MarketUpdate = 'update:market',
-    DelegatorUpdate = 'update:delegator',
+    ContractUpdate = 'update:contract',
     DelegatedPoolUpdate = 'update:delegated-pool',
     OrderUpdate = 'update:order',
     PoolUpdate = 'update:pool',
     TradeUpdate = 'update:trade',
-    LevelUpdate = 'update:level'
+    LevelUpdate = 'update:level',
+    BookingUpdate = 'update:booking'
 }
 
 export type NotificationData = {
@@ -77,7 +88,13 @@ export type Options = {
     database?: string;
     application?: string;
     connections?: number;
-    intervals?: number[]
+    intervals?: number[];
+    signer?: {
+        secretKey?: string;
+        simulation?: boolean;
+        confirmTimeout?: number;
+        maxGasPrice?: number;
+    }
 }
 
 export type Caches = {
@@ -86,6 +103,14 @@ export type Caches = {
     assetIdsToPairId: NodeCache;
     assetPairIdToAssets: NodeCache;
     accountHashToAssetId: NodeCache;
+}
+
+export type Sequencer = {
+    secretKey: Seckey,
+    address: string,
+    simulation: boolean,
+    confirmTimeout: number,
+    maxGasPrice: number | null
 }
 
 export class Cursor {
@@ -126,10 +151,12 @@ export class TimeCursor {
 }
 
 export class Exchange {
+    private static config: pq.Options<any> | null = null;
     static listeners: Record<string, pq.ListenMeta> = { };
     static intervals: number[] = [2628000, 604800, 259200, 86400, 14400, 3600, 1800, 900, 300, 60];
     static connection: pq.Sql;
     static cache: Caches;
+    static sequencer: Sequencer | null = null;
 
     static clearCache(): void {
         const options = { maxKeys: 1024 * 8 };
@@ -142,7 +169,29 @@ export class Exchange {
         };
     }
     static async setup(config: Options): Promise<void> {
-        const sql = pq({
+        const signer = config.signer; this.sequencer = null;
+        if (signer != null && typeof signer.secretKey == 'string') {
+            const secretKey = Signing.decodeSecretKey(signer.secretKey);
+            if (secretKey == null)
+                throw new Error('invalid signer secret key (read-only mode)');
+
+            const address = Signing.encodeAddress(Signing.derivePublicKeyHash(Signing.derivePublicKey(secretKey)));
+            if (address == null)
+                throw new Error('failed to derive signer address (read-only mode)');
+
+            this.sequencer = {
+                secretKey: secretKey,
+                address: address,
+                simulation: signer.simulation === true,
+                confirmTimeout: typeof signer.confirmTimeout == 'number' ? signer.confirmTimeout : 120,
+                maxGasPrice: typeof signer.maxGasPrice == 'number' ? signer.maxGasPrice : null
+            };
+            Log.info(`sequencer ${address}${this.sequencer.simulation ? ' (simulation mode)' : ''}`);
+        } else {
+            this.sequencer = null;
+        }
+
+        const options: pq.Options<any> = {
             host: config.host || 'localhost',
             port: config.port || 19419,
             user: config.user,
@@ -151,7 +200,10 @@ export class Exchange {
             max: config.connections || Math.max(4, os.cpus().length),
             connection: {
                 application_name: config.application || 'ts',
-            },
+            }
+        };
+        const sql = pq({
+            ...options,
             onnotice: (notice: pq.Notice) => {
                 Log.info('storage notice:', notice['message'] || notice);
             },
@@ -159,7 +211,8 @@ export class Exchange {
                 Log.query(`storage query (parameters: ${parameters}, connections: ${connection}):\n`, query);
             }
         });
- 
+        this.config = options;
+
         const result = await this.resultOf(sql`SELECT COUNT(1) FROM pg_extension WHERE extname = 'timescaledb'`);
         if (result[0]['count'] < 1)
             throw new Error('postgresql database must have \'timescaledb\' extension loaded');
@@ -200,7 +253,7 @@ export class Exchange {
             PRIMARY KEY (id)
         );
         CREATE INDEX IF NOT EXISTS assets_hash ON assets USING hash (hash);
-        
+
         CREATE TABLE IF NOT EXISTS pairs
         (
             id BIGSERIAL,
@@ -220,59 +273,35 @@ export class Exchange {
             value NUMERIC(96, 18) NOT NULL,
             PRIMARY KEY (account_id, asset_id)
         );
-        
-        CREATE TABLE IF NOT EXISTS markets
-        (
-            id BIGSERIAL,
-            account_id BIGINT NOT NULL UNIQUE REFERENCES accounts (id) ON DELETE CASCADE,
-            deployer_account_id BIGINT NOT NULL REFERENCES accounts (id) ON DELETE CASCADE,
-            block_number BIGINT NOT NULL REFERENCES blocks (block_number) ON DELETE CASCADE,
-            pool_exit_fee NUMERIC(96, 18) NOT NULL,
-            max_pool_fee_rate NUMERIC(96, 18) NOT NULL,
-            min_maker_fee NUMERIC(96, 18) NOT NULL,
-            max_maker_fee NUMERIC(96, 18) NOT NULL,
-            maker_fee_exponent BIGINT NOT NULL,
-            min_taker_fee NUMERIC(96, 18) NOT NULL,
-            max_taker_fee NUMERIC(96, 18) NOT NULL,
-            taker_fee_exponent BIGINT NOT NULL,
-            asset_volume_target NUMERIC(96, 18) NOT NULL,
-            asset_reset_days BIGINT NOT NULL,
-            account_reset_days BIGINT NOT NULL,
-            market_policy SMALLINT NOT NULL,
-            PRIMARY KEY (id)
-        );
 
-        CREATE TABLE IF NOT EXISTS delegators
+        CREATE TABLE IF NOT EXISTS contracts
         (
             id BIGSERIAL,
-            market_id BIGINT NOT NULL REFERENCES markets (id) ON DELETE CASCADE,
+            type TEXT NOT NULL CHECK (type IN ('dex', 'dlp', 'uap', 'ams')),
             account_id BIGINT NOT NULL UNIQUE REFERENCES accounts (id) ON DELETE CASCADE,
-            deployer_account_id BIGINT NOT NULL REFERENCES accounts (id) ON DELETE CASCADE,
-            block_number BIGINT NOT NULL REFERENCES blocks (block_number) ON DELETE CASCADE,
-            reward_emission NUMERIC(96, 18) NOT NULL,
-            reward_balance NUMERIC(96, 18) NOT NULL,
-            permissions JSONB DEFAULT NULL,
-            PRIMARY KEY (id)
+            deployer_account_id BIGINT REFERENCES accounts (id) ON DELETE CASCADE,
+            block_number BIGINT REFERENCES blocks (block_number) ON DELETE CASCADE,
+            parameters JSONB NOT NULL DEFAULT '{}'::jsonb,
+            PRIMARY KEY (id),
+            UNIQUE (type)
         );
 
         CREATE TABLE IF NOT EXISTS poly_assets
         (
             asset_id BIGINT NOT NULL REFERENCES assets (id) ON DELETE CASCADE,
-            market_id BIGINT NOT NULL REFERENCES markets (id) ON DELETE CASCADE,
             poly_asset_id BIGINT NOT NULL REFERENCES assets (id) ON DELETE CASCADE,
-            PRIMARY KEY (asset_id, market_id)
+            PRIMARY KEY (asset_id)
         );
-        
+
         CREATE TABLE IF NOT EXISTS tiers
         (
             account_id BIGINT NOT NULL REFERENCES accounts (id) ON DELETE CASCADE,
             asset_id BIGINT NOT NULL REFERENCES assets (id) ON DELETE CASCADE,
-            market_id BIGINT NOT NULL REFERENCES markets (id) ON DELETE CASCADE,
             block_number BIGINT NOT NULL REFERENCES blocks (block_number) ON DELETE CASCADE,
             volume NUMERIC(96, 18) NOT NULL,
             maker_fee NUMERIC(96, 18) NOT NULL,
             taker_fee NUMERIC(96, 18) NOT NULL,
-            PRIMARY KEY (account_id, asset_id, market_id)
+            PRIMARY KEY (account_id, asset_id)
         );
 
         CREATE TABLE IF NOT EXISTS orders
@@ -280,7 +309,6 @@ export class Exchange {
             id BIGSERIAL,
             order_id BYTEA NOT NULL,
             pair_id BIGINT NOT NULL REFERENCES pairs (id) ON DELETE CASCADE,
-            market_id BIGINT NOT NULL REFERENCES markets (id) ON DELETE CASCADE,
             account_id BIGINT NOT NULL REFERENCES accounts (id) ON DELETE CASCADE,
             block_number BIGINT NOT NULL REFERENCES blocks (block_number) ON DELETE CASCADE,
             condition SMALLINT NOT NULL,
@@ -298,16 +326,15 @@ export class Exchange {
             last_price NUMERIC(96, 18) GENERATED ALWAYS AS (COALESCE(stop_price, price, filling_price, 0.0)) STORED,
             last_quantity NUMERIC(96, 18) GENERATED ALWAYS AS (CASE WHEN side = 0 THEN COALESCE(value / COALESCE(stop_price, price, filling_price), 0.0) ELSE value END) STORED,
             PRIMARY KEY (id),
-            UNIQUE (market_id, order_id)
+            UNIQUE (order_id)
         );
         CREATE INDEX IF NOT EXISTS orders_order_id ON orders USING hash (order_id);
-        
+
         CREATE TABLE IF NOT EXISTS pools
         (
             id BIGSERIAL,
             pool_id BYTEA NOT NULL,
             pair_id BIGINT NOT NULL REFERENCES pairs (id) ON DELETE CASCADE,
-            market_id BIGINT NOT NULL REFERENCES markets (id) ON DELETE CASCADE,
             account_id BIGINT NOT NULL REFERENCES accounts (id) ON DELETE CASCADE,
             block_number BIGINT NOT NULL REFERENCES blocks (block_number) ON DELETE CASCADE,
             initial_price NUMERIC(96, 18) NOT NULL,
@@ -327,7 +354,7 @@ export class Exchange {
             last_ask_price NUMERIC(96, 18) GENERATED ALWAYS AS (CASE WHEN active THEN COALESCE(price * (1 + fee_rate), 0.0) ELSE 0.0 END) STORED,
             last_bid_price NUMERIC(96, 18) GENERATED ALWAYS AS (CASE WHEN active THEN COALESCE(price * (1 - fee_rate), 0.0) ELSE 0.0 END) STORED,
             PRIMARY KEY (id),
-            UNIQUE (market_id, pool_id)
+            UNIQUE (pool_id)
         );
         CREATE INDEX IF NOT EXISTS pools_pool_id ON pools USING hash (pool_id);
         CREATE INDEX IF NOT EXISTS pools_price_not_initial_price ON pools ((price <> initial_price));
@@ -336,8 +363,6 @@ export class Exchange {
         (
             id BIGSERIAL,
             pair_id BIGINT NOT NULL REFERENCES pairs (id) ON DELETE CASCADE,
-            market_id BIGINT NOT NULL REFERENCES markets (id) ON DELETE CASCADE,
-            delegator_id BIGINT NOT NULL REFERENCES delegators (id) ON DELETE CASCADE,
             account_id BIGINT NOT NULL REFERENCES accounts (id) ON DELETE CASCADE,
             block_number BIGINT NOT NULL REFERENCES blocks (block_number) ON DELETE CASCADE,
             reward_value NUMERIC(96, 18) NOT NULL,
@@ -347,13 +372,12 @@ export class Exchange {
             secondary_value NUMERIC(96, 18) NOT NULL,
             active BOOLEAN NOT NULL,
             PRIMARY KEY (id),
-            UNIQUE (pair_id, market_id, delegator_id, account_id)
+            UNIQUE (pair_id, account_id)
         );
 
         CREATE TABLE IF NOT EXISTS depths
         (
             pair_id BIGINT NOT NULL REFERENCES pairs (id) ON DELETE CASCADE,
-            market_id BIGINT NOT NULL REFERENCES markets (id) ON DELETE CASCADE,
             pool_id BIGINT NOT NULL REFERENCES pools (id) ON DELETE CASCADE,
             account_id BIGINT NOT NULL REFERENCES accounts (id) ON DELETE CASCADE,
             block_number BIGINT NOT NULL REFERENCES blocks (block_number) ON DELETE CASCADE,
@@ -362,11 +386,10 @@ export class Exchange {
             time BIGINT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS depths_pair_id_time ON depths (pair_id, time DESC);
-        
+
         CREATE TABLE IF NOT EXISTS trades
         (
             pair_id BIGINT NOT NULL,
-            market_id BIGINT DEFAULT NULL,
             maker_order_id BIGINT DEFAULT NULL,
             maker_pool_id BIGINT DEFAULT NULL,
             maker_account_id BIGINT DEFAULT NULL,
@@ -391,7 +414,53 @@ export class Exchange {
             timescaledb.compress_orderby = 'time DESC'
         );
         SELECT add_compression_policy('trades', 604800000, if_not_exists => true);
-        
+
+        CREATE TABLE IF NOT EXISTS bookings
+        (
+            id BIGSERIAL,
+            asset_id BIGINT NOT NULL REFERENCES assets (id) ON DELETE CASCADE,
+            amount NUMERIC(96, 18) NOT NULL,
+            public_key TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'awaiting_deposit',
+            expires_block BIGINT NOT NULL,
+            tx_hash BYTEA NOT NULL,
+            block_number BIGINT NOT NULL REFERENCES blocks (block_number) ON DELETE CASCADE,
+            deposit_hash BYTEA DEFAULT NULL,
+            withdraw_hash BYTEA DEFAULT NULL,
+            bridge_hash BYTEA DEFAULT NULL,
+            out_asset_id BIGINT REFERENCES assets (id) ON DELETE SET NULL,
+            out_amount NUMERIC(96, 18) DEFAULT NULL,
+            broadcast_hash BYTEA DEFAULT NULL,
+            proof_transaction_id TEXT DEFAULT NULL,
+            relay_error TEXT DEFAULT NULL,
+            attestate_hash BYTEA DEFAULT NULL,
+            PRIMARY KEY (id),
+            UNIQUE (tx_hash)
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS bookings_active_handle ON bookings (asset_id, amount) WHERE status NOT IN ('finalized', 'expired');
+        CREATE INDEX IF NOT EXISTS bookings_lookup ON bookings (asset_id, amount);
+        CREATE INDEX IF NOT EXISTS bookings_status ON bookings (status);
+        ALTER TABLE bookings ADD COLUMN IF NOT EXISTS routing_address TEXT DEFAULT NULL;
+        ALTER TABLE bookings ADD COLUMN IF NOT EXISTS deposit_source TEXT DEFAULT NULL;
+        ALTER TABLE bookings ADD COLUMN IF NOT EXISTS deposit_block BIGINT DEFAULT NULL;
+        ALTER TABLE bookings ADD COLUMN IF NOT EXISTS deposit_payer_account_id BIGINT DEFAULT NULL;
+        ALTER TABLE bookings ADD COLUMN IF NOT EXISTS deposit_preattested_time BIGINT DEFAULT NULL;
+
+        CREATE TABLE IF NOT EXISTS deposits
+        (
+            id BIGSERIAL,
+            deposit_hash BYTEA NOT NULL UNIQUE,
+            booking_id BIGINT REFERENCES bookings (id) ON DELETE SET NULL,
+            payer_account_id BIGINT REFERENCES accounts (id) ON DELETE SET NULL,
+            asset_id BIGINT NOT NULL REFERENCES assets (id) ON DELETE CASCADE,
+            amount NUMERIC(96, 18) NOT NULL,
+            source TEXT NOT NULL,
+            block_number BIGINT REFERENCES blocks (block_number) ON DELETE CASCADE,
+            preattested_time BIGINT DEFAULT NULL,
+            auto_time BIGINT DEFAULT floor(EXTRACT(EPOCH FROM CURRENT_TIMESTAMP)),
+            PRIMARY KEY (id)
+        );
+
         CREATE MATERIALIZED VIEW IF NOT EXISTS pairs_view AS (
             WITH timings AS (
                 SELECT
@@ -432,12 +501,12 @@ export class Exchange {
         CREATE MATERIALIZED VIEW IF NOT EXISTS delegators_view AS (
             WITH sources AS (
                 SELECT
-                    delegators.id,
-                    delegators.account_id,
+                    contracts.id,
+                    contracts.account_id,
                     delegated_pools.pair_id
                 FROM delegated_pools
-                    INNER JOIN delegators ON delegators.id = delegated_pools.delegator_id
-                GROUP BY delegators.id, delegators.account_id, delegated_pools.pair_id
+                    INNER JOIN contracts ON contracts.type = 'dlp'
+                GROUP BY contracts.id, contracts.account_id, delegated_pools.pair_id
             ), timings AS (
                 SELECT
                     (SELECT EXTRACT(EPOCH FROM CURRENT_DATE::TIMESTAMP - INTERVAL '180 days')::BIGINT * 1000) AS min_time,
@@ -451,7 +520,7 @@ export class Exchange {
                 WHERE trades.pair_id = sources.pair_id AND time BETWEEN timings.min_time AND timings.max_time) AS volume
             FROM sources
                 INNER JOIN timings ON TRUE
-        )`.simple());
+        );`.simple());
         await this.deployPriceSeries(sql);
     }
     private static async deployPriceSeries(connection?: pq.Sql | pq.TransactionSql): Promise<void> {
@@ -480,7 +549,7 @@ export class Exchange {
             await this.resultOf(sql.unsafe(`DROP MATERIALIZED VIEW IF EXISTS trades_${intervals[j]}_view`));
             present[j] = false;
         }
-        
+
         for (let i = 0; i < intervals.length; i++) {
             const interval = intervals[i];
             const bucket = interval * 1000;
@@ -488,7 +557,7 @@ export class Exchange {
             const name = 'trades_' + interval + '_view';
             await this.resultOf(sql.unsafe((source > 0 ? `
             CREATE MATERIALIZED VIEW IF NOT EXISTS ${name} WITH (timescaledb.continuous) AS
-            SELECT 
+            SELECT
                 pair_id,
                 time_bucket(${bucket}, timepoint) AS timepoint,
                 SUM(volume) AS volume,
@@ -499,7 +568,7 @@ export class Exchange {
             FROM trades_${source}_view
             GROUP BY pair_id, time_bucket(${bucket}, timepoint)` : `
             CREATE MATERIALIZED VIEW IF NOT EXISTS ${name} WITH (timescaledb.continuous) AS
-            SELECT 
+            SELECT
                 pair_id,
                 time_bucket(${bucket}, time) AS timepoint,
                 SUM(quantity) AS volume,
@@ -554,7 +623,7 @@ export class Exchange {
         await listener.unlisten();
         Log.info(`exchange ${channel} channel: shutdown`);
     }
-    static async dispatchEvents(block: { number: number, time: Date }, contract: { account: string, version: string, type: string }, events: EventInfo[], connection?: pq.TransactionSql): Promise<void> {
+    static async dispatchEvents(block: { number: number, time: Date }, contract: { account: string, type: string }, events: EventInfo[], connection?: pq.TransactionSql): Promise<void> {
         const accounts: Record<string, Uint256> = { };
         if (!accounts[contract.account]) {
             const accountId = await this.getAccountIdByAddress(contract.account, false, connection);
@@ -563,7 +632,7 @@ export class Exchange {
 
             accounts[contract.account] = accountId;
         }
-        
+
         let step = 0;
         const pseudos: Record<string, any> = { };
         const orders: Record<string, { orderId: Uint256, pseudoRef: PseudoOrder | null, primaryQuantity: BigNumber, secondaryQuantity: BigNumber }> = { };
@@ -573,7 +642,7 @@ export class Exchange {
             const log = events[i];
             Log.query(`exchange ${contract.account} event (type: ${log.event.type}, block: ${block.number}):`, log.event.args);
             switch (contract.type) {
-                case 'dex': {
+                case ContractType.DEX: {
                     switch (log.event.type) {
                         case Spot.DEX.Events.Config: {
                             try {
@@ -585,29 +654,29 @@ export class Exchange {
                                             throw new Error('cannot decode deployer account ' + market.deployer_account);
                                         accounts[market.deployer_account] = accountId;
                                     }
-                                    
-                                    const result = await this.setMarket({
+
+                                    const result = await this.setContract({
+                                        type: ContractType.DEX,
                                         accountId: accounts[contract.account],
                                         deployerAccountId: accounts[market.deployer_account],
                                         blockNumber: block.number,
-                                        poolExitFee: Common.bn(market.pool_exit_fee) || new BigNumber(0),
-                                        maxPoolFeeRate: Common.bn(market.max_pool_fee_rate) || new BigNumber(0),
-                                        minMakerFee: Common.bn(market.min_maker_fee) || new BigNumber(0),
-                                        maxMakerFee: Common.bn(market.max_maker_fee) || new BigNumber(0),
-                                        makerFeeExponent: Common.num(market.maker_fee_exponent) || 0,
-                                        minTakerFee: Common.bn(market.min_taker_fee) || new BigNumber(0),
-                                        maxTakerFee: Common.bn(market.max_taker_fee) || new BigNumber(0),
-                                        takerFeeExponent: Common.num(market.taker_fee_exponent) || 0,
-                                        assetVolumeTarget: Common.bn(market.asset_volume_target) || new BigNumber(0),
-                                        assetResetDays: Common.num(market.asset_reset_days) || 0,
-                                        accountResetDays: Common.num(market.account_reset_days) || 0,
-                                        marketPolicy: (Common.num(market.market_policy) || 0) as MarketPolicy
+                                        parameters: {
+                                            poolExitFee: Common.bn(market.pool_exit_fee) || new BigNumber(0),
+                                            maxPoolFeeRate: Common.bn(market.max_pool_fee_rate) || new BigNumber(0),
+                                            minMakerFee: Common.bn(market.min_maker_fee) || new BigNumber(0),
+                                            maxMakerFee: Common.bn(market.max_maker_fee) || new BigNumber(0),
+                                            makerFeeExponent: Common.num(market.maker_fee_exponent) || 0,
+                                            minTakerFee: Common.bn(market.min_taker_fee) || new BigNumber(0),
+                                            maxTakerFee: Common.bn(market.max_taker_fee) || new BigNumber(0),
+                                            takerFeeExponent: Common.num(market.taker_fee_exponent) || 0,
+                                            assetVolumeTarget: Common.bn(market.asset_volume_target) || new BigNumber(0),
+                                            assetResetDays: Common.num(market.asset_reset_days) || 0,
+                                            accountResetDays: Common.num(market.account_reset_days) || 0,
+                                            marketPolicy: (Common.num(market.market_policy) || 0) as MarketPolicy
+                                        }
                                     }, connection);
-                                    if (result != null) {
-                                        await this.notify(Notification.MarketUpdate, {
-                                            args: { marketId: result.id }
-                                        }, connection);
-                                    }
+                                    if (result != null)
+                                        await this.notify(Notification.ContractUpdate, { args: { type: ContractType.DEX, account: contract.account } }, connection);
                                 }
                                 Log.info(`exchange ${contract.account} market update`);
                             } catch (exception) {
@@ -772,16 +841,12 @@ export class Exchange {
                                 if (!accountId)
                                     throw new Error('Failed to get contract account id: ' + contract.account);
 
-                                const market = await this.getMarketByAccountId(accountId, connection);
-                                if (!market)
-                                    throw new Error('Failed to get market: ' + contract.account);
-
                                 const tier = await Blockchain.call(contract.account, UiUtil.toFunction(Spot.DEX.assetOf), [asset.toUint256()]);
                                 const assetId = await this.getAssetIdByHash(asset, 'trusted', connection);
                                 if (!assetId)
                                     throw new Error('Failed to get asset id');
 
-                                await this.setPolyAsset(assetId, market, tier ? tier.symbol || null : null, connection);
+                                await this.setPolyAsset(assetId, contract.account, tier ? tier.symbol || null : null, connection);
                                 Log.info(`exchange ${contract.account} poly asset update: ${asset.id} maps to ${tier ? tier.symbol || null : null}`);
                             } catch (exception) {
                                 Log.error(`exchange ${contract.account} poly asset update error (ref: ${asset.id}):`, exception);
@@ -794,7 +859,7 @@ export class Exchange {
                     }
                     break;
                 }
-                case 'dlp': {
+                case ContractType.DLP: {
                     switch (log.event.type) {
                         case Spot.DLP.Events.Config: {
                             try {
@@ -806,15 +871,6 @@ export class Exchange {
                                             throw new Error('cannot decode deployer account ' + delegator.deployer_account);
                                         accounts[delegator.deployer_account] = accountId;
                                     }
-
-                                    const marketAccountId = await this.getAccountIdByAddress(delegator.dex_account, true, connection);
-                                    if (!marketAccountId)
-                                        throw new Error('cannot find account ' + delegator.dex_account);
-
-                                    const market = await this.getMarketByAccountId(marketAccountId, connection);
-                                    if (!market)
-                                        throw new Error('cannot find market account ' + delegator.dex_account);
-
                                     const permissions = Array.isArray(delegator.permissions) ? delegator.permissions.map((x: any) => ({
                                         primaryAssetId: null,
                                         primaryAsset: x.primary_asset,
@@ -826,22 +882,21 @@ export class Exchange {
                                         permission.primaryAssetId = await this.getAssetIdByHash(new AssetId(permission.primaryAsset), 'trusted', connection);
                                         permission.secondaryAssetId = await this.getAssetIdByHash(new AssetId(permission.secondaryAsset), 'trusted', connection);
                                     }
-                                    
-                                    const result = await this.setDelegator({
-                                        marketId: market.id,
+
+                                    const result = await this.setContract({
+                                        type: ContractType.DLP,
                                         accountId: accounts[contract.account],
                                         deployerAccountId: accounts[delegator.deployer_account],
                                         blockNumber: block.number,
-                                        rewardEmission: Common.bn(delegator.reward_emission) || new BigNumber(0),
-                                        rewardBalance: Common.bn(delegator.reward_balance) || new BigNumber(0),
-                                        permissions: permissions.filter((x: any) => x.primaryAssetId != null && x.secondaryAssetId != null)
+                                        parameters: {
+                                            rewardEmission: Common.bn(delegator.reward_emission) || new BigNumber(0),
+                                            rewardBalance: Common.bn(delegator.reward_balance) || new BigNumber(0),
+                                            permissions: permissions.filter((x: any) => x.primaryAssetId != null && x.secondaryAssetId != null)
+                                        }
                                     }, connection);
-                                    if (result != null) {
-                                        await this.notify(Notification.DelegatorUpdate, {
-                                            args: { delegatorId: result.id }
-                                        }, connection);
+                                    if (result != null)
+                                        await this.notify(Notification.ContractUpdate, { args: { type: ContractType.DLP, account: contract.account } }, connection);
                                     }
-                                }
                                 Log.info(`exchange ${contract.account} delegator update`);
                             } catch (exception) {
                                 Log.error(`exchange ${contract.account} delegator update error:`, exception);
@@ -856,13 +911,9 @@ export class Exchange {
                             const batch = log.event.args[3];
                             if (batch) {
                                 try {
-                                    const accountId = await this.getAccountIdByAddress(contract.account, false, connection);
-                                    if (!accountId)
-                                        throw new Error('Failed to get delegator account id: ' + contract.account);
-
-                                    const delegator = await this.getDelegatorByAccountId(accountId, connection);
-                                    if (!delegator)
-                                        throw new Error('Failed to get delegator: ' + contract.account);
+                                    const dlp = await this.getContractByType(ContractType.DLP, connection);
+                                    if (dlp == null)
+                                        throw new Error('dlp contract not registered: ' + contract.account);
 
                                     const primaryAssetId = await this.getAssetIdByHash(primaryAsset, 'trusted', connection);
                                     if (!primaryAssetId)
@@ -872,15 +923,11 @@ export class Exchange {
                                     if (!secondaryAssetId)
                                         throw new Error('cannot find secondary asset of contract account ' + contract.account);
 
-                                    const market = await this.getMarketById(delegator.marketId, connection);
-                                    if (!market)
-                                        throw new Error('cannot find market of delegator contract account ' + contract.account);
-
-                                    const pairId = await this.getPairByAssetIds(primaryAssetId, secondaryAssetId, market.id, true, connection);
+                                    const pairId = await this.getPairByAssetIds(primaryAssetId, secondaryAssetId, true, connection);
                                     if (!pairId)
                                         throw new Error('cannot find asset pair of contract account ' + contract.account);
 
-                                    const delegatedPools = await this.getAllDelegatedPoolsByDelegatorIdAndMarketPair(delegator.id, delegator.marketId, pairId)
+                                    const delegatedPools = await this.getAllDelegatedPoolsByPair(pairId)
                                     for (let i = 0; i < delegatedPools.length; i++) {
                                         const delegatedPool = delegatedPools[i];
                                         let delegatedPoolId: Uint256 | null = null;
@@ -895,8 +942,6 @@ export class Exchange {
                                             const share = await Blockchain.call(contract.account, UiUtil.toFunction(Spot.DLP.shareOf), [primaryAsset.toUint256(), secondaryAsset.toUint256(), owner]);
                                             const result = await this.setDelegatedPool({
                                                 pairId: pairId,
-                                                marketId: market.id,
-                                                delegatorId: delegator.id,
                                                 accountId: delegatedPool.accountId,
                                                 blockNumber: block.number,
                                                 rewardValue: Common.bn(share.reward_value) || new BigNumber(0),
@@ -910,7 +955,7 @@ export class Exchange {
                                                 delegatedPoolId = result.id;
                                             }
                                         } catch {
-                                            const prevDelegatedPool = await this.getDelegatedPoolByHandle(market.id, pairId, delegator.id, delegatedPool.accountId, connection);
+                                            const prevDelegatedPool = await this.getDelegatedPoolByHandle(pairId, delegatedPool.accountId, connection);
                                             if (prevDelegatedPool) {
                                                 delegatedPoolId = prevDelegatedPool.id;
                                                 prevDelegatedPool.blockNumber = block.number;
@@ -927,7 +972,7 @@ export class Exchange {
                                         }
                                     }
 
-                                    Log.info(`exchange ${contract.account} delegated pool batch update (market_id: ${market.id.toString()}, pair_id: ${pairId.toString()}, delegator_id: ${delegator.id.toString()}): ${delegatedPools.length} updates`);
+                                    Log.info(`exchange ${contract.account} delegated pool batch update (pair_id: ${pairId.toString()}): ${delegatedPools.length} updates`);
                                 } catch (exception) {
                                     Log.error(`exchange ${contract.account} delegated pool batch update error (primary_asset: ${primaryAsset.id}, secondary_asset: ${secondaryAsset.id}):`, exception);
                                 }
@@ -940,13 +985,9 @@ export class Exchange {
                                     if (!ownerId)
                                         throw new Error('Failed to get owner account id: ' + owner);
 
-                                    const accountId = await this.getAccountIdByAddress(contract.account, false, connection);
-                                    if (!accountId)
-                                        throw new Error('Failed to get delegator account id: ' + contract.account);
-
-                                    const delegator = await this.getDelegatorByAccountId(accountId, connection);
-                                    if (!delegator)
-                                        throw new Error('Failed to get delegator: ' + contract.account);
+                                    const dlp = await this.getContractByType(ContractType.DLP, connection);
+                                    if (dlp == null)
+                                        throw new Error('dlp contract not registered: ' + contract.account);
 
                                     const primaryAssetId = await this.getAssetIdByHash(primaryAsset, 'trusted', connection);
                                     if (!primaryAssetId)
@@ -956,11 +997,7 @@ export class Exchange {
                                     if (!secondaryAssetId)
                                         throw new Error('cannot find secondary asset of contract account ' + contract.account);
 
-                                    const market = await this.getMarketById(delegator.marketId, connection);
-                                    if (!market)
-                                        throw new Error('cannot find market of delegator contract account ' + contract.account);
-
-                                    const pairId = await this.getPairByAssetIds(primaryAssetId, secondaryAssetId, market.id, true, connection);
+                                    const pairId = await this.getPairByAssetIds(primaryAssetId, secondaryAssetId, true, connection);
                                     if (!pairId)
                                         throw new Error('cannot find asset pair of contract account ' + contract.account);
 
@@ -969,8 +1006,6 @@ export class Exchange {
                                         const share = await Blockchain.call(contract.account, UiUtil.toFunction(Spot.DLP.shareOf), [primaryAsset.toUint256(), secondaryAsset.toUint256(), owner]);
                                         const result = await this.setDelegatedPool({
                                             pairId: pairId,
-                                            marketId: market.id,
-                                            delegatorId: delegator.id,
                                             accountId: ownerId,
                                             blockNumber: block.number,
                                             rewardValue: Common.bn(share.reward_value) || new BigNumber(0),
@@ -984,20 +1019,20 @@ export class Exchange {
                                             delegatedPoolId = result.id;
                                         }
                                     } catch {
-                                        const prevDelegatedPool = await this.getDelegatedPoolByHandle(market.id, pairId, delegator.id, ownerId, connection);
+                                        const prevDelegatedPool = await this.getDelegatedPoolByHandle(pairId, ownerId, connection);
                                         if (prevDelegatedPool) {
                                             delegatedPoolId = prevDelegatedPool.id;
                                             prevDelegatedPool.blockNumber = block.number;
                                             prevDelegatedPool.active = active = false;
                                             await this.setDelegatedPool(prevDelegatedPool, false, connection);
                                         }
-                                    }             
+                                    }
 
                                     await this.notify(Notification.DelegatedPoolUpdate, {
                                         accounts: owner ? [owner] : undefined,
                                         args: { delegatedPoolId: delegatedPoolId || new Uint256(0), active: active }
                                     }, connection);
-                                    Log.info(`exchange ${contract.account} delegated pool update (market_id: ${market.id.toString()}, pair_id: ${pairId.toString()}, delegator_id: ${delegator.id.toString()}, ownerId: ${ownerId.toString()})`);
+                                    Log.info(`exchange ${contract.account} delegated pool update (pair_id: ${pairId.toString()}, owner: ${ownerId.toString()})`);
                                 } catch (exception) {
                                     Log.error(`exchange ${contract.account} delegated pool update error (primary_asset: ${primaryAsset.id}, secondary_asset: ${secondaryAsset.id}, owner: ${owner}):`, exception);
                                 }
@@ -1008,6 +1043,257 @@ export class Exchange {
                             Log.error(`exchange ${contract.account} event is unknown (type: ${log.event.type}, block: ${block.number}, contract: dlp):`, log.event.args);
                             break;
                     }
+                    break;
+                }
+                case ContractType.AMS: {
+                    switch (log.event.type) {
+                        case Spot.AMS.Events.Config: {
+                            try {
+                                const params = await Blockchain.call(contract.account, UiUtil.toFunction(Spot.AMS.paramsOf), []);
+                                if (params != null) {
+                                    if (!accounts[params.deployer_account]) {
+                                        const deployerAccountId = await this.getAccountIdByAddress(params.deployer_account, false, connection);
+                                        if (!deployerAccountId)
+                                            throw new Error('cannot decode deployer account ' + params.deployer_account);
+                                        accounts[params.deployer_account] = deployerAccountId;
+                                    }
+
+                                    const result = await this.setContract({
+                                        type: ContractType.AMS,
+                                        accountId: accounts[contract.account],
+                                        deployerAccountId: accounts[params.deployer_account],
+                                        blockNumber: block.number,
+                                        parameters: {
+                                            dex: params.dex_account,
+                                            feeOverflow: Common.bn(params.fee_overflow) || new BigNumber(0),
+                                            bookValidityBlocks: Common.num(params.book_validity_blocks) || 0,
+                                            depositValidityBlocks: Common.num(params.deposit_validity_blocks) || 0,
+                                            depositPrecision: Common.num(params.deposit_precision) ?? 6
+                                        }
+                                    }, connection);
+                                    if (result != null)
+                                        await this.notify(Notification.ContractUpdate, { args: { type: ContractType.AMS, account: contract.account } }, connection);
+                                }
+
+                                Log.info(`exchange ${contract.account} ams config update`);
+                            } catch (exception) {
+                                Log.error(`exchange ${contract.account} ams config update error:`, exception);
+                            }
+                            break;
+                        }
+                        case Spot.AMS.Events.BookingRef: {
+                            try {
+                                const amsContract = await this.getAmsContract(connection);
+                                if (amsContract == null)
+                                    throw new Error('ams contract not registered (config event missing): ' + contract.account);
+
+                                const asset = new AssetId(log.event.args[0]);
+                                const amount = Common.bn(log.event.args[1]) || new BigNumber(0);
+                                if (amount.isLessThanOrEqualTo(0))
+                                    throw new Error('invalid booked amount');
+
+                                const publicKey = Array.isArray(log.args) && log.args.length > 2 ? String(log.args[2]) : '';
+                                if (publicKey.length < 1)
+                                    throw new Error('booking transaction public key missing');
+
+                                await this.expireBookings(block.number, connection);
+                                await this.setBooking(asset, {
+                                    amount: amount,
+                                    publicKey: publicKey,
+                                    expiresBlock: block.number + amsContract.parameters.bookValidityBlocks,
+                                    txHash: Common.u256(log.hash) || new Uint256(),
+                                    blockNumber: block.number
+                                }, connection);
+                                Log.info(`exchange ${contract.account} ams booking: ${asset.id} ${amount.toString()} (public key: ${publicKey}, expires: ${block.number + amsContract.parameters.bookValidityBlocks}) @ block ${block.number}`);
+                            } catch (exception) {
+                                Log.error(`exchange ${contract.account} ams booking update error:`, exception);
+                            }
+                            break;
+                        }
+                        case Spot.AMS.Events.SwapRef: {
+                            try {
+                                const amsContract = await this.getAmsContract(connection);
+                                if (amsContract == null)
+                                    throw new Error('ams contract not registered: ' + contract.account);
+
+                                const args = log.event.args;
+                                if (!Array.isArray(args) || args.length < 4)
+                                    throw new Error('unexpected swap_ref event layout');
+
+                                const inputAssetId = await this.getAssetIdByHash(new AssetId(args[0]), 'trusted', connection);
+                                const inputAmount = Common.bn(args[1]);
+                                if (inputAssetId == null || inputAmount == null)
+                                    throw new Error('cannot resolve swap_ref input');
+                                Log.info(`exchange ${contract.account} ams swap_ref: ${new AssetId(args[0]).id} ${inputAmount.toString()} @ block ${block.number}`);
+
+                                const booking = await this.getBookingByHandle(inputAssetId, inputAmount.decimalPlaces(amsContract.parameters.depositPrecision ?? 6, BigNumber.ROUND_DOWN), null, connection);
+                                if (booking == null)
+                                    Log.info(`exchange ${contract.account} ams swap_ref without any booking (input: ${args[0]}, amount: ${inputAmount.toString()})`);
+                                else if (booking.status != BookingStatus.AwaitingExecution)
+                                    Log.info(`exchange ${contract.account} ams swap_ref on ${booking.status} booking (deposit: ${log.hash})`);
+
+                                if (booking != null && booking.outAsset == null) {
+                                    const output = await this.findSwapRefOutput(events, log.hash, connection);
+                                    if (output != null)
+                                        await this.setBookingOutput(booking.id, output.outAssetId, output.outAmount, connection);
+                                }
+                            } catch (exception) {
+                                Log.error(`exchange ${contract.account} ams swap ref error:`, exception);
+                            }
+                            break;
+                        }
+                        case Spot.AMS.Events.SpentBooking: {
+                            try {
+                                const amsContract = await this.getAmsContract(connection);
+                                if (amsContract == null)
+                                    throw new Error('ams contract not registered: ' + contract.account);
+
+                                if (!Array.isArray(log.event.args) || log.event.args.length < 6)
+                                    throw new Error('unexpected spent_booking event layout');
+
+                                const depositHash = Common.u256(Array.isArray(log.args) && log.args.length > 0 ? log.args[0] : null);
+                                if (depositHash == null)
+                                    throw new Error('deposit hash missing from spending transaction');
+
+                                const withdrawHash = Common.u256(log.event.args[4]);
+                                if (withdrawHash == null)
+                                    throw new Error('withdraw hash missing from spent_booking event');
+
+                                const expiresBlock = Common.num(log.event.args[3]) || 0;
+                                const bridgeHash = Common.u256(log.event.args[5]);
+                                let booking: Booking | null = await this.getBookingByDepositHash(depositHash, connection);
+
+                                if (booking == null) {
+                                    for (let j = 0; j < events.length && booking == null; j++) {
+                                        const other = events[j];
+                                        if (other.hash == log.hash && other.event.type == Spot.AMS.Events.SwapRef && Array.isArray(other.event.args) && other.event.args.length >= 4) {
+                                            const inputAssetId = await this.getAssetIdByHash(new AssetId(other.event.args[0]), 'trusted', connection);
+                                            const inputAmount = Common.bn(other.event.args[1]);
+                                            if (inputAssetId != null && inputAmount != null)
+                                                booking = await this.getBookingByHandle(inputAssetId, inputAmount.decimalPlaces(amsContract.parameters.depositPrecision ?? 6, BigNumber.ROUND_DOWN), null, connection);
+                                        }
+                                    }
+                                }
+
+                                if (booking == null)
+                                    throw new Error('no matching AMS booking for spent booking (deposit: ' + depositHash.toHex() + ')');
+
+                                if (booking.depositHash == null)
+                                    await this.setBookingDepositFacts(booking.id, { depositHash: depositHash, source: 'mined', blockNumber: block.number }, connection);
+
+                                if (booking.outAsset == null) {
+                                    const output = await this.findSwapRefOutput(events, log.hash, connection);
+                                    if (output != null)
+                                        await this.setBookingOutput(booking.id, output.outAssetId, output.outAmount, connection);
+                                }
+
+                                await this.setBookingWithdrawal(booking.id, withdrawHash, bridgeHash, expiresBlock, true, connection);
+
+                                if (booking.status == BookingStatus.AwaitingExecution || booking.status == BookingStatus.FailingWithdrawal)
+                                    await this.updateBookingStatus(booking.id, BookingStatus.AwaitingWithdrawal, connection);
+                                Log.info(`exchange ${contract.account} ams spent_booking: deposit ${depositHash.toHex()} withdraw ${withdrawHash.toHex()} (booking: ${booking.id}) @ block ${block.number}`);
+
+                            } catch (exception) {
+                                Log.error(`exchange ${contract.account} ams spent booking error:`, exception);
+                            }
+                            break;
+                        }
+                        case PseudoEvent.Preattestation: {
+                            const row = log.event.args[0] as PreattestationEvent;
+                            Log.info(`exchange ${contract.account} ams preattestation: ${row.txHash.toHex()} (${row.asset.id} ${row.amount.toString()}, ${row.source == 'mined' ? 'block ' + block.number : 'mempool'})`);
+                            try {
+                                const assetId = await this.getAssetIdByHash(row.asset, 'trusted', connection);
+                                if (assetId == null) {
+                                    Log.error(`ams preattestation: cannot find asset ${row.asset.id} (preattestation: ${row.txHash.toHex()})`);
+                                    break;
+                                }
+
+                                const payerAccountId = row.payerAccount != null ? await this.getAccountIdByAddress(row.payerAccount, false, connection) : null;
+                                let booking = await this.getBookingByDepositHash(row.txHash, connection);
+                                if (booking == null && row.isSinglePayment) {
+                                    const amsContract = await this.getAmsContract(connection);
+                                    const paidAmount = row.amount.decimalPlaces(amsContract?.parameters.depositPrecision ?? 6, BigNumber.ROUND_DOWN);
+                                    booking = await this.getBookingByHandle(assetId, paidAmount, [BookingStatus.AwaitingDeposit, BookingStatus.FinalizingDeposit], connection);
+                                }
+
+                                if (booking == null) {
+                                    Log.info(`exchange ${contract.account} ams preattestation without any booking (preattestation: ${row.txHash.toHex()})`);
+                                    break;
+                                }
+
+                                const known = booking.depositHash == row.txHash.toHex();
+                                if (known && (row.source != 'mined' || booking.depositBlock != null))
+                                    break;
+
+                                if (booking.depositHash != null && booking.depositHash != row.txHash.toHex()) {
+                                    Log.info(`exchange ${contract.account} ams preattestation ignored (booking ${booking.id} already linked to ${booking.depositHash}): ${row.txHash.toHex()}`);
+                                    break;
+                                }
+
+                                await this.setBookingDepositFacts(booking.id, {
+                                    depositHash: row.txHash,
+                                    source: row.source,
+                                    blockNumber: row.source == 'mined' ? block.number : null,
+                                    payerAccountId: payerAccountId,
+                                    preattestedTime: row.source == 'mined' ? null : Math.floor(Date.now() / 1_000)
+                                }, connection);
+
+                                if (row.source == 'mined') {
+                                    if (booking.status != BookingStatus.AwaitingExecution)
+                                        await this.updateBookingStatus(booking.id, BookingStatus.AwaitingExecution, connection);
+                                } else if (booking.status == BookingStatus.AwaitingDeposit)
+                                    await this.updateBookingStatus(booking.id, BookingStatus.FinalizingDeposit, connection);
+                            } catch (exception) {
+                                Log.error(`exchange ${contract.account} ams preattestation ingest error (preattestation: ${row.txHash.toHex()}):`, exception);
+                            }
+                            break;
+                        }
+                        case PseudoEvent.Broadcast: {
+                            const row = log.event.args[0] as BroadcastEvent;
+                            Log.info(`exchange ${contract.account} ams broadcast: ${row.txHash.toHex()} (withdraw: ${row.withdrawHash.toHex()}${row.error != null ? ', error: ' + row.error : row.proofTransactionId != null ? ', proof: ' + row.proofTransactionId : ''}) @ block ${block.number}`);
+                            try {
+                                const bookings = await this.getBookingsByWithdrawHash(row.withdrawHash, [BookingStatus.AwaitingWithdrawal, BookingStatus.FinalizingWithdrawal, BookingStatus.FailingWithdrawal], connection);
+                                for (let j = 0; j < bookings.length; j++) {
+                                    const booking = bookings[j];
+                                    if (row.proofTransactionId != null) {
+                                        await this.setBookingBroadcastProof(booking.id, row.txHash, row.proofTransactionId, connection);
+                                        if (booking.status != BookingStatus.FinalizingWithdrawal)
+                                            await this.updateBookingStatus(booking.id, BookingStatus.FinalizingWithdrawal, connection);
+                                    } else if (row.error != null) {
+                                        if (booking.status == BookingStatus.FailingWithdrawal && booking.broadcastHash == row.txHash.toHex())
+                                            continue;
+
+                                        await this.setBookingBroadcastError(booking.id, row.txHash, row.error, connection);
+                                        if (booking.status != BookingStatus.FailingWithdrawal)
+                                            await this.updateBookingStatus(booking.id, BookingStatus.FailingWithdrawal, connection);
+                                    }
+                                }
+                            } catch (exception) {
+                                Log.error(`exchange ${contract.account} ams broadcast ingest error (broadcast: ${row.txHash.toHex()}):`, exception);
+                            }
+                            break;
+                        }
+                        case PseudoEvent.Attestation: {
+                            const row = log.event.args[0] as AttestationEvent;
+                            Log.info(`exchange ${contract.account} ams attestation: ${row.txHash.toHex()} (hashdata: ${row.hashdata}) @ block ${block.number}`);
+                            try {
+                                const bookings = await this.getBookingsByProofTransactionId(row.hashdata, connection);
+                                for (let j = 0; j < bookings.length; j++) {
+                                    const booking = bookings[j];
+                                    await this.setBookingAttestate(booking.id, row.txHash, connection);
+                                    if (booking.status != BookingStatus.Finalized)
+                                        await this.updateBookingStatus(booking.id, BookingStatus.Finalized, connection);
+                                }
+                            } catch (exception) {
+                                Log.error(`exchange ${contract.account} ams attestation ingest error (attestation: ${row.txHash.toHex()}):`, exception);
+                            }
+                            break;
+                        }
+                        default:
+                            Log.error(`exchange ${contract.account} event is unknown (type: ${log.event.type}, block: ${block.number}, contract: ams):`, log.event.args);
+                            break;
+                    }
+
                     break;
                 }
                 default:
@@ -1032,14 +1318,14 @@ export class Exchange {
                     if (!order && !event.pseudoRef)
                         throw new Error('cannot find order of contract account ' + contract.account);
 
-                    const account = order ? order.account : pseudoOrder.transaction.fromAccount; 
+                    const account = order ? order.account : pseudoOrder.transaction.fromAccount;
                     if (!accounts[account]) {
                         const accountId = await this.getAccountIdByAddress(account, false, connection);
                         if (!accountId)
                             throw new Error('cannot decode order account ' + account);
                         accounts[account] = accountId;
                     }
-                    
+
                     const pair = order ? await Blockchain.call(contract.account, UiUtil.toFunction(Spot.DEX.pairOf), [order.pair_id]) : { primary_asset: pseudoOrder.primaryAsset.toHex(), secondary_asset: pseudoOrder.secondaryAsset.toHex() };
                     if (!pair)
                         throw new Error('cannot find asset pair of contract account ' + contract.account);
@@ -1052,11 +1338,7 @@ export class Exchange {
                     if (!secondaryAssetId)
                         throw new Error('cannot find secondary asset of contract account ' + contract.account);
 
-                    const market = await this.getMarketByAccountId(accounts[contract.account], connection);
-                    if (!market)
-                        throw new Error('cannot find market of contract account ' + contract.account);
-
-                    const pairId = await this.getPairByAssetIds(primaryAssetId, secondaryAssetId, market.id, true, connection);
+                    const pairId = await this.getPairByAssetIds(primaryAssetId, secondaryAssetId, true, connection);
                     if (!pairId)
                         throw new Error('cannot find asset pair of contract account ' + contract.account);
 
@@ -1065,7 +1347,6 @@ export class Exchange {
                     result = await this.setOrder({
                         orderId: order ? Common.u256(order.id) || new Uint256(order.id) : new Uint256(pseudoOrder.transaction.hash),
                         pairId: pairId,
-                        marketId: market.id,
                         accountId: accounts[account],
                         blockNumber: block.number,
                         condition: (Common.num(order ? order.condition : pseudoOrder.condition) || 0) as OrderCondition,
@@ -1137,14 +1418,14 @@ export class Exchange {
                     if (!pool && !event.pseudoRef)
                         throw new Error('cannot find pool of contract account ' + contract.account);
 
-                    const account = pool ? pool.account : pseudoPool.transaction.fromAccount; 
+                    const account = pool ? pool.account : pseudoPool.transaction.fromAccount;
                     if (!accounts[account]) {
                         const accountId = await this.getAccountIdByAddress(account, false, connection);
                         if (!accountId)
                             throw new Error('cannot decode pool account ' + account);
                         accounts[account] = accountId;
                     }
-                    
+
                     const pair = pool ? await Blockchain.call(contract.account, UiUtil.toFunction(Spot.DEX.pairOf), [pool.pair_id]) : { primary_asset: pseudoPool.primaryAsset.toHex(), secondary_asset: pseudoPool.secondaryAsset.toHex() };
                     if (!pair)
                         throw new Error('cannot find asset pair of contract account ' + contract.account);
@@ -1159,11 +1440,7 @@ export class Exchange {
                     if (!secondaryAssetId)
                         throw new Error('cannot find secondary asset of contract account ' + contract.account);
 
-                    const market = await this.getMarketByAccountId(accounts[contract.account], connection);
-                    if (!market)
-                        throw new Error('cannot find market of contract account ' + contract.account);
-
-                    const pairId = await this.getPairByAssetIds(primaryAssetId, secondaryAssetId, market.id, true, connection);
+                    const pairId = await this.getPairByAssetIds(primaryAssetId, secondaryAssetId, true, connection);
                     if (!pairId)
                         throw new Error('cannot find asset pair of contract account ' + contract.account);
 
@@ -1178,7 +1455,6 @@ export class Exchange {
                     result = await this.setPool({
                         poolId: pool ? Common.u256(pool.id) || new Uint256(pool.id) : event.poolId,
                         pairId: pairId,
-                        marketId: market.id,
                         accountId: accounts[account],
                         blockNumber: block.number,
                         initialPrice: price,
@@ -1202,7 +1478,6 @@ export class Exchange {
                         await this.setDepth({
                             poolId: result.id,
                             pairId: pairId,
-                            marketId: market.id,
                             accountId: accounts[account],
                             blockNumber: block.number,
                             price: result.price,
@@ -1220,7 +1495,6 @@ export class Exchange {
                             await this.setDepth({
                                 poolId: result.id,
                                 pairId: result.pairId,
-                                marketId: result.marketId,
                                 accountId: result.accountId,
                                 blockNumber: block.number,
                                 price: result.price,
@@ -1295,19 +1569,17 @@ export class Exchange {
                 if (!makerOrder && !makerPool && !takerOrder)
                     throw new Error('cannot find maker/taker order of contract account ' + contract.account + '(taker_order_id: ' + event.takerOrderId.toString() + ')');
 
-                const marketId: Uint256 = (makerOrder?.marketId || makerPool?.marketId || takerOrder?.marketId) as any;
                 const pairId: Uint256 = (makerOrder?.pairId || makerPool?.pairId || takerOrder?.pairId) as any;
-                if (takerOrder && (marketId.neq(takerOrder.marketId) || pairId.neq(takerOrder.pairId)))
+                if (takerOrder && pairId.neq(takerOrder.pairId))
                     throw new Error('maker/taker order market mismatch of contract account ' + contract.account + '(maker_order_or_pool_id: ' + (event.makerOrderOrPoolId.toString() || 'null') + ', taker_order_id: ' + event.takerOrderId.toString() + ')');
-            
+
                 const assets = await this.getPairById(pairId, connection);
                 if (!assets || !assets.primaryAsset || !assets.secondaryAsset)
                     throw new Error('cannot find assets of contract account ' + contract.account + '(order_id: ' + event.takerOrderId.toString() + ')');
-                
+
                 const base = assets && assets.secondaryAsset && Whitelist.has(assets.secondaryAsset.hash) ? Quotes.assetBaseOf(assets.secondaryAsset.hash) : null;
                 const trade = {
                     pairId: pairId,
-                    marketId: marketId,
                     makerOrderId: makerOrder?.id,
                     makerPoolId:  makerPool?.id,
                     makerAccountId: makerOrder?.accountId || makerPool?.accountId,
@@ -1335,9 +1607,9 @@ export class Exchange {
                         }
                     }, connection);
                 }
-                    
+
                 if (base != null) {
-                    const pairId = await this.getPairByAssetIds(assets.primaryAsset.id, null, null,true,  connection);
+                    const pairId = await this.getPairByAssetIds(assets.primaryAsset.id, null, true, connection);
                     if (pairId != null) {
                         trade.pairId = pairId;
                         await this.setTrade(trade, connection);
@@ -1353,6 +1625,7 @@ export class Exchange {
         const sql = connection || this.connection;
         await this.resultOf(sql`DELETE FROM blocks WHERE block_number >= ${blockNumber}`);
         await this.resultOf(sql`UPDATE accounts SET synced = FALSE`);
+        await this.rollbackBookings(blockNumber, connection);
     }
     static async setBlock(block: Block, affectedAccounts?: string[], connection?: pq.TransactionSql): Promise<Block | null> {
         const sql = connection || this.connection;
@@ -1370,7 +1643,7 @@ export class Exchange {
         ON CONFLICT (block_number) DO UPDATE SET
             block_hash = EXCLUDED.block_hash
         RETURNING *`);
-        
+
         if (affectedAccounts != null && affectedAccounts.length > 0) {
             let affectedAccountIds = [];
             for (let i = 0; i < affectedAccounts.length; i++) {
@@ -1385,7 +1658,7 @@ export class Exchange {
                 await this.setAccountSyncByAccountIds(affectedAccountIds, false, connection);
             }
         }
-        
+
         await this.notify(Notification.ChainUpdate, {
             args: { tip: block.blockNumber }
         }, connection);
@@ -1422,13 +1695,10 @@ export class Exchange {
             return null;
         }
     }
-    static async setPolyAsset(assetId: Uint256, market: Market, symbol: string | null, connection?: pq.TransactionSql): Promise<AssetId | null> {
+    static async setPolyAsset(assetId: Uint256, marketAccount: string, symbol: string | null, connection?: pq.TransactionSql): Promise<AssetId | null> {
         const sql = connection || this.connection;
-        if (!market.account)
-            throw new Error('Failed to receive market by id');
-
-        const polyAsset = symbol ? AssetId.fromHandle(new AssetId().chain || '', symbol, market.account) : null;
-        await this.resultOf(sql`DELETE FROM poly_assets WHERE asset_id = ${assetId.toString()} AND market_id = ${market.id.toString()}`);
+        const polyAsset = symbol ? AssetId.fromHandle(new AssetId().chain || '', symbol, marketAccount) : null;
+        await this.resultOf(sql`DELETE FROM poly_assets WHERE asset_id = ${assetId.toString()}`);
         if (!polyAsset)
             return null;
 
@@ -1436,17 +1706,17 @@ export class Exchange {
         if (!polyAssetId)
             return polyAsset;
 
-        await this.resultOf(sql`INSERT INTO poly_assets (asset_id, market_id, poly_asset_id) VALUES (${assetId.toString()}, ${market.id.toString()}, ${polyAssetId.toString()}) ON CONFLICT (asset_id, market_id) DO NOTHING`);
+        await this.resultOf(sql`INSERT INTO poly_assets (asset_id, poly_asset_id) VALUES (${assetId.toString()}, ${polyAssetId.toString()}) ON CONFLICT (asset_id) DO NOTHING`);
         return polyAsset;
     }
-    static async getPolyAssetId(assetId: Uint256, marketId: Uint256, connection?: pq.TransactionSql): Promise<Uint256 | null> {
+    static async getPolyAssetId(assetId: Uint256, connection?: pq.TransactionSql): Promise<Uint256 | null> {
         const sql = connection || this.connection;
-        const key = assetId.toString() + ':' + marketId.toString();
+        const key = assetId.toString();
         const cache = this.get(this.cache.assetIdToPolyAssetId, key);
         if (cache != null)
             return new Uint256(cache);
 
-        let result = await this.resultOf(sql`SELECT poly_asset_id FROM poly_assets WHERE asset_id = ${assetId.toString()} AND market_id = ${marketId.toString()}`);
+        let result = await this.resultOf(sql`SELECT poly_asset_id FROM poly_assets WHERE asset_id = ${assetId.toString()}`);
         try {
             const value = new Uint256(result[0]['poly_asset_id']);
             this.set(this.cache.assetIdToPolyAssetId, key, value.toString());
@@ -1492,7 +1762,7 @@ export class Exchange {
 
             result = await this.resultOf(sql`INSERT INTO assets (hash) VALUES (${hash.toUint8Array()}) ON CONFLICT (hash) DO NOTHING RETURNING id`);
         }
-        
+
         try {
             const value = new Uint256(result[0]['id']);
             this.set(this.cache.assetHashToAssetId, hash.toHex(), value.toString());
@@ -1537,25 +1807,19 @@ export class Exchange {
             this.resultOf(sql`UPDATE pairs pair SET launch_time = (SELECT MIN(time) FROM trades WHERE pair_id IN (pair.id, (SELECT id FROM pairs ppair WHERE ppair.primary_asset_id = pair.primary_asset_id AND ppair.secondary_asset_id IS NULL LIMIT 1), (SELECT id FROM pairs spair WHERE spair.primary_asset_id = pair.secondary_asset_id AND spair.secondary_asset_id IS NULL LIMIT 1))) WHERE pair.launch_time IS NULL`)
         ]);
     }
-    static async getPairByAssetIds(primaryAssetId: Uint256 | null, secondaryAssetId: Uint256 | null, marketId: Uint256 | null, createIfNotExists: boolean, connection?: pq.TransactionSql): Promise<Uint256 | null> {
+    static async getPairByAssetIds(primaryAssetId: Uint256 | null, secondaryAssetId: Uint256 | null, createIfNotExists: boolean, connection?: pq.TransactionSql): Promise<Uint256 | null> {
         const sql = connection || this.connection;
-        if (marketId != null) {
-            const market = await this.resultOf(sql`SELECT TRUE FROM markets WHERE id = ${marketId.toString()}`);
-            if (!market.length)
-                throw new Error('No such market account found');
-            
-            if (primaryAssetId != null) {
-                const polyPrimaryAssetId = await this.getPolyAssetId(primaryAssetId, marketId, connection);
-                if (polyPrimaryAssetId) {
-                    primaryAssetId = polyPrimaryAssetId;
-                }
+        if (primaryAssetId != null) {
+            const polyPrimaryAssetId = await this.getPolyAssetId(primaryAssetId, connection);
+            if (polyPrimaryAssetId) {
+                primaryAssetId = polyPrimaryAssetId;
             }
-            
-            if (secondaryAssetId != null) {
-                const polySecondaryAssetId = await this.getPolyAssetId(secondaryAssetId, marketId, connection);
-                if (polySecondaryAssetId) {
-                    secondaryAssetId = polySecondaryAssetId;
-                }
+        }
+
+        if (secondaryAssetId != null) {
+            const polySecondaryAssetId = await this.getPolyAssetId(secondaryAssetId, connection);
+            if (polySecondaryAssetId) {
+                secondaryAssetId = polySecondaryAssetId;
             }
         }
 
@@ -1576,7 +1840,7 @@ export class Exchange {
 
             result = await this.resultOf(sql`INSERT INTO pairs (primary_asset_id, secondary_asset_id) VALUES (${primaryAssetId ? primaryAssetId.toString() : null}, ${secondaryAssetId ? secondaryAssetId.toString() : null}) ON CONFLICT (primary_asset_id, secondary_asset_id) DO NOTHING RETURNING id`);
         }
-        
+
         try {
             const value = new Uint256(result[0]['id']);
             this.set(this.cache.assetIdsToPairId, pair, value.toString());
@@ -1596,7 +1860,7 @@ export class Exchange {
                 secondaryAsset: s.id != null && s.hash != null ? { id: new Uint256(s.id), hash: new AssetId(Uint8Array.from(s.hash)) } : null
             };
         }
-        
+
         const result = await this.resultOf(sql`
         SELECT
             passet.id AS primary_asset_id,
@@ -1657,12 +1921,12 @@ export class Exchange {
             return [];
         }
     }
-    static async getPairByAssetHashes(primaryAssetHash: AssetId | null, secondaryAssetHash: AssetId | null, marketId: Uint256 | null, verifyExistence: boolean, createIfNotExists: boolean, connection?: pq.TransactionSql): Promise<Uint256 | null> {
+    static async getPairByAssetHashes(primaryAssetHash: AssetId | null, secondaryAssetHash: AssetId | null, verifyExistence: boolean, createIfNotExists: boolean, connection?: pq.TransactionSql): Promise<Uint256 | null> {
         const primaryAssetId = primaryAssetHash ? await this.getAssetIdByHash(primaryAssetHash, verifyExistence ? 'untrusted' : 'trusted', connection) : null;
         const secondaryAssetId = secondaryAssetHash ? await this.getAssetIdByHash(secondaryAssetHash, verifyExistence ? 'untrusted' : 'trusted', connection) : null;
-        return await this.getPairByAssetIds(primaryAssetId, secondaryAssetId, marketId, createIfNotExists, connection);
+        return await this.getPairByAssetIds(primaryAssetId, secondaryAssetId, createIfNotExists, connection);
     }
-    static async getAggregatedPairs(marketId: Uint256, pairId: Uint256 | null, connection?: pq.TransactionSql): Promise<AggregatedPair[]> {
+    static async getAggregatedPairs(pairId: Uint256 | null, connection?: pq.TransactionSql): Promise<AggregatedPair[]> {
         const sql = connection || this.connection;
         const result = await this.resultOf(sql`
         WITH results AS (
@@ -1671,9 +1935,9 @@ export class Exchange {
                 pairs.*,
                 passet.hash AS primary_asset,
                 sasset.hash AS secondary_asset,
-                COALESCE((SELECT SUM(last_price * last_quantity) FROM orders WHERE market_id = ${marketId.toString()} AND pair_id = pairs.id AND active = TRUE), 0.0) AS order_liquidity,
-                COALESCE((SELECT SUM(COALESCE(last_ask_price, 0) * primary_value + secondary_value) FROM pools WHERE market_id = ${marketId.toString()} AND pair_id = pairs.id AND active = TRUE), 0.0) AS pool_liquidity,
-                COALESCE((SELECT AVG(fee_rate) FROM pools WHERE market_id = ${marketId.toString()} AND pair_id = pairs.id AND active = TRUE), 0.0) AS pool_fee_rate,
+                COALESCE((SELECT SUM(last_price * last_quantity) FROM orders WHERE pair_id = pairs.id AND active = TRUE), 0.0) AS order_liquidity,
+                COALESCE((SELECT SUM(COALESCE(last_ask_price, 0) * primary_value + secondary_value) FROM pools WHERE pair_id = pairs.id AND active = TRUE), 0.0) AS pool_liquidity,
+                COALESCE((SELECT AVG(fee_rate) FROM pools WHERE pair_id = pairs.id AND active = TRUE), 0.0) AS pool_fee_rate,
                 (SELECT ARRAY[price, time] FROM trades WHERE pair_id = pairs.id ORDER BY time DESC LIMIT 1) AS close_price_and_time,
                 (SELECT ARRAY[price, time] FROM trades WHERE pair_id = ppair.id ORDER BY time DESC LIMIT 1) AS psynthetic_close_price_and_time,
                 (SELECT ARRAY[price, time] FROM trades WHERE pair_id = spair.id ORDER BY time DESC LIMIT 1) AS ssynthetic_close_price_and_time
@@ -1813,7 +2077,7 @@ export class Exchange {
                 const currencies = Quotes.currencies[i];
                 if (!currencies.length)
                     continue;
-                
+
                 if (!results[BASENAME]) {
                     results[BASENAME] = {
                         whitelist: true,
@@ -1838,6 +2102,37 @@ export class Exchange {
                     }
                 }
             }
+            try {
+                const stableQuoted = await this.resultOf(sql`
+                SELECT
+                    assets.hash,
+                    sassets.hash AS quote_hash,
+                    (SELECT price FROM trades WHERE pair_id = pairs.id ORDER BY time DESC LIMIT 1) AS close_price
+                FROM pairs
+                    INNER JOIN assets ON assets.id = pairs.primary_asset_id
+                    INNER JOIN assets sassets ON sassets.id = pairs.secondary_asset_id`);
+                for (let i = 0; i < stableQuoted.length; i++) {
+                    const item = stableQuoted[i];
+                    const asset = new AssetId(new Uint8Array(item['hash']));
+                    const symbol = symbolOf(asset);
+                    const quoteSymbol = symbolOf(new AssetId(new Uint8Array(item['quote_hash'])));
+                    const quotePrice = results[quoteSymbol]?.price?.close;
+                    const close = Common.bn(item['close_price']);
+                    if (quotePrice == null || !quotePrice.gt(0) || close == null || !close.gt(0) || symbol == quoteSymbol)
+                        continue;
+                    const prev = results[symbol];
+                    if (prev?.price?.close != null)
+                        continue;
+                    results[symbol] = {
+                        whitelist: prev?.whitelist ?? Whitelist.has(asset),
+                        base: prev?.base ?? null,
+                        price: {
+                            open: prev?.price?.open ?? close.times(quotePrice),
+                            close: close.times(quotePrice)
+                        }
+                    };
+                }
+            } catch { }
             return results;
         } catch {
             return { };
@@ -1852,12 +2147,14 @@ export class Exchange {
         SELECT
             (SELECT price FROM trades WHERE pair_id = ppair.id ORDER BY time DESC LIMIT 1) AS primary_price,
             (SELECT price FROM trades WHERE pair_id = spair.id ORDER BY time DESC LIMIT 1) AS secondary_price,
+	        (SELECT price FROM trades WHERE pair_id = tpair.id ORDER BY time DESC LIMIT 1) AS tertiary_price,
             passet.hash AS primary_asset,
             sasset.hash AS secondary_asset
         FROM assets passet
             INNER JOIN assets sasset ON sasset.id = ${secondaryAssetId.toString()}
             LEFT JOIN pairs ppair ON ppair.primary_asset_id = passet.id AND ppair.secondary_asset_id IS NULL
             LEFT JOIN pairs spair ON spair.primary_asset_id = sasset.id AND ppair.secondary_asset_id IS NULL
+	        LEFT JOIN pairs tpair ON tpair.primary_asset_id = passet.id AND tpair.secondary_asset_id = sasset.id
         WHERE passet.id = ${primaryAssetId.toString()}`);
         if (!result.length)
             throw new Error('Pair not found');
@@ -1868,7 +2165,9 @@ export class Exchange {
         const secondaryAsset = new AssetId(new Uint8Array(result[0]['secondary_asset']));
         const secondaryStable = Quotes.baseOf(symbolOf(secondaryAsset)) != null;
         const secondaryPrice = Common.bn(result[0]['secondary_price']) || (secondaryStable ? new BigNumber(1) : new BigNumber(NaN));
-        const price = primaryPrice.dividedBy(secondaryPrice);
+        const tertiaryPrice = Common.bn(result[0]['tertiary_price']) || (secondaryStable ? new BigNumber(1) : new BigNumber(NaN));
+        let price = primaryPrice.dividedBy(secondaryPrice);
+        price = price.isFinite() ? price : tertiaryPrice;
         if (!price.isFinite())
             throw new Error('Price not found');
 
@@ -1887,19 +2186,23 @@ export class Exchange {
             SELECT
                 (SELECT time FROM trades WHERE pair_id = ppair.id ORDER BY time DESC LIMIT 1) AS primary_time,
                 (SELECT time FROM trades WHERE pair_id = spair.id ORDER BY time DESC LIMIT 1) AS secondary_time,
+	            (SELECT time FROM trades WHERE pair_id = tpair.id ORDER BY time DESC LIMIT 1) AS tertiary_time,
                 ppair.id AS primary_pair,
                 spair.id AS secondary_pair,
+                tpair.id AS tertiary_pair,
                 passet.hash AS primary_asset,
                 sasset.hash AS secondary_asset
             FROM assets passet
                 INNER JOIN assets sasset ON sasset.id = ${secondaryAssetId.toString()}
                 LEFT JOIN pairs ppair ON ppair.primary_asset_id = passet.id AND ppair.secondary_asset_id IS NULL
                 LEFT JOIN pairs spair ON spair.primary_asset_id = sasset.id AND ppair.secondary_asset_id IS NULL
+	            LEFT JOIN pairs tpair ON tpair.primary_asset_id = passet.id AND tpair.secondary_asset_id = sasset.id
             WHERE passet.id = ${primaryAssetId.toString()}
         )
         SELECT
             (SELECT SUM(price * GREATEST(quantity, 0.000001)) / SUM(GREATEST(quantity, 0.000001)) FROM trades WHERE pair_id = points.primary_pair AND time >= points.primary_time - ${interval}) AS primary_price,
             (SELECT SUM(price * GREATEST(quantity, 0.000001)) / SUM(GREATEST(quantity, 0.000001)) FROM trades WHERE pair_id = points.secondary_pair AND time >= points.secondary_time - ${interval}) AS secondary_price,
+            (SELECT SUM(price * GREATEST(quantity, 0.000001)) / SUM(GREATEST(quantity, 0.000001)) FROM trades WHERE pair_id = points.tertiary_pair AND time >= points.tertiary_time - ${interval}) AS tertiary_price,
             points.primary_asset,
             points.secondary_asset
         FROM points`);
@@ -1912,7 +2215,9 @@ export class Exchange {
         const secondaryAsset = new AssetId(new Uint8Array(result[0]['secondary_asset']));
         const secondaryStable = Quotes.baseOf(symbolOf(secondaryAsset)) != null;
         const secondaryPrice = Common.bn(result[0]['secondary_price']) || (secondaryStable ? new BigNumber(1) : new BigNumber(NaN));
-        const price = primaryPrice.dividedBy(secondaryPrice);
+        const tertiaryPrice = Common.bn(result[0]['tertiary_price']) || (secondaryStable ? new BigNumber(1) : new BigNumber(NaN));
+        let price = primaryPrice.dividedBy(secondaryPrice);
+        price = price.isFinite() ? price : tertiaryPrice;
         if (!price.isFinite())
             throw new Error('Price not found');
 
@@ -2083,7 +2388,7 @@ export class Exchange {
             return [];
         }
     }
-    static async setSyncedAccountTierByAccountIdAndMarketAsset(accountId: Uint256, marketId: Uint256, assetId: Uint256, volume: BigNumber, makerFee: BigNumber, takerFee: BigNumber, connection?: pq.TransactionSql): Promise<void> {
+    static async setSyncedAccountTierByAccountIdAndAsset(accountId: Uint256, assetId: Uint256, volume: BigNumber, makerFee: BigNumber, takerFee: BigNumber, connection?: pq.TransactionSql): Promise<void> {
         const sql = connection || this.connection;
         const top = await this.getLatestBlock(undefined, connection);
         await this.resultOf(sql`
@@ -2091,7 +2396,6 @@ export class Exchange {
         (
             account_id,
             asset_id,
-            market_id,
             block_number,
             volume,
             maker_fee,
@@ -2101,25 +2405,24 @@ export class Exchange {
         (
             ${accountId.toString()},
             ${assetId.toString()},
-            ${marketId.toString()},
             ${top?.blockNumber || 1},
             ${volume.toString()},
             ${makerFee.toString()},
             ${takerFee.toString()}
         )
-        ON CONFLICT (account_id, asset_id, market_id) DO UPDATE SET
+        ON CONFLICT (account_id, asset_id) DO UPDATE SET
             block_number = EXCLUDED.block_number,
             volume = EXCLUDED.volume,
             maker_fee = EXCLUDED.maker_fee,
             taker_fee = EXCLUDED.taker_fee`);
     }
-    static async getSyncedAccountTierByAccountIdAndMarketAsset(accountId: Uint256, marketId: Uint256, assetId: Uint256, connection?: pq.TransactionSql): Promise<{ volume: BigNumber | null, makerFee: BigNumber | null, takerFee: BigNumber | null } | null> {
+    static async getSyncedAccountTierByAccountIdAndAsset(accountId: Uint256, assetId: Uint256, connection?: pq.TransactionSql): Promise<{ volume: BigNumber | null, makerFee: BigNumber | null, takerFee: BigNumber | null } | null> {
         const sql = connection || this.connection;
         const synced = await this.getAccountSyncByAccountId(accountId, connection);
         if (!synced)
             return null;
 
-        const result = await this.resultOf(sql`SELECT * FROM tiers WHERE account_id = ${accountId.toString()} AND asset_id = ${assetId.toString()} AND market_id = ${marketId.toString()}`);
+        const result = await this.resultOf(sql`SELECT * FROM tiers WHERE account_id = ${accountId.toString()} AND asset_id = ${assetId.toString()}`);
         if (!result.length)
             return null;
 
@@ -2174,134 +2477,90 @@ export class Exchange {
             return null;
         }
     }
-    static async setMarket(market: Omit<Market, 'id'>, connection?: pq.TransactionSql): Promise<Market | null> {
+    static async setContract(contract: { type: ContractType, accountId: Uint256, deployerAccountId: Uint256 | null, blockNumber: number | null, parameters: ContractParameters }, connection?: pq.TransactionSql): Promise<Contract | null> {
         const sql = connection || this.connection;
         const result = await this.resultOf(sql`
-        INSERT INTO markets
+        INSERT INTO contracts
         (
+            type,
             account_id,
             deployer_account_id,
             block_number,
-            pool_exit_fee,
-            max_pool_fee_rate,
-            min_maker_fee,
-            max_maker_fee,
-            maker_fee_exponent,
-            min_taker_fee,
-            max_taker_fee,
-            taker_fee_exponent,
-            asset_volume_target,
-            asset_reset_days,
-            account_reset_days,
-            market_policy
+            parameters
         )
         VALUES
         (
-            ${market.accountId.toString()},
-            ${market.deployerAccountId.toString()},
-            ${market.blockNumber},
-            ${market.poolExitFee.toString()},
-            ${market.maxPoolFeeRate.toString()},
-            ${market.minMakerFee.toString()},
-            ${market.maxMakerFee.toString()},
-            ${market.makerFeeExponent},
-            ${market.minTakerFee.toString()},
-            ${market.maxTakerFee.toString()},
-            ${market.takerFeeExponent},
-            ${market.assetVolumeTarget.toString()},
-            ${market.assetResetDays},
-            ${market.accountResetDays},
-            ${market.marketPolicy}
+            ${contract.type},
+            ${contract.accountId.toString()},
+            ${contract.deployerAccountId ? contract.deployerAccountId.toString() : null},
+            ${contract.blockNumber},
+            ${sql.json(JSON.parse(JSON.stringify(contract.parameters)))}
         )
-        ON CONFLICT (account_id) DO UPDATE SET
+        ON CONFLICT (type) DO UPDATE SET
+            account_id = EXCLUDED.account_id,
             deployer_account_id = EXCLUDED.deployer_account_id,
             block_number = EXCLUDED.block_number,
-            pool_exit_fee = EXCLUDED.pool_exit_fee,
-            max_pool_fee_rate = EXCLUDED.max_pool_fee_rate,
-            min_maker_fee = EXCLUDED.min_maker_fee,
-            max_maker_fee = EXCLUDED.max_maker_fee,
-            maker_fee_exponent = EXCLUDED.maker_fee_exponent,
-            min_taker_fee = EXCLUDED.min_taker_fee,
-            max_taker_fee = EXCLUDED.max_taker_fee,
-            taker_fee_exponent = EXCLUDED.taker_fee_exponent,
-            asset_volume_target = EXCLUDED.asset_volume_target,
-            asset_reset_days = EXCLUDED.asset_reset_days,
-            account_reset_days = EXCLUDED.account_reset_days,
-            market_policy = EXCLUDED.market_policy
+            parameters = EXCLUDED.parameters
         RETURNING *`);
         try {
-            return this.toMarket(result[0]);
+            return this.toContract(result[0]);
         } catch {
             return null;
         }
     }
-    static async getMarketById(id: Uint256, connection?: pq.TransactionSql): Promise<Market | null> {
+    static async getContractByType<T extends ContractParameters = ContractParameters>(type: ContractType, connection?: pq.TransactionSql): Promise<Contract<T> | null> {
         const sql = connection || this.connection;
         const result = await this.resultOf(sql`
         SELECT
-            markets.*,
+            contracts.*,
             accounts.hash AS account_hash,
             deployer_accounts.hash AS deployer_account_hash
-        FROM markets
-            INNER JOIN accounts ON accounts.id = markets.account_id
-            INNER JOIN accounts deployer_accounts ON deployer_accounts.id = markets.deployer_account_id
-        WHERE markets.id = ${id.toString()}`);
+        FROM contracts
+            INNER JOIN accounts ON accounts.id = contracts.account_id
+            LEFT JOIN accounts deployer_accounts ON deployer_accounts.id = contracts.deployer_account_id
+        WHERE contracts.type = ${type}`);
         try {
-            return this.toMarket(result[0]);
+            return this.toContract(result[0]) as Contract<T>;
         } catch {
             return null;
         }
     }
-    static async getMarketByAccountId(accountId: Uint256, connection?: pq.TransactionSql): Promise<Market | null> {
+    static async getContractByAccount<T extends ContractParameters = ContractParameters>(account: string, connection?: pq.TransactionSql): Promise<Contract<T> | null> {
         const sql = connection || this.connection;
+        const accountId = await this.getAccountIdByAddress(account, false, connection);
+        if (accountId == null)
+            return null;
+
         const result = await this.resultOf(sql`
         SELECT
-            markets.*,
+            contracts.*,
             accounts.hash AS account_hash,
             deployer_accounts.hash AS deployer_account_hash
-        FROM markets
-            INNER JOIN accounts ON accounts.id = markets.account_id
-            INNER JOIN accounts deployer_accounts ON deployer_accounts.id = markets.deployer_account_id
-        WHERE account_id = ${accountId.toString()}`);
+        FROM contracts
+            INNER JOIN accounts ON accounts.id = contracts.account_id
+            LEFT JOIN accounts deployer_accounts ON deployer_accounts.id = contracts.deployer_account_id
+        WHERE contracts.account_id = ${accountId.toString()}`);
         try {
-            return this.toMarket(result[0]);
+            return this.toContract(result[0]) as Contract<T>;
         } catch {
             return null;
         }
     }
-    static async getMarkets(connection?: pq.TransactionSql): Promise<Market[]> {
+    static async getContracts(connection?: pq.TransactionSql): Promise<Contract[]> {
         const sql = connection || this.connection;
         const result = await this.resultOf(sql`
         SELECT
-            markets.*,
+            contracts.*,
             accounts.hash AS account_hash,
             deployer_accounts.hash AS deployer_account_hash
-        FROM markets
-            INNER JOIN accounts ON accounts.id = markets.account_id
-            INNER JOIN accounts deployer_accounts ON deployer_accounts.id = markets.deployer_account_id`);
+        FROM contracts
+            INNER JOIN accounts ON accounts.id = contracts.account_id
+            LEFT JOIN accounts deployer_accounts ON deployer_accounts.id = contracts.deployer_account_id
+        ORDER BY contracts.id`);
         try {
-            let results: Market[] = [];
+            let results: Contract[] = [];
             for (let i = 0; i < result.length; i++)
-                results.push(this.toMarket(result[i]));
-            return results;
-        } catch {
-            return [];
-        }
-    }
-    static async getDelegators(connection?: pq.TransactionSql): Promise<Delegator[]> {
-        const sql = connection || this.connection;
-        const result = await this.resultOf(sql`
-        SELECT
-            delegators.*,
-            accounts.hash AS account_hash,
-            deployer_accounts.hash AS deployer_account_hash
-        FROM delegators
-            INNER JOIN accounts ON accounts.id = delegators.account_id
-            INNER JOIN accounts deployer_accounts ON deployer_accounts.id = delegators.deployer_account_id`);
-        try {
-            let results: Delegator[] = [];
-            for (let i = 0; i < result.length; i++)
-                results.push(this.toDelegator(result[i]));
+                results.push(this.toContract(result[i]));
             return results;
         } catch {
             return [];
@@ -2314,7 +2573,6 @@ export class Exchange {
         (
             order_id,
             pair_id,
-            market_id,
             account_id,
             block_number,
             condition,
@@ -2334,7 +2592,6 @@ export class Exchange {
         (
             ${order.orderId.toUint8Array()},
             ${order.pairId.toString()},
-            ${order.marketId.toString()},
             ${order.accountId.toString()},
             ${order.blockNumber},
             ${order.condition},
@@ -2350,7 +2607,7 @@ export class Exchange {
             ${order.trailingDistance?.toString() || null},
             ${order.active}
         )
-        ON CONFLICT (market_id, order_id) DO UPDATE SET
+        ON CONFLICT (order_id) DO UPDATE SET
             pair_id = EXCLUDED.pair_id,
             account_id = EXCLUDED.account_id,
             block_number = EXCLUDED.block_number,
@@ -2378,14 +2635,11 @@ export class Exchange {
         SELECT
             orders.*,
             passet.hash AS primary_asset,
-            sasset.hash AS secondary_asset,
-            accounts.hash AS market_account_hash
+            sasset.hash AS secondary_asset
         FROM orders
             INNER JOIN pairs ON pairs.id = pair_id
             INNER JOIN assets passet ON passet.id = pairs.primary_asset_id
             INNER JOIN assets sasset ON sasset.id = pairs.secondary_asset_id
-            INNER JOIN markets ON markets.id = market_id
-            INNER JOIN accounts ON accounts.id = markets.account_id
         WHERE orders.id = ${id.toString()}`);
         try {
             return this.toOrder(result[0]);
@@ -2399,14 +2653,11 @@ export class Exchange {
         SELECT
             orders.*,
             passet.hash AS primary_asset,
-            sasset.hash AS secondary_asset,
-            accounts.hash AS market_account_hash
+            sasset.hash AS secondary_asset
         FROM orders
             INNER JOIN pairs ON pairs.id = pair_id
             INNER JOIN assets passet ON passet.id = pairs.primary_asset_id
             INNER JOIN assets sasset ON sasset.id = pairs.secondary_asset_id
-            INNER JOIN markets ON markets.id = market_id
-            INNER JOIN accounts ON accounts.id = markets.account_id
         WHERE order_id = ${orderId.toUint8Array()}`);
         try {
             return this.toOrder(result[0]);
@@ -2420,14 +2671,11 @@ export class Exchange {
         SELECT
             orders.*,
             passet.hash AS primary_asset,
-            sasset.hash AS secondary_asset,
-            accounts.hash AS market_account_hash
+            sasset.hash AS secondary_asset
         FROM orders
             INNER JOIN pairs ON pairs.id = pair_id
             INNER JOIN assets passet ON passet.id = pairs.primary_asset_id
             INNER JOIN assets sasset ON sasset.id = pairs.secondary_asset_id
-            INNER JOIN markets ON markets.id = market_id
-            INNER JOIN accounts ON accounts.id = markets.account_id
         WHERE orders.account_id = ${accountId.toString()}${typeof active == 'boolean' ? sql` AND active = ${active}` : sql``} ORDER BY active DESC, block_number DESC LIMIT ${cursor.count} OFFSET ${cursor.offset}`);
         try {
             const orders = [];
@@ -2439,21 +2687,18 @@ export class Exchange {
             return [];
         }
     }
-    static async getOrdersByAccountIdAndMarketPair(accountId: Uint256, marketId: Uint256, pairId: Uint256, active: boolean | null, cursor: Cursor, connection?: pq.TransactionSql): Promise<Order[]> {
+    static async getOrdersByAccountIdAndPair(accountId: Uint256, pairId: Uint256, active: boolean | null, cursor: Cursor, connection?: pq.TransactionSql): Promise<Order[]> {
         const sql = connection || this.connection;
         const result = await this.resultOf(sql`
         SELECT
             orders.*,
             passet.hash AS primary_asset,
-            sasset.hash AS secondary_asset,
-            accounts.hash AS market_account_hash
+            sasset.hash AS secondary_asset
         FROM orders
             INNER JOIN pairs ON pairs.id = pair_id
             INNER JOIN assets passet ON passet.id = pairs.primary_asset_id
             INNER JOIN assets sasset ON sasset.id = pairs.secondary_asset_id
-            INNER JOIN markets ON markets.id = market_id
-            INNER JOIN accounts ON accounts.id = markets.account_id
-        WHERE orders.account_id = ${accountId.toString()} AND orders.market_id = ${marketId.toString()} AND orders.pair_id = ${pairId.toString()}${typeof active == 'boolean' ? sql` AND active = ${active}` : sql``} ORDER BY active DESC, block_number DESC LIMIT ${cursor.count} OFFSET ${cursor.offset}`);
+        WHERE orders.account_id = ${accountId.toString()} AND orders.pair_id = ${pairId.toString()}${typeof active == 'boolean' ? sql` AND active = ${active}` : sql``} ORDER BY active DESC, block_number DESC LIMIT ${cursor.count} OFFSET ${cursor.offset}`);
         try {
             const orders = [];
             for (let i = 0; i < result.length; i++) {
@@ -2471,7 +2716,6 @@ export class Exchange {
         (
             pool_id,
             pair_id,
-            market_id,
             account_id,
             block_number,
             initial_price,
@@ -2493,7 +2737,6 @@ export class Exchange {
         (
             ${pool.poolId.toUint8Array()},
             ${pool.pairId.toString()},
-            ${pool.marketId.toString()},
             ${pool.accountId.toString()},
             ${pool.blockNumber},
             ${pool.initialPrice.toString()},
@@ -2511,7 +2754,7 @@ export class Exchange {
             ${pool.exitFee.toString()},
             ${pool.active}
         )
-        ON CONFLICT (market_id, pool_id) DO UPDATE SET
+        ON CONFLICT (pool_id) DO UPDATE SET
             pair_id = EXCLUDED.pair_id,
             account_id = EXCLUDED.account_id,
             block_number = EXCLUDED.block_number,
@@ -2540,14 +2783,11 @@ export class Exchange {
             pools.*,
             passet.hash AS primary_asset,
             sasset.hash AS secondary_asset,
-            accounts.hash AS market_account_hash,
             pools_view.volume
         FROM pools
             INNER JOIN pairs ON pairs.id = pair_id
             INNER JOIN assets passet ON passet.id = pairs.primary_asset_id
             INNER JOIN assets sasset ON sasset.id = pairs.secondary_asset_id
-            INNER JOIN markets ON markets.id = market_id
-            INNER JOIN accounts ON accounts.id = markets.account_id
             LEFT JOIN pools_view ON pools_view.id = pools.id
         WHERE pools.id = ${id.toString()}`);
         try {
@@ -2563,14 +2803,11 @@ export class Exchange {
             pools.*,
             passet.hash AS primary_asset,
             sasset.hash AS secondary_asset,
-            accounts.hash AS market_account_hash,
             pools_view.volume
         FROM pools
             INNER JOIN pairs ON pairs.id = pair_id
             INNER JOIN assets passet ON passet.id = pairs.primary_asset_id
             INNER JOIN assets sasset ON sasset.id = pairs.secondary_asset_id
-            INNER JOIN markets ON markets.id = market_id
-            INNER JOIN accounts ON accounts.id = markets.account_id
             LEFT JOIN pools_view ON pools_view.id = pools.id
         WHERE pool_id = ${poolId.toUint8Array()}`);
         try {
@@ -2586,14 +2823,11 @@ export class Exchange {
             pools.*,
             passet.hash AS primary_asset,
             sasset.hash AS secondary_asset,
-            accounts.hash AS market_account_hash,
             pools_view.volume
         FROM pools
             INNER JOIN pairs ON pairs.id = pair_id
             INNER JOIN assets passet ON passet.id = pairs.primary_asset_id
             INNER JOIN assets sasset ON sasset.id = pairs.secondary_asset_id
-            INNER JOIN markets ON markets.id = market_id
-            INNER JOIN accounts ON accounts.id = markets.account_id
             LEFT JOIN pools_view ON pools_view.id = pools.id
         WHERE active = TRUE ORDER BY 100000000 * (primary_revenue * price + secondary_revenue) / (primary_value * price + secondary_value) DESC LIMIT ${cursor.count} OFFSET ${cursor.offset}`);
         try {
@@ -2613,33 +2847,28 @@ export class Exchange {
             WITH targets AS (
                 WITH sources AS (
                     SELECT
-                        market_id,
                         pair_id,
-                        delegator_id,
                         SUM(initial_primary_value) AS initial_primary_value,
                         SUM(initial_secondary_value) AS initial_secondary_value,
                         SUM(primary_value) AS primary_value,
                         SUM(secondary_value) AS secondary_value
                     FROM delegated_pools WHERE active = TRUE
-                    GROUP BY market_id, pair_id, delegator_id
+                    GROUP BY pair_id
                 )
                 SELECT
                     sources.*,
                     delegators.account_id,
                     passet.hash AS primary_asset,
                     sasset.hash AS secondary_asset,
-                    market_account.hash AS market_account_hash,
                     delegator_account.hash AS delegator_account_hash,
-                    (SELECT v.fee_rate FROM pools v WHERE v.pair_id = sources.pair_id AND v.market_id = sources.market_id AND v.account_id = delegators.account_id AND v.active = TRUE LIMIT 1) AS fee_rate,
+                    (SELECT v.fee_rate FROM pools v WHERE v.pair_id = sources.pair_id AND v.account_id = delegators.account_id AND v.active = TRUE LIMIT 1) AS fee_rate,
                     COALESCE((SELECT price FROM trades WHERE pair_id = (SELECT id FROM pairs WHERE primary_asset_id = passet.id AND secondary_asset_id IS NULL) ORDER BY time DESC LIMIT 1), 1) AS primary_price,
                     COALESCE((SELECT price FROM trades WHERE pair_id = (SELECT id FROM pairs WHERE primary_asset_id = sasset.id AND secondary_asset_id IS NULL) ORDER BY time DESC LIMIT 1), 1) AS secondary_price
                 FROM sources
                     INNER JOIN pairs ON pairs.id = pair_id
                     INNER JOIN assets passet ON passet.id = pairs.primary_asset_id
                     INNER JOIN assets sasset ON sasset.id = pairs.secondary_asset_id
-                    INNER JOIN markets ON markets.id = sources.market_id
-                    INNER JOIN delegators ON delegators.id = sources.delegator_id
-                    INNER JOIN accounts market_account ON market_account.id = markets.account_id
+                    INNER JOIN contracts delegators ON delegators.type = ${ContractType.DLP}
                     INNER JOIN accounts delegator_account ON delegator_account.id = delegators.account_id
             )
             SELECT
@@ -2648,7 +2877,7 @@ export class Exchange {
                 primary_value * primary_price + secondary_value * secondary_price AS current_value,
                 delegators_view.volume
             FROM targets
-                LEFT JOIN delegators_view ON delegators_view.id = targets.delegator_id AND delegators_view.pair_id = targets.pair_id
+                LEFT JOIN delegators_view ON delegators_view.pair_id = targets.pair_id
             WHERE initial_primary_value > 0 OR initial_secondary_value > 0
         )
         SELECT * FROM aggregates ORDER BY 100000000 * (current_value - initial_value) / initial_value DESC`);
@@ -2658,10 +2887,7 @@ export class Exchange {
                 const value = result[i];
                 delegatedPools.push({
                     pairId: new Uint256(value['pair_id']),
-                    marketId: new Uint256(value['market_id']),
-                    delegatorId: new Uint256(value['delegator_id']),
                     delegatorAccount: value['delegator_account_hash'] ? Signing.encodeAddress(new Pubkeyhash(new Uint8Array(value['delegator_account_hash']))) || undefined : undefined,
-                    marketAccount: value['market_account_hash'] ? Signing.encodeAddress(new Pubkeyhash(new Uint8Array(value['market_account_hash']))) || undefined : undefined,
                     primaryAsset: value['primary_asset'] ? new AssetId(new Uint8Array(value['primary_asset'])).id : undefined,
                     secondaryAsset: value['secondary_asset'] ? new AssetId(new Uint8Array(value['secondary_asset'])).id : undefined,
                     initialValue: new BigNumber(value['initial_value']),
@@ -2682,14 +2908,11 @@ export class Exchange {
             pools.*,
             passet.hash AS primary_asset,
             sasset.hash AS secondary_asset,
-            accounts.hash AS market_account_hash,
             pools_view.volume
         FROM pools
             INNER JOIN pairs ON pairs.id = pair_id
             INNER JOIN assets passet ON passet.id = pairs.primary_asset_id
             INNER JOIN assets sasset ON sasset.id = pairs.secondary_asset_id
-            INNER JOIN markets ON markets.id = market_id
-            INNER JOIN accounts ON accounts.id = markets.account_id
             LEFT JOIN pools_view ON pools_view.id = pools.id
         WHERE pools.account_id = ${accountId.toString()}${typeof active == 'boolean' ? sql` AND active = ${active}` : sql``} ORDER BY active DESC, block_number DESC LIMIT ${cursor.count} OFFSET ${cursor.offset}`);
         try {
@@ -2702,23 +2925,20 @@ export class Exchange {
             return [];
         }
     }
-    static async getPoolsByAccountIdAndMarketPair(accountId: Uint256, marketId: Uint256, pairId: Uint256, active: boolean | null, cursor: Cursor, connection?: pq.TransactionSql): Promise<Pool[]> {
+    static async getPoolsByAccountIdAndPair(accountId: Uint256, pairId: Uint256, active: boolean | null, cursor: Cursor, connection?: pq.TransactionSql): Promise<Pool[]> {
         const sql = connection || this.connection;
         const result = await this.resultOf(sql`
         SELECT
             pools.*,
             passet.hash AS primary_asset,
             sasset.hash AS secondary_asset,
-            accounts.hash AS market_account_hash,
             pools_view.volume
         FROM pools
             INNER JOIN pairs ON pairs.id = pair_id
             INNER JOIN assets passet ON passet.id = pairs.primary_asset_id
             INNER JOIN assets sasset ON sasset.id = pairs.secondary_asset_id
-            INNER JOIN markets ON markets.id = market_id
-            INNER JOIN accounts ON accounts.id = markets.account_id
             LEFT JOIN pools_view ON pools_view.id = pools.id
-        WHERE pools.account_id = ${accountId.toString()} AND pools.market_id = ${marketId.toString()} AND pools.pair_id = ${pairId.toString()}${typeof active == 'boolean' ? sql` AND active = ${active}` : sql``} ORDER BY active DESC, block_number DESC LIMIT ${cursor.count} OFFSET ${cursor.offset}`);
+        WHERE pools.account_id = ${accountId.toString()} AND pools.pair_id = ${pairId.toString()}${typeof active == 'boolean' ? sql` AND active = ${active}` : sql``} ORDER BY active DESC, block_number DESC LIMIT ${cursor.count} OFFSET ${cursor.offset}`);
         try {
             const pools = [];
             for (let i = 0; i < result.length; i++) {
@@ -2729,74 +2949,12 @@ export class Exchange {
             return [];
         }
     }
-    static async getDelegatorByAccountId(accountId: Uint256, connection?: pq.TransactionSql): Promise<Delegator | null> {
-        const sql = connection || this.connection;
-        const result = await this.resultOf(sql`
-        SELECT
-            delegators.*,
-            accounts.hash AS account_hash,
-            deployer_accounts.hash AS deployer_account_hash
-        FROM delegators
-            INNER JOIN accounts ON accounts.id = delegators.account_id
-            INNER JOIN accounts deployer_accounts ON deployer_accounts.id = delegators.deployer_account_id
-        WHERE account_id = ${accountId.toString()}`);
-        try {
-            return this.toDelegator(result[0]);
-        } catch {
-            return null;
-        }
-    }
-    static async setDelegator(delegator: Omit<Delegator, 'id'>, connection?: pq.TransactionSql): Promise<Delegator | null> {
-        const sql = connection || this.connection;
-        const result = await this.resultOf(sql`
-        INSERT INTO delegators
-        (
-            market_id,
-            account_id,
-            deployer_account_id,
-            block_number,
-            reward_emission,
-            reward_balance,
-            permissions
-        )
-        VALUES
-        (
-            ${delegator.marketId.toString()},
-            ${delegator.accountId.toString()},
-            ${delegator.deployerAccountId.toString()},
-            ${delegator.blockNumber},
-            ${delegator.rewardEmission.toString()},
-            ${delegator.rewardBalance.toString()},
-            ${sql.json(delegator.permissions.map((x) => ({
-                primaryAssetId: x.primaryAssetId.toString(),
-                primaryAsset: x.primaryAsset.toString(),
-                secondaryAssetId: x.secondaryAssetId.toString(),
-                secondaryAsset: x.secondaryAsset.toString()
-            })))}::jsonb
-        )
-        ON CONFLICT (account_id) DO UPDATE SET
-            market_id = EXCLUDED.market_id,
-            deployer_account_id = EXCLUDED.deployer_account_id,
-            block_number = EXCLUDED.block_number,
-            reward_emission = EXCLUDED.reward_emission,
-            reward_balance = EXCLUDED.reward_balance,
-            permissions = EXCLUDED.permissions
-        RETURNING *`);
-
-        try {
-            return this.toDelegator(result[0]);
-        } catch {
-            return null;
-        }
-    }
     static async setDelegatedPool(pool: Omit<DelegatedPool, 'id'>, reset: boolean, connection?: pq.TransactionSql): Promise<DelegatedPool | null> {
         const sql = connection || this.connection;
         const result = await this.resultOf(sql`
         INSERT INTO delegated_pools
         (
             pair_id,
-            market_id,
-            delegator_id,
             account_id,
             block_number,
             initial_primary_value,
@@ -2809,8 +2967,6 @@ export class Exchange {
         VALUES
         (
             ${pool.pairId.toString()},
-            ${pool.marketId.toString()},
-            ${pool.delegatorId.toString()},
             ${pool.accountId.toString()},
             ${pool.blockNumber},
             ${pool.initialPrimaryValue.toString()},
@@ -2820,7 +2976,7 @@ export class Exchange {
             ${pool.rewardValue.toString()},
             ${pool.active}
         )
-        ON CONFLICT (pair_id, market_id, delegator_id, account_id) DO UPDATE SET
+        ON CONFLICT (pair_id, account_id) DO UPDATE SET
             block_number = EXCLUDED.block_number,
             initial_primary_value = ${reset ? sql`EXCLUDED` : sql`delegated_pools`}.initial_primary_value,
             initial_secondary_value = ${reset ? sql`EXCLUDED` : sql`delegated_pools`}.initial_secondary_value,
@@ -2842,20 +2998,17 @@ export class Exchange {
             delegated_pools.*,
             passet.hash AS primary_asset,
             sasset.hash AS secondary_asset,
-            market_account.hash AS market_account_hash,
             delegator_account.hash AS delegator_account_hash,
             delegators_view.volume,
-            (SELECT ARRAY[SUM(v.primary_value), SUM(v.secondary_value)] FROM delegated_pools v WHERE v.pair_id = delegated_pools.pair_id AND v.market_id = delegated_pools.market_id AND v.delegator_id = delegated_pools.delegator_id AND v.active = TRUE) AS virtual_pool,
-            (SELECT ARRAY[v.primary_value + v.primary_revenue - v.initial_primary_value, v.secondary_value + v.secondary_revenue - v.initial_secondary_value, v.primary_value, v.secondary_value, v.fee_rate, v.initial_price] FROM pools v WHERE v.pair_id = delegated_pools.pair_id AND v.market_id = delegated_pools.market_id AND v.account_id = delegators.account_id AND v.active = TRUE LIMIT 1) AS shadow_pool
+            (SELECT ARRAY[SUM(v.primary_value), SUM(v.secondary_value)] FROM delegated_pools v WHERE v.pair_id = delegated_pools.pair_id AND v.active = TRUE) AS virtual_pool,
+            (SELECT ARRAY[v.primary_value + v.primary_revenue - v.initial_primary_value, v.secondary_value + v.secondary_revenue - v.initial_secondary_value, v.primary_value, v.secondary_value, v.fee_rate, v.initial_price] FROM pools v WHERE v.pair_id = delegated_pools.pair_id AND v.account_id = delegators.account_id AND v.active = TRUE LIMIT 1) AS shadow_pool
         FROM delegated_pools
             INNER JOIN pairs ON pairs.id = pair_id
             INNER JOIN assets passet ON passet.id = pairs.primary_asset_id
             INNER JOIN assets sasset ON sasset.id = pairs.secondary_asset_id
-            INNER JOIN markets ON markets.id = market_id
-            INNER JOIN delegators ON delegators.id = delegator_id
-            INNER JOIN accounts market_account ON market_account.id = markets.account_id
+            INNER JOIN contracts delegators ON delegators.type = ${ContractType.DLP}
             INNER JOIN accounts delegator_account ON delegator_account.id = delegators.account_id
-            LEFT JOIN delegators_view ON delegators_view.id = delegator_id AND delegators_view.pair_id = pairs.id
+            LEFT JOIN delegators_view ON delegators_view.id = delegators.id AND delegators_view.pair_id = pairs.id
         WHERE delegated_pools.id = ${id.toString()}`);
         try {
             return this.toDelegatedPool(result[0]);
@@ -2863,37 +3016,34 @@ export class Exchange {
             return null;
         }
     }
-    static async getDelegatedPoolByHandle(marketId: Uint256, pairId: Uint256, delegatorId: Uint256, accountId: Uint256, connection?: pq.TransactionSql): Promise<DelegatedPool | null> {
+    static async getDelegatedPoolByHandle(pairId: Uint256, accountId: Uint256, connection?: pq.TransactionSql): Promise<DelegatedPool | null> {
         const sql = connection || this.connection;
         const result = await this.resultOf(sql`
         SELECT
             delegated_pools.*,
             passet.hash AS primary_asset,
             sasset.hash AS secondary_asset,
-            market_account.hash AS market_account_hash,
             delegator_account.hash AS delegator_account_hash,
             delegators_view.volume,
-            (SELECT ARRAY[SUM(v.primary_value), SUM(v.secondary_value)] FROM delegated_pools v WHERE v.pair_id = delegated_pools.pair_id AND v.market_id = delegated_pools.market_id AND v.delegator_id = delegated_pools.delegator_id AND v.active = TRUE) AS virtual_pool,
-            (SELECT ARRAY[v.primary_value + v.primary_revenue - v.initial_primary_value, v.secondary_value + v.secondary_revenue - v.initial_secondary_value, v.primary_value, v.secondary_value, v.fee_rate, v.initial_price] FROM pools v WHERE v.pair_id = delegated_pools.pair_id AND v.market_id = delegated_pools.market_id AND v.account_id = delegators.account_id AND v.active = TRUE LIMIT 1) AS shadow_pool
+            (SELECT ARRAY[SUM(v.primary_value), SUM(v.secondary_value)] FROM delegated_pools v WHERE v.pair_id = delegated_pools.pair_id AND v.active = TRUE) AS virtual_pool,
+            (SELECT ARRAY[v.primary_value + v.primary_revenue - v.initial_primary_value, v.secondary_value + v.secondary_revenue - v.initial_secondary_value, v.primary_value, v.secondary_value, v.fee_rate, v.initial_price] FROM pools v WHERE v.pair_id = delegated_pools.pair_id AND v.account_id = delegators.account_id AND v.active = TRUE LIMIT 1) AS shadow_pool
         FROM delegated_pools
             INNER JOIN pairs ON pairs.id = pair_id
             INNER JOIN assets passet ON passet.id = pairs.primary_asset_id
             INNER JOIN assets sasset ON sasset.id = pairs.secondary_asset_id
-            INNER JOIN markets ON markets.id = market_id
-            INNER JOIN delegators ON delegators.id = delegator_id
-            INNER JOIN accounts market_account ON market_account.id = markets.account_id
+            INNER JOIN contracts delegators ON delegators.type = ${ContractType.DLP}
             INNER JOIN accounts delegator_account ON delegator_account.id = delegators.account_id
-            LEFT JOIN delegators_view ON delegators_view.id = delegator_id AND delegators_view.pair_id = pairs.id
-        WHERE delegated_pools.market_id = ${marketId.toString()} AND delegated_pools.pair_id = ${pairId.toString()} AND delegated_pools.delegator_id = ${delegatorId.toString()} AND delegated_pools.account_id = ${accountId.toString()}`);
+            LEFT JOIN delegators_view ON delegators_view.id = delegators.id AND delegators_view.pair_id = pairs.id
+        WHERE delegated_pools.pair_id = ${pairId.toString()} AND delegated_pools.account_id = ${accountId.toString()}`);
         try {
             return this.toDelegatedPool(result[0]);
         } catch {
             return null;
         }
     }
-    static async getAllDelegatedPoolsByDelegatorIdAndMarketPair(delegatorId: Uint256, marketId: Uint256, pairId: Uint256, connection?: pq.TransactionSql): Promise<DelegatedPool[]> {
+    static async getAllDelegatedPoolsByPair(pairId: Uint256, connection?: pq.TransactionSql): Promise<DelegatedPool[]> {
         const sql = connection || this.connection;
-        const result = await this.resultOf(sql`SELECT * FROM delegated_pools WHERE delegator_id = ${delegatorId.toString()} AND market_id = ${marketId.toString()} AND pair_id = ${pairId.toString()}`);
+        const result = await this.resultOf(sql`SELECT * FROM delegated_pools WHERE pair_id = ${pairId.toString()}`);
         try {
             const delegatedPools = [];
             for (let i = 0; i < result.length; i++) {
@@ -2904,28 +3054,25 @@ export class Exchange {
             return [];
         }
     }
-    static async getDelegatedPoolsByAccountIdAndMarketPair(accountId: Uint256, marketId: Uint256, pairId: Uint256, active: boolean | null, cursor: Cursor, connection?: pq.TransactionSql): Promise<DelegatedPool[]> {
+    static async getDelegatedPoolsByAccountIdAndPair(accountId: Uint256, pairId: Uint256, active: boolean | null, cursor: Cursor, connection?: pq.TransactionSql): Promise<DelegatedPool[]> {
         const sql = connection || this.connection;
         const result = await this.resultOf(sql`
         SELECT
             delegated_pools.*,
             passet.hash AS primary_asset,
             sasset.hash AS secondary_asset,
-            market_account.hash AS market_account_hash,
             delegator_account.hash AS delegator_account_hash,
             delegators_view.volume,
-            (SELECT ARRAY[SUM(v.primary_value), SUM(v.secondary_value)] FROM delegated_pools v WHERE v.pair_id = delegated_pools.pair_id AND v.market_id = delegated_pools.market_id AND v.delegator_id = delegated_pools.delegator_id AND v.active = TRUE) AS virtual_pool,
-            (SELECT ARRAY[v.primary_value + v.primary_revenue - v.initial_primary_value, v.secondary_value + v.secondary_revenue - v.initial_secondary_value, v.primary_value, v.secondary_value, v.fee_rate, v.initial_price] FROM pools v WHERE v.pair_id = delegated_pools.pair_id AND v.market_id = delegated_pools.market_id AND v.account_id = delegators.account_id AND v.active = TRUE LIMIT 1) AS shadow_pool
+            (SELECT ARRAY[SUM(v.primary_value), SUM(v.secondary_value)] FROM delegated_pools v WHERE v.pair_id = delegated_pools.pair_id AND v.active = TRUE) AS virtual_pool,
+            (SELECT ARRAY[v.primary_value + v.primary_revenue - v.initial_primary_value, v.secondary_value + v.secondary_revenue - v.initial_secondary_value, v.primary_value, v.secondary_value, v.fee_rate, v.initial_price] FROM pools v WHERE v.pair_id = delegated_pools.pair_id AND v.account_id = delegators.account_id AND v.active = TRUE LIMIT 1) AS shadow_pool
         FROM delegated_pools
             INNER JOIN pairs ON pairs.id = pair_id
             INNER JOIN assets passet ON passet.id = pairs.primary_asset_id
             INNER JOIN assets sasset ON sasset.id = pairs.secondary_asset_id
-            INNER JOIN markets ON markets.id = market_id
-            INNER JOIN delegators ON delegators.id = delegator_id
-            INNER JOIN accounts market_account ON market_account.id = markets.account_id
+            INNER JOIN contracts delegators ON delegators.type = ${ContractType.DLP}
             INNER JOIN accounts delegator_account ON delegator_account.id = delegators.account_id
-            LEFT JOIN delegators_view ON delegators_view.id = delegator_id AND delegators_view.pair_id = pairs.id
-        WHERE delegated_pools.account_id = ${accountId.toString()} AND delegated_pools.market_id = ${marketId.toString()} AND delegated_pools.pair_id = ${pairId.toString()}${typeof active == 'boolean' ? sql` AND active = ${active}` : sql``} ORDER BY active DESC, delegated_pools.block_number DESC LIMIT ${cursor.count} OFFSET ${cursor.offset}`);
+            LEFT JOIN delegators_view ON delegators_view.id = delegators.id AND delegators_view.pair_id = pairs.id
+        WHERE delegated_pools.account_id = ${accountId.toString()} AND delegated_pools.pair_id = ${pairId.toString()}${typeof active == 'boolean' ? sql` AND active = ${active}` : sql``} ORDER BY active DESC, delegated_pools.block_number DESC LIMIT ${cursor.count} OFFSET ${cursor.offset}`);
         try {
             const delegatedPools = [];
             for (let i = 0; i < result.length; i++) {
@@ -2943,20 +3090,17 @@ export class Exchange {
             delegated_pools.*,
             passet.hash AS primary_asset,
             sasset.hash AS secondary_asset,
-            market_account.hash AS market_account_hash,
             delegator_account.hash AS delegator_account_hash,
             delegators_view.volume,
-            (SELECT ARRAY[SUM(v.primary_value), SUM(v.secondary_value)] FROM delegated_pools v WHERE v.pair_id = delegated_pools.pair_id AND v.market_id = delegated_pools.market_id AND v.delegator_id = delegated_pools.delegator_id AND v.active = TRUE) AS virtual_pool,
-            (SELECT ARRAY[v.primary_value + v.primary_revenue - v.initial_primary_value, v.secondary_value + v.secondary_revenue - v.initial_secondary_value, v.primary_value, v.secondary_value, v.fee_rate, v.initial_price] FROM pools v WHERE v.pair_id = delegated_pools.pair_id AND v.market_id = delegated_pools.market_id AND v.account_id = delegators.account_id AND v.active = TRUE LIMIT 1) AS shadow_pool
+            (SELECT ARRAY[SUM(v.primary_value), SUM(v.secondary_value)] FROM delegated_pools v WHERE v.pair_id = delegated_pools.pair_id AND v.active = TRUE) AS virtual_pool,
+            (SELECT ARRAY[v.primary_value + v.primary_revenue - v.initial_primary_value, v.secondary_value + v.secondary_revenue - v.initial_secondary_value, v.primary_value, v.secondary_value, v.fee_rate, v.initial_price] FROM pools v WHERE v.pair_id = delegated_pools.pair_id AND v.account_id = delegators.account_id AND v.active = TRUE LIMIT 1) AS shadow_pool
         FROM delegated_pools
             INNER JOIN pairs ON pairs.id = pair_id
             INNER JOIN assets passet ON passet.id = pairs.primary_asset_id
             INNER JOIN assets sasset ON sasset.id = pairs.secondary_asset_id
-            INNER JOIN markets ON markets.id = market_id
-            INNER JOIN delegators ON delegators.id = delegator_id
-            INNER JOIN accounts market_account ON market_account.id = markets.account_id
+            INNER JOIN contracts delegators ON delegators.type = ${ContractType.DLP}
             INNER JOIN accounts delegator_account ON delegator_account.id = delegators.account_id
-            LEFT JOIN delegators_view ON delegators_view.id = delegator_id AND delegators_view.pair_id = pairs.id
+            LEFT JOIN delegators_view ON delegators_view.id = delegators.id AND delegators_view.pair_id = pairs.id
         WHERE delegated_pools.account_id = ${accountId.toString()}${typeof active == 'boolean' ? sql` AND active = ${active}` : sql``} ORDER BY active DESC, delegated_pools.block_number DESC LIMIT ${cursor.count} OFFSET ${cursor.offset}`);
         try {
             const delegatedPools = [];
@@ -2970,66 +3114,56 @@ export class Exchange {
     }
     static async getDelegationOf(accountId: Uint256, connection?: pq.TransactionSql): Promise<PseudoDelegatedState[]> {
         const sql = connection || this.connection;
-        const delegators = await this.resultOf(sql`SELECT
-            delegators.id,
-            account_id,
-            accounts.hash AS delegator_account_hash,
-            permissions
-        FROM delegators
-            INNER JOIN accounts ON accounts.id = delegators.account_id
-        WHERE deployer_account_id = ${accountId.toString()}`);
-        if (!delegators.length)
+        const contract = await this.getContractByType<DlpParameters>(ContractType.DLP, connection);
+        if (contract == null || contract.deployerAccountId == null || !contract.deployerAccountId.eq(accountId))
             return [];
 
+        const delegatorAccount = contract.account || '';
+        const delegations = await this.resultOf(sql`
+        WITH sources AS (
+            SELECT
+                pair_id,
+                SUM(primary_value) AS primary_value,
+                SUM(secondary_value) AS secondary_value
+            FROM delegated_pools
+            WHERE active = TRUE GROUP BY pair_id
+        )
+        SELECT
+            sources.primary_value,
+            sources.secondary_value,
+            passet.hash AS primary_asset,
+            sasset.hash AS secondary_asset
+        FROM sources
+            INNER JOIN pairs ON pairs.id = pair_id
+            INNER JOIN assets passet ON passet.id = pairs.primary_asset_id
+            INNER JOIN assets sasset ON sasset.id = pairs.secondary_asset_id`);
+        const delegatedPools = await this.resultOf(sql`
+        SELECT
+            pools.id,
+            price,
+            passet.hash AS primary_asset,
+            sasset.hash AS secondary_asset,
+            primary_value + primary_revenue - initial_primary_value AS primary_delta,
+            secondary_value + secondary_revenue - initial_secondary_value AS secondary_delta
+        FROM pools
+            INNER JOIN pairs ON pairs.id = pair_id
+            INNER JOIN assets passet ON passet.id = pairs.primary_asset_id
+            INNER JOIN assets sasset ON sasset.id = pairs.secondary_asset_id
+        WHERE account_id = ${contract.accountId.toString()} AND active = TRUE`);
         let results: PseudoDelegatedState[] = [];
-        for (let i = 0; i < delegators.length; i++) {
-            const delegator = delegators[i];
-            const delegatorAccount: string = Signing.encodeAddress(new Pubkeyhash(delegator['delegator_account_hash'])) || '';
-            const delegations = await this.resultOf(sql`
-            WITH sources AS (
-                SELECT
-                    pair_id,
-                    SUM(primary_value) AS primary_value,
-                    SUM(secondary_value) AS secondary_value
-                FROM delegated_pools       
-                WHERE delegator_id = ${delegator['id']} AND active = TRUE GROUP BY pair_id
-            )
-            SELECT
-                sources.primary_value,
-                sources.secondary_value,
-                passet.hash AS primary_asset,
-                sasset.hash AS secondary_asset
-            FROM sources
-                INNER JOIN pairs ON pairs.id = pair_id
-                INNER JOIN assets passet ON passet.id = pairs.primary_asset_id
-                INNER JOIN assets sasset ON sasset.id = pairs.secondary_asset_id`);
-            const delegatedPools = await this.resultOf(sql`
-            SELECT
-                pools.id,
-                price,
-                passet.hash AS primary_asset,
-                sasset.hash AS secondary_asset,
-                primary_value + primary_revenue - initial_primary_value AS primary_delta,
-                secondary_value + secondary_revenue - initial_secondary_value AS secondary_delta
-            FROM pools
-                INNER JOIN pairs ON pairs.id = pair_id
-                INNER JOIN assets passet ON passet.id = pairs.primary_asset_id
-                INNER JOIN assets sasset ON sasset.id = pairs.secondary_asset_id
-            WHERE account_id = ${delegator['account_id']} AND active = TRUE`);
-            results = [...results, ...(Array.isArray(delegator['permissions']) ? delegator['permissions'].map((x) => {
-                const delegation = delegations.find((v) => new AssetId(v['primary_asset']).id == new AssetId(x.primaryAsset).id && new AssetId(v['secondary_asset']).id == new AssetId(x.secondaryAsset).id) || { };
-                const delegatedPool = delegatedPools.find((v) => new AssetId(v['primary_asset']).id == new AssetId(x.primaryAsset).id && new AssetId(v['secondary_asset']).id == new AssetId(x.secondaryAsset).id) || { };
-                return {
-                    primaryAsset: x.primaryAsset,
-                    secondaryAsset: x.secondaryAsset,
-                    delegatorAccount: delegatorAccount,
-                    poolId: Common.u256(delegatedPool['id']) || new Uint256(0),
-                    primaryLiquidity: (Common.bn(delegation['primary_value']) || new BigNumber(0)).plus(Common.bn(delegatedPool['primary_delta']) || new BigNumber(0)),
-                    secondaryLiquidity: (Common.bn(delegation['secondary_value']) || new BigNumber(0)).plus(Common.bn(delegatedPool['secondary_delta']) || new BigNumber(0)),
-                    price: Common.bn(delegatedPool['price']) || new BigNumber(0)
-                };
-            }) : [])];
-        }
+        results = [...results, ...(Array.isArray(contract.parameters.permissions) ? contract.parameters.permissions.map((x) => {
+            const delegation = delegations.find((v) => new AssetId(v['primary_asset']).id == new AssetId(x.primaryAsset).id && new AssetId(v['secondary_asset']).id == new AssetId(x.secondaryAsset).id) || { };
+            const delegatedPool = delegatedPools.find((v) => new AssetId(v['primary_asset']).id == new AssetId(x.primaryAsset).id && new AssetId(v['secondary_asset']).id == new AssetId(x.secondaryAsset).id) || { };
+            return {
+                primaryAsset: x.primaryAsset,
+                secondaryAsset: x.secondaryAsset,
+                delegatorAccount: delegatorAccount,
+                poolId: Common.u256(delegatedPool['id']) || new Uint256(0),
+                primaryLiquidity: (Common.bn(delegation['primary_value']) || new BigNumber(0)).plus(Common.bn(delegatedPool['primary_delta']) || new BigNumber(0)),
+                secondaryLiquidity: (Common.bn(delegation['secondary_value']) || new BigNumber(0)).plus(Common.bn(delegatedPool['secondary_delta']) || new BigNumber(0)),
+                price: Common.bn(delegatedPool['price']) || new BigNumber(0)
+            };
+        }) : [])];
         return results;
     }
     static async setDepth(depth: Omit<Depth, 'id'>, connection?: pq.TransactionSql): Promise<Depth | null> {
@@ -3038,7 +3172,6 @@ export class Exchange {
         INSERT INTO depths
         (
             pair_id,
-            market_id,
             pool_id,
             account_id,
             block_number,
@@ -3049,7 +3182,6 @@ export class Exchange {
         VALUES
         (
             ${depth.pairId.toString()},
-            ${depth.marketId.toString()},
             ${depth.poolId.toString()},
             ${depth.accountId.toString()},
             ${depth.blockNumber},
@@ -3070,7 +3202,6 @@ export class Exchange {
         INSERT INTO trades
         (
             pair_id,
-            market_id,
             maker_order_id,
             maker_pool_id,
             maker_account_id,
@@ -3085,7 +3216,6 @@ export class Exchange {
         VALUES
         (
             ${trade.pairId.toString()},
-            ${trade.marketId ? trade.marketId.toString() : null},
             ${trade.makerOrderId ? trade.makerOrderId.toString() : null},
             ${trade.makerPoolId ? trade.makerPoolId.toString() : null},
             ${trade.makerAccountId ? trade.makerAccountId.toString() : null},
@@ -3108,7 +3238,7 @@ export class Exchange {
         const base = Quotes.globalBase();
         for (let i = 0; i < trades.length; i++) {
             const trade = trades[i];
-            const pairId = await this.getPairByAssetHashes(trade.asset, null, null, true, true, connection);
+            const pairId = await this.getPairByAssetHashes(trade.asset, null, false, true, connection);
             if (!pairId)
                 throw new Error(`${symbolOf(trade.asset)}: invalid pair id`);
 
@@ -3128,13 +3258,6 @@ export class Exchange {
                 }
             }, connection);
         }
-    }
-    static async cleanupLogs(marketId: Uint256, blockNumber: number, connection?: pq.TransactionSql): Promise<void> {
-        const sql = connection || this.connection;
-        try {
-            await this.resultOf(sql`DELETE FROM depths WHERE market_id = ${marketId.toString()} AND block_number = ${blockNumber}`);
-            await this.resultOf(sql`DELETE FROM trades WHERE market_id = ${marketId.toString()} AND block_number = ${blockNumber}`);
-        } catch { }
     }
     static async getAssetPriceHistory(assets: AssetId[], interval: number, points: number, connection?: pq.TransactionSql): Promise<Record<string, AssetId & { history: [number, BigNumber][] }>> {
         const sql = connection || this.connection;
@@ -3201,7 +3324,7 @@ export class Exchange {
         FROM pairs
             INNER JOIN pairs ppair ON ppair.primary_asset_id = pairs.primary_asset_id AND ppair.secondary_asset_id IS NULL
             INNER JOIN pairs spair ON spair.primary_asset_id = pairs.secondary_asset_id AND spair.secondary_asset_id IS NULL
-        WHERE pairs.id = ${pairId.toString()}`);    
+        WHERE pairs.id = ${pairId.toString()}`);
         const pairings = {
             primary: pairId.toInteger(),
             secondary: bindings.length > 0 ? parseInt(bindings[0]['secondary_id']) : null,
@@ -3296,7 +3419,7 @@ export class Exchange {
             close: base.close
         }));
     }
-    static async getAggregatedLogsByMarketPair(marketId: Uint256, pairId: Uint256, cursor: Cursor, connection?: pq.TransactionSql): Promise<AggregatedLog[]> {
+    static async getAggregatedLogsByPair(pairId: Uint256, cursor: Cursor, connection?: pq.TransactionSql): Promise<AggregatedLog[]> {
         const sql = connection || this.connection;
         const result = await this.resultOf(sql`
         (
@@ -3308,7 +3431,7 @@ export class Exchange {
                 quantity
             FROM depths
                 LEFT JOIN accounts ON accounts.id = account_id
-            WHERE pair_id = ${pairId.toString()} AND market_id = ${marketId.toString()}
+            WHERE pair_id = ${pairId.toString()}
         )
         UNION ALL
         (
@@ -3321,7 +3444,7 @@ export class Exchange {
             FROM trades
                 LEFT JOIN accounts maker_account ON maker_account.id = maker_account_id
                 LEFT JOIN accounts taker_account ON taker_account.id = taker_account_id
-            WHERE pair_id = ${pairId.toString()} AND market_id = ${marketId.toString()} AND (maker_account.hash IS NOT NULL OR taker_account.hash IS NOT NULL)
+            WHERE pair_id = ${pairId.toString()} AND (maker_account.hash IS NOT NULL OR taker_account.hash IS NOT NULL)
         )
         ORDER BY time DESC LIMIT ${cursor.count} OFFSET ${cursor.offset}`);
         try {
@@ -3339,7 +3462,7 @@ export class Exchange {
             return [];
         }
     }
-    static async getAggregatedLevelsByMarketPair(marketId: Uint256, pairId: Uint256, levels: number, connection?: pq.TransactionSql): Promise<{ ask: AggregatedLevel[], bid: AggregatedLevel[] }> {
+    static async getAggregatedLevelsByPair(pairId: Uint256, levels: number, connection?: pq.TransactionSql): Promise<{ ask: AggregatedLevel[], bid: AggregatedLevel[] }> {
         const sql = connection || this.connection;
         const result = await this.resultOf(sql`
         (
@@ -3353,7 +3476,7 @@ export class Exchange {
                 NULL AS primary_value,
                 NULL AS secondary_value,
                 NULL AS fee_rate
-            FROM orders WHERE market_id = ${marketId.toString()} AND pair_id = ${pairId.toString()} AND side = ${OrderSide.Sell} AND active = TRUE AND last_price > 0 AND last_quantity > 0
+            FROM orders WHERE pair_id = ${pairId.toString()} AND side = ${OrderSide.Sell} AND active = TRUE AND last_price > 0 AND last_quantity > 0
             ORDER BY price ASC LIMIT ${levels}
         )
         UNION ALL
@@ -3368,7 +3491,7 @@ export class Exchange {
                 primary_value,
                 secondary_value,
                 fee_rate
-            FROM pools WHERE market_id = ${marketId.toString()} AND pair_id = ${pairId.toString()} AND active = TRUE AND last_ask_price > 0 AND primary_value > 0 AND (max_price IS NULL OR last_ask_price <= max_price)
+            FROM pools WHERE pair_id = ${pairId.toString()} AND active = TRUE AND last_ask_price > 0 AND primary_value > 0 AND (max_price IS NULL OR last_ask_price <= max_price)
             ORDER BY price ASC LIMIT ${levels}
         )
         UNION ALL
@@ -3383,7 +3506,7 @@ export class Exchange {
                 NULL AS primary_value,
                 NULL AS secondary_value,
                 NULL AS fee_rate
-            FROM orders WHERE market_id = ${marketId.toString()} AND pair_id = ${pairId.toString()} AND side = ${OrderSide.Buy} AND active = TRUE AND last_price > 0 AND last_quantity > 0
+            FROM orders WHERE pair_id = ${pairId.toString()} AND side = ${OrderSide.Buy} AND active = TRUE AND last_price > 0 AND last_quantity > 0
             ORDER BY price DESC LIMIT ${levels}
         )
         UNION ALL
@@ -3398,7 +3521,7 @@ export class Exchange {
                 primary_value,
                 secondary_value,
                 fee_rate
-            FROM pools WHERE market_id = ${marketId.toString()} AND pair_id = ${pairId.toString()} AND active = TRUE AND last_bid_price > 0 AND secondary_value > 0 AND (min_price IS NULL OR last_bid_price >= min_price)
+            FROM pools WHERE pair_id = ${pairId.toString()} AND active = TRUE AND last_bid_price > 0 AND secondary_value > 0 AND (min_price IS NULL OR last_bid_price >= min_price)
             ORDER BY price ASC LIMIT ${levels}
         )`);
         const ask: AggregatedLevel[] = [], bid: AggregatedLevel[] = [];
@@ -3412,18 +3535,18 @@ export class Exchange {
             bid: bid.sort((a, b) => b.price.minus(a.price).toNumber()).slice(0, levels)
         }
     }
-    static async getAggregatedPolyAssetIdsByMarketPair(marketId: Uint256, pairId: Uint256, connection?: pq.TransactionSql): Promise<{ primary: AssetId[], secondary: AssetId[] }> {
+    static async getAggregatedPolyAssetIdsByPair(pairId: Uint256, connection?: pq.TransactionSql): Promise<{ primary: AssetId[], secondary: AssetId[] }> {
         const sql = connection || this.connection;
         const result = await this.resultOf(sql`
         WITH poly_ids AS (
             SELECT
-                COALESCE((SELECT poly_asset_id FROM poly_assets WHERE asset_id = pairs.primary_asset_id AND market_id = ${marketId.toString()}), (SELECT poly_asset_id FROM poly_assets WHERE poly_asset_id = pairs.primary_asset_id AND market_id = ${marketId.toString()} LIMIT 1)) AS primary_poly_asset_id,
-		        COALESCE((SELECT poly_asset_id FROM poly_assets WHERE asset_id = pairs.secondary_asset_id AND market_id = ${marketId.toString()}), (SELECT poly_asset_id FROM poly_assets WHERE poly_asset_id = pairs.secondary_asset_id AND market_id = ${marketId.toString()} LIMIT 1)) AS secondary_poly_asset_id
+                COALESCE((SELECT poly_asset_id FROM poly_assets WHERE asset_id = pairs.primary_asset_id), (SELECT poly_asset_id FROM poly_assets WHERE poly_asset_id = pairs.primary_asset_id LIMIT 1)) AS primary_poly_asset_id,
+		        COALESCE((SELECT poly_asset_id FROM poly_assets WHERE asset_id = pairs.secondary_asset_id), (SELECT poly_asset_id FROM poly_assets WHERE poly_asset_id = pairs.secondary_asset_id LIMIT 1)) AS secondary_poly_asset_id
 	        FROM pairs WHERE pairs.id = ${pairId.toString()}
         )
         SELECT asset_id, (poly_asset_id = COALESCE(primary_poly_asset_id, 0)) AS as_primary FROM poly_assets
             INNER JOIN poly_ids ON TRUE
-        WHERE market_id = ${marketId.toString()} AND poly_asset_id IN (SELECT unnest(ARRAY[primary_poly_asset_id, secondary_poly_asset_id]) FROM poly_ids)`);
+        WHERE poly_asset_id IN (SELECT unnest(ARRAY[primary_poly_asset_id, secondary_poly_asset_id]) FROM poly_ids)`);
         const primary: AssetId[] = [], secondary: AssetId[] = [];
         for (let i = 0; i < result.length; i++) {
             const value = result[i];
@@ -3434,30 +3557,25 @@ export class Exchange {
         }
         return { primary: primary, secondary: secondary };
     }
-    static async getAggregatedPolyAssetIdsByMarket(targetAssetId: Uint256, connection?: pq.TransactionSql): Promise<(AssetId & { marketId?: Uint256 })[]> {
+    static async getAggregatedPolyAssetIdsByMarket(targetAssetId: Uint256, connection?: pq.TransactionSql): Promise<AssetId[]> {
         const sql = connection || this.connection;
-        const polyResult = await this.resultOf(sql`SELECT poly_asset_id, market_id FROM poly_assets WHERE asset_id = ${targetAssetId.toString()} OR poly_asset_id = ${targetAssetId.toString()} LIMIT 1`);
+        const polyResult = await this.resultOf(sql`SELECT poly_asset_id FROM poly_assets WHERE asset_id = ${targetAssetId.toString()} OR poly_asset_id = ${targetAssetId.toString()} LIMIT 1`);
         const polyAssetId = (polyResult.length > 0 ? Common.u256(polyResult[0]['poly_asset_id']) : targetAssetId) || targetAssetId;
-        const result = await this.resultOf(sql`SELECT asset_id, market_id FROM poly_assets WHERE poly_asset_id = ${polyAssetId.toString()}`);
-        const assets: (AssetId & { marketId?: Uint256 })[] = [];
+        const result = await this.resultOf(sql`SELECT asset_id FROM poly_assets WHERE poly_asset_id = ${polyAssetId.toString()}`);
+        const assets: AssetId[] = [];
         for (let i = 0; i < result.length; i++) {
             const assetId = Common.u256(result[i]['asset_id']) || new Uint256();
-            const marketId = Common.u256(result[i]['market_id']) || new Uint256();
-            const asset: (AssetId & { marketId?: Uint256 }) | null = await this.getAssetHashById(assetId, connection);
-            if (asset != null) {
-                asset.marketId = marketId;
+            const asset: AssetId | null = await this.getAssetHashById(assetId, connection);
+            if (asset != null)
                 assets.push(asset);
-            }
         }
-        
-        const polyAsset: (AssetId & { marketId?: Uint256 }) | null = await this.getAssetHashById(polyAssetId, connection);
-        if (polyAsset != null && result.length > 0) {
-            polyAsset.marketId = Common.u256(result[0]['market_id']) || new Uint256();
+
+        const polyAsset: AssetId | null = await this.getAssetHashById(polyAssetId, connection);
+        if (polyAsset != null && result.length > 0)
             assets.push(polyAsset);
-        }
         return assets;
     }
-    static async getRoutingAmountByPairId(marketId: Uint256, pairId: Uint256, side: OrderSide, amount: [BigNumber, BigNumber], slippage: BigNumber, connection?: pq.TransactionSql): Promise<[BigNumber, BigNumber]> {
+    static async getRoutingAmountByPairId(pairId: Uint256, side: OrderSide, amount: [BigNumber, BigNumber], slippage: BigNumber, connection?: pq.TransactionSql): Promise<[BigNumber, BigNumber]> {
         const sql = connection || this.connection;
         const result = await this.resultOf(side == OrderSide.Buy ? sql`
         WITH levels AS (
@@ -3465,14 +3583,14 @@ export class Exchange {
                 SELECT
                     last_price AS price,
                     last_quantity AS quantity
-                FROM orders WHERE market_id = ${marketId.toString()} AND pair_id = ${pairId.toString()} AND side = ${OrderSide.Sell} AND active = TRUE AND last_price > 0 AND last_quantity > 0
+                FROM orders WHERE pair_id = ${pairId.toString()} AND side = ${OrderSide.Sell} AND active = TRUE AND last_price > 0 AND last_quantity > 0
             )
             UNION ALL
             (
                 SELECT
                     last_ask_price AS price,
                     primary_value AS quantity
-                FROM pools WHERE market_id = ${marketId.toString()} AND pair_id = ${pairId.toString()} AND active = TRUE AND last_ask_price > 0 AND primary_value > 0 AND (max_price IS NULL OR last_ask_price <= max_price)
+                FROM pools WHERE pair_id = ${pairId.toString()} AND active = TRUE AND last_ask_price > 0 AND primary_value > 0 AND (max_price IS NULL OR last_ask_price <= max_price)
             )
         ) SELECT price, SUM(quantity) AS quantity FROM levels GROUP BY price ORDER BY price ASC` : sql`
         WITH levels AS (
@@ -3480,7 +3598,7 @@ export class Exchange {
                 SELECT
                     last_price AS price,
                     last_quantity AS quantity
-                FROM orders WHERE market_id = ${marketId.toString()} AND pair_id = ${pairId.toString()} AND side = ${OrderSide.Buy} AND active = TRUE AND last_price > 0 AND last_quantity > 0
+                FROM orders WHERE pair_id = ${pairId.toString()} AND side = ${OrderSide.Buy} AND active = TRUE AND last_price > 0 AND last_quantity > 0
                 ORDER BY price DESC
             )
             UNION ALL
@@ -3488,7 +3606,7 @@ export class Exchange {
                 SELECT
                     last_bid_price AS price,
                     secondary_value / last_bid_price AS quantity
-                FROM pools WHERE market_id = ${marketId.toString()} AND pair_id = ${pairId.toString()} AND active = TRUE AND last_bid_price > 0 AND secondary_value > 0 AND (min_price IS NULL OR last_bid_price >= min_price)
+                FROM pools WHERE pair_id = ${pairId.toString()} AND active = TRUE AND last_bid_price > 0 AND secondary_value > 0 AND (min_price IS NULL OR last_bid_price >= min_price)
                 ORDER BY price ASC
             )
         ) SELECT price, SUM(quantity) AS quantity FROM levels GROUP BY price ORDER BY price DESC`);
@@ -3526,10 +3644,10 @@ export class Exchange {
         }
         return [minAmountOut, maxAmountOut];
     }
-    static async getRoutingPathsByAssetIds(marketId: Uint256, fromAssetId: Uint256, toAssetId: Uint256, amount: BigNumber, slippage: BigNumber, depth: number, connection?: pq.TransactionSql): Promise<RouterPath[]> {
+    static async getRoutingPathsByAssetIds(fromAssetId: Uint256, toAssetId: Uint256, amount: BigNumber, slippage: BigNumber, depth: number, connection?: pq.TransactionSql): Promise<RouterPath[]> {
         const allPaths: RouterPath[] = [];
-        const fromPolyAsset = (await this.getPolyAssetId(fromAssetId, marketId)) || fromAssetId;
-        const toPolyAsset = (await this.getPolyAssetId(toAssetId, marketId)) || toAssetId;
+        const fromPolyAsset = (await this.getPolyAssetId(fromAssetId)) || fromAssetId;
+        const toPolyAsset = (await this.getPolyAssetId(toAssetId)) || toAssetId;
         const queue: [Uint256, [BigNumber, BigNumber], Set<string>, RouterPath][] = [[fromPolyAsset, [amount, amount], new Set([fromPolyAsset.toCompactHex()]), []]];
         while (queue.length > 0) {
             const [assetIn, amountIn, set, path] = queue.shift()!;
@@ -3548,7 +3666,7 @@ export class Exchange {
                     continue;
 
                 const side = isSelling ? OrderSide.Sell : OrderSide.Buy;
-                const amountOut = await this.getRoutingAmountByPairId(marketId, pair.id, side, amountIn, slippage, connection);
+                const amountOut = await this.getRoutingAmountByPairId(pair.id, side, amountIn, slippage, connection);
                 if (amountOut[0].gt(0) || amountOut[1].gt(0)) {
                     queue.push([
                         assetOut.id,
@@ -3567,31 +3685,59 @@ export class Exchange {
             blockHash: Common.u256(value['block_hash']) || new Uint256(),
         }
     }
-    private static toMarket(value: pq.Row): Market {
-        const account = value['account_hash'] ? Signing.encodeAddress(new Pubkeyhash(new Uint8Array(value['account_hash']))) || undefined : undefined;
-        const version = account ? Blockchain.accountOf(account)?.version || undefined : undefined;
+    private static parametersOf(type: string, value: unknown): ContractParameters {
+        const parameters = typeof value == 'string' ? JSON.parse(value || '{}') : (value || { }) as Record<string, unknown>;
+        switch (type) {
+            case ContractType.DEX:
+                return {
+                    poolExitFee: Common.bn(parameters['poolExitFee']) || new BigNumber(0),
+                    maxPoolFeeRate: Common.bn(parameters['maxPoolFeeRate']) || new BigNumber(0),
+                    minMakerFee: Common.bn(parameters['minMakerFee']) || new BigNumber(0),
+                    maxMakerFee: Common.bn(parameters['maxMakerFee']) || new BigNumber(0),
+                    makerFeeExponent: Common.num(parameters['makerFeeExponent']) || 0,
+                    minTakerFee: Common.bn(parameters['minTakerFee']) || new BigNumber(0),
+                    maxTakerFee: Common.bn(parameters['maxTakerFee']) || new BigNumber(0),
+                    takerFeeExponent: Common.num(parameters['takerFeeExponent']) || 0,
+                    assetVolumeTarget: Common.bn(parameters['assetVolumeTarget']) || new BigNumber(0),
+                    assetResetDays: Common.num(parameters['assetResetDays']) || 0,
+                    accountResetDays: Common.num(parameters['accountResetDays']) || 0,
+                    marketPolicy: (Common.num(parameters['marketPolicy']) || 0) as MarketPolicy
+                };
+            case ContractType.DLP:
+                return {
+                    rewardEmission: Common.bn(parameters['rewardEmission']) || new BigNumber(0),
+                    rewardBalance: Common.bn(parameters['rewardBalance']) || new BigNumber(0),
+                    permissions: Array.isArray(parameters['permissions']) ? parameters['permissions'].map((x: any) => ({
+                        primaryAssetId: Common.u256(x.primaryAssetId) || new Uint256(0),
+                        primaryAsset: String(x.primaryAsset ?? ''),
+                        secondaryAssetId: Common.u256(x.secondaryAssetId) || new Uint256(0),
+                        secondaryAsset: String(x.secondaryAsset ?? '')
+                    })) : []
+                };
+            case ContractType.AMS:
+                return {
+                    dex: typeof parameters['dex'] == 'string' ? parameters['dex'] : undefined,
+                    feeOverflow: Common.bn(parameters['feeOverflow']) || new BigNumber(0),
+                    bookValidityBlocks: Common.num(parameters['bookValidityBlocks']) || 0,
+                    depositValidityBlocks: Common.num(parameters['depositValidityBlocks']) || 0,
+                    depositPrecision: Common.num(parameters['depositPrecision']) ?? 6,
+                    sequencer: this.sequencer?.address ?? null
+                };
+            default:
+                return { };
+        }
+    }
+    private static toContract(value: pq.Row): Contract {
         return {
             id: new Uint256(value['id']),
+            type: value['type'],
             accountId: new Uint256(value['account_id']),
-            account: account,
-            version: version,
-            unifiedAssetProxyAccount: version ? Blockchain.contracts.versions[version].uap : undefined,
-            deployerAccountId: new Uint256(value['deployer_account_id']),
-            deployerAccount: value['deployer_account_hash'] ? Signing.encodeAddress(new Pubkeyhash(new Uint8Array(value['deployer_account_hash']))) || undefined : undefined,
-            blockNumber: Common.num(value['block_number']) || 0,
-            poolExitFee: Common.bn(value['pool_exit_fee']) || new BigNumber(0),
-            maxPoolFeeRate: Common.bn(value['max_pool_fee_rate']) || new BigNumber(0),
-            minMakerFee: Common.bn(value['min_maker_fee']) || new BigNumber(0),
-            maxMakerFee: Common.bn(value['max_maker_fee']) || new BigNumber(0),
-            makerFeeExponent: Common.num(value['maker_fee_exponent']) || 0,
-            minTakerFee: Common.bn(value['min_taker_fee']) || new BigNumber(0),
-            maxTakerFee: Common.bn(value['max_taker_fee']) || new BigNumber(0),
-            takerFeeExponent: Common.num(value['taker_fee_exponent']) || 0,
-            assetVolumeTarget: Common.bn(value['asset_volume_target']) || new BigNumber(0),
-            assetResetDays: Common.num(value['asset_reset_days']) || 0,
-            accountResetDays: Common.num(value['account_reset_days']) || 0,
-            marketPolicy: value['market_policy'] as MarketPolicy
-        }
+            account: value['account_hash'] ? Signing.encodeAddress(new Pubkeyhash(new Uint8Array(value['account_hash']))) || undefined : undefined,
+            deployerAccountId: value['deployer_account_id'] ? new Uint256(value['deployer_account_id']) : null,
+            deployerAccount: value['deployer_account_hash'] ? Signing.encodeAddress(new Pubkeyhash(new Uint8Array(value['deployer_account_hash']))) || undefined : null,
+            blockNumber: Common.num(value['block_number']) ?? null,
+            parameters: this.parametersOf(value['type'], value['parameters'])
+        };
     }
     private static toOrder(value: pq.Row): Order {
         return {
@@ -3600,8 +3746,6 @@ export class Exchange {
             pairId: new Uint256(value['pair_id']),
             primaryAsset: value['primary_asset'] ? new AssetId(new Uint8Array(value['primary_asset'])).id : undefined,
             secondaryAsset: value['secondary_asset'] ? new AssetId(new Uint8Array(value['secondary_asset'])).id : undefined,
-            marketId: new Uint256(value['market_id']),
-            marketAccount: value['market_account_hash'] ? Signing.encodeAddress(new Pubkeyhash(new Uint8Array(value['market_account_hash']))) || undefined : undefined,
             accountId: new Uint256(value['account_id']),
             blockNumber: value['block_number'],
             condition: value['condition'] as OrderCondition,
@@ -3627,8 +3771,6 @@ export class Exchange {
             pairId: new Uint256(value['pair_id']),
             primaryAsset: value['primary_asset'] ? new AssetId(new Uint8Array(value['primary_asset'])).id : undefined,
             secondaryAsset: value['secondary_asset'] ? new AssetId(new Uint8Array(value['secondary_asset'])).id : undefined,
-            marketId: new Uint256(value['market_id']),
-            marketAccount: value['market_account_hash'] ? Signing.encodeAddress(new Pubkeyhash(new Uint8Array(value['market_account_hash']))) || undefined : undefined,
             accountId: new Uint256(value['account_id']),
             blockNumber: value['block_number'],
             initialPrice: new BigNumber(value['initial_price']),
@@ -3653,7 +3795,6 @@ export class Exchange {
     private static toTrade(value: pq.Row): Trade {
         return {
             pairId: new Uint256(value['pair_id']),
-            marketId: Common.u256(value['market_id']),
             makerOrderId: Common.u256(value['maker_order_id']),
             makerPoolId: Common.u256(value['maker_pool_id']),
             makerAccountId: Common.u256(value['maker_account_id']),
@@ -3669,33 +3810,12 @@ export class Exchange {
     private static toDepth(value: pq.Row): Depth {
         return {
             pairId: new Uint256(value['pair_id']),
-            marketId: Common.u256(value['market_id']) || new Uint256(0),
             poolId: Common.u256(value['pool_id']) || new Uint256(0),
             accountId: Common.u256(value['account_id']) || new Uint256(0),
             blockNumber: value['block_number'] || 0,
             price: new BigNumber(value['price']),
             quantity: new BigNumber(value['quantity']),
             time: new Date(value['time'])
-        };
-    }
-    private static toDelegator(value: pq.Row): Delegator {
-        const permissions = value['permissions'];
-        return {
-            id: new Uint256(value['id']),
-            marketId: Common.u256(value['market_id']) || new Uint256(0),
-            accountId: Common.u256(value['account_id']) || new Uint256(0),
-            account: value['account_hash'] ? Signing.encodeAddress(new Pubkeyhash(new Uint8Array(value['account_hash']))) || undefined : undefined,
-            deployerAccountId: Common.u256(value['deployer_account_id']) || new Uint256(0),
-            deployerAccount: value['deployer_account_hash'] ? Signing.encodeAddress(new Pubkeyhash(new Uint8Array(value['deployer_account_hash']))) || undefined : undefined,
-            blockNumber: value['block_number'] || 0,
-            rewardEmission: new BigNumber(value['reward_emission']),
-            rewardBalance: new BigNumber(value['reward_balance']),
-            permissions: Array.isArray(permissions) ? permissions.map((x) => ({
-                primaryAssetId: Common.u256(x.primaryAssetId) || new Uint256(0),
-                primaryAsset: x.primaryAsset,
-                secondaryAssetId: Common.u256(x.secondaryAssetId) || new Uint256(0),
-                secondaryAsset: x.secondaryAsset
-            })) : []
         };
     }
     private static toDelegatedPool(value: pq.Row): DelegatedPool {
@@ -3717,11 +3837,8 @@ export class Exchange {
         const dynamic = virtualPool.length == 2 && shadowPool.length == 6 && (!primaryDelta.eq(0) || !secondaryDelta.eq(0));
         return {
             id: new Uint256(value['id']),
-            delegatorId: new Uint256(value['delegator_id']),
             delegatorAccount: value['delegator_account_hash'] ? Signing.encodeAddress(new Pubkeyhash(new Uint8Array(value['delegator_account_hash']))) || undefined : undefined,
             pairId: new Uint256(value['pair_id']),
-            marketId: new Uint256(value['market_id']),
-            marketAccount: value['market_account_hash'] ? Signing.encodeAddress(new Pubkeyhash(new Uint8Array(value['market_account_hash']))) || undefined : undefined,
             accountId: new Uint256(value['account_id']),
             primaryAsset: value['primary_asset'] ? new AssetId(new Uint8Array(value['primary_asset'])).id : undefined,
             secondaryAsset: value['secondary_asset'] ? new AssetId(new Uint8Array(value['secondary_asset'])).id : undefined,
@@ -3788,7 +3905,7 @@ export class Exchange {
     private static toBestSeriesItem(series: { timepoint: number }[], timepoint: number, exactOnly?: boolean): [any, number] {
         if (!series.length)
             return [null, 0];
-        
+
         let left = 0, right = series.length - 1;
         while (left <= right) {
             const mid = Math.floor((left + right) / 2);
@@ -3801,7 +3918,7 @@ export class Exchange {
                 right = mid - 1;
             }
         }
-        
+
         if (exactOnly)
             return [null, left];
 
@@ -3817,11 +3934,11 @@ export class Exchange {
     private static toFixedSeries(series: { timepoint: number }[], from: number, to: number, interval: number, extend: (from: any) => any): ({ timepoint: number } | any)[] {
         if (!series.length || to - from <= 0 || !interval)
             return series;
-        
+
         const count = Math.ceil((to - from) / interval);
         if (series.length == count)
             return series;
-        
+
         let result = [], prev: any = null;
         while (result.length != count) {
             const timepoint: number = to - interval * result.length;
@@ -3830,8 +3947,334 @@ export class Exchange {
             item.timepoint = timepoint;
             prev = next;
             result.push(item);
-        } 
+        }
         return result.reverse();
+    }
+    static async updateBookingStatus(bookingId: Uint256, to: string, connection?: pq.TransactionSql): Promise<Booking | null> {
+        const sql = connection || this.connection;
+        const booking = await this.getBookingById(bookingId, connection);
+        if (booking == null)
+            throw new Error('AMS booking not found: ' + bookingId.toString());
+
+        if (to != booking.status && !(BOOKING_STATUS_EDGES[booking.status] || []).includes(to))
+            throw new Error(`illegal AMS booking transition (${booking.status} -> ${to})`);
+
+        await this.resultOf(sql`UPDATE bookings SET status = ${to} WHERE id = ${bookingId.toString()}`);
+
+        await this.notify(Notification.BookingUpdate, {
+            accounts: await this.getBookingAccounts(booking, connection),
+            args: {
+                asset: booking.asset.id,
+                amount: booking.amount.toString()
+            }
+        }, connection);
+        return await this.getBookingById(bookingId, connection);
+    }
+    static async expireBookings(blockNumber: number, connection?: pq.TransactionSql): Promise<void> {
+        const sql = connection || this.connection;
+        const rows = await this.resultOf(sql`
+        SELECT id FROM bookings
+        WHERE expires_block <= ${blockNumber}
+            AND status IN ('awaiting_deposit', 'finalizing_deposit', 'awaiting_execution')
+        ORDER BY id`);
+        for (let i = 0; i < rows.length; i++)
+            await this.updateBookingStatus(new Uint256(rows[i]['id']), BookingStatus.Expired, connection);
+    }
+    private static async rollbackBookings(blockNumber: number, connection?: pq.TransactionSql): Promise<void> {
+        const sql = connection || this.connection;
+        const rows = await this.resultOf(sql`
+        SELECT bookings.id FROM bookings
+        WHERE bookings.status IN ('finalizing_deposit', 'awaiting_execution')
+            AND (bookings.deposit_block IS NULL OR bookings.deposit_block >= ${blockNumber})
+        ORDER BY bookings.id`);
+        for (let i = 0; i < rows.length; i++) {
+            const bookingId = new Uint256(rows[i]['id']);
+            await this.updateBookingStatus(bookingId, BookingStatus.AwaitingDeposit, connection);
+            await this.resultOf(sql`
+            UPDATE bookings SET
+                deposit_hash = NULL,
+                deposit_source = NULL,
+                deposit_block = NULL,
+                deposit_payer_account_id = NULL,
+                deposit_preattested_time = NULL
+            WHERE id = ${bookingId.toString()}`);
+            Log.info(`ams reorg: booking ${bookingId.toString()} fell back to ${BookingStatus.AwaitingDeposit} (block: ${blockNumber})`);
+        }
+    }
+    private static async getBookingAccounts(booking: Booking, connection?: pq.TransactionSql): Promise<string[]> {
+        const accounts: string[] = [];
+        const contract = await this.getAmsContract(connection);
+        if (contract?.account != null)
+            accounts.push(contract.account);
+
+        if (booking.depositPayer != null)
+            accounts.push(booking.depositPayer);
+
+        return accounts;
+    }
+    static async getAmsContract(connection?: pq.TransactionSql): Promise<Contract<AmsParameters> | null> {
+        return await this.getContractByType<AmsParameters>(ContractType.AMS, connection);
+    }
+    static async setBooking(asset: AssetId, booking: { amount: BigNumber, publicKey: string, expiresBlock: number, txHash: Uint256, blockNumber: number }, connection?: pq.TransactionSql): Promise<Booking | null> {
+        const sql = connection || this.connection;
+        const assetId = await this.getAssetIdByHash(asset, 'trusted', connection);
+        if (assetId == null)
+            throw new Error('cannot find booked asset ' + asset.id);
+
+        const result = await this.resultOf(sql`
+        INSERT INTO bookings
+        (
+            asset_id,
+            amount,
+            public_key,
+            status,
+            expires_block,
+            tx_hash,
+            block_number
+        )
+        VALUES
+        (
+            ${assetId.toString()},
+            ${booking.amount.toString()},
+            ${booking.publicKey},
+            ${BookingStatus.AwaitingDeposit},
+            ${booking.expiresBlock},
+            ${booking.txHash.toUint8Array()},
+            ${booking.blockNumber}
+        )
+        ON CONFLICT (tx_hash) DO NOTHING
+        RETURNING id`);
+        if (result.length < 1)
+            return await this.getBookingByTxHash(booking.txHash, connection);
+
+        const bookingId = new Uint256(result[0]['id']);
+        await this.notify(Notification.BookingUpdate, {
+            accounts: [(await this.getAmsContract(connection))?.account].filter((v): v is string => v != null),
+            args: {
+                asset: asset.id,
+                amount: booking.amount.toString()
+            }
+        }, connection);
+        return await this.getBookingById(bookingId, connection);
+    }
+    static async getBookingByTxHash(txHash: Uint256, connection?: pq.TransactionSql): Promise<Booking | null> {
+        const sql = connection || this.connection;
+        const result = await this.resultOf(sql`
+        ${this.bookingSelect(sql)}
+        WHERE bookings.tx_hash = ${txHash.toUint8Array()}`);
+        try {
+            return this.toBooking(result[0]);
+        } catch {
+            return null;
+        }
+    }
+    static async getBookingById(id: Uint256, connection?: pq.TransactionSql): Promise<Booking | null> {
+        const sql = connection || this.connection;
+        const result = await this.resultOf(sql`
+        ${this.bookingSelect(sql)}
+        WHERE bookings.id = ${id.toString()}`);
+        try {
+            return this.toBooking(result[0]);
+        } catch {
+            return null;
+        }
+    }
+    static async getBookingByHandle(assetId: Uint256, amount: BigNumber, statuses: string[] | null, connection?: pq.TransactionSql): Promise<Booking | null> {
+        const sql = connection || this.connection;
+        const result = await this.resultOf(sql`
+        ${this.bookingSelect(sql)}
+        WHERE bookings.asset_id = ${assetId.toString()}
+            AND bookings.amount = ${amount.toString()}
+            AND (${statuses == null ? null : 'set'}::text IS NULL OR bookings.status = ANY(${statuses ?? []}))
+        ORDER BY CASE WHEN bookings.status IN ('finalized', 'expired') THEN 1 ELSE 0 END, bookings.id DESC
+        LIMIT 1`);
+        try {
+            return this.toBooking(result[0]);
+        } catch {
+            return null;
+        }
+    }
+    static async getBookingByDepositHash(depositHash: Uint256, connection?: pq.TransactionSql): Promise<Booking | null> {
+        const sql = connection || this.connection;
+        const result = await this.resultOf(sql`
+        ${this.bookingSelect(sql)}
+        WHERE bookings.deposit_hash = ${depositHash.toUint8Array()}`);
+        try {
+            return this.toBooking(result[0]);
+        } catch {
+            return null;
+        }
+    }
+
+    static async getBookings(cursor: Cursor, publicKeys?: string[] | null, statuses?: string[] | null, connection?: pq.TransactionSql): Promise<Booking[]> {
+        const sql = connection || this.connection;
+        const result = await this.resultOf(sql`
+        ${this.bookingSelect(sql)}
+        WHERE (${publicKeys == null ? null : 'set'}::text IS NULL OR bookings.public_key = ANY(${publicKeys ?? []}))
+            AND (${statuses == null ? null : 'set'}::text IS NULL OR bookings.status = ANY(${statuses ?? []}))
+        ORDER BY bookings.id DESC
+        LIMIT ${cursor.count} OFFSET ${cursor.offset}`);
+
+        const list: Booking[] = [];
+        for (const row of result) {
+            try {
+                list.push(this.toBooking(row));
+            } catch { }
+        }
+
+        return list;
+    }
+    static async hasPendingBookings(connection?: pq.TransactionSql): Promise<boolean> {
+        const sql = connection || this.connection;
+        const result = await this.resultOf(sql`
+        SELECT EXISTS (SELECT TRUE FROM bookings WHERE status IN ('awaiting_deposit', 'finalizing_deposit')) AS pending`);
+        return result[0]?.['pending'] === true;
+    }
+    static async setBookingDepositFacts(bookingId: Uint256, facts: { depositHash: Uint256, source: string, blockNumber?: number | null, payerAccountId?: Uint256 | null, preattestedTime?: number | null }, connection?: pq.TransactionSql): Promise<void> {
+        const sql = connection || this.connection;
+        await this.resultOf(sql`
+        UPDATE bookings SET
+            deposit_hash = ${facts.depositHash.toUint8Array()},
+            deposit_source = ${facts.source},
+            deposit_block = COALESCE(${facts.blockNumber ?? null}, deposit_block),
+            deposit_payer_account_id = COALESCE(${facts.payerAccountId?.toString() ?? null}, deposit_payer_account_id),
+            deposit_preattested_time = COALESCE(${facts.preattestedTime ?? null}, deposit_preattested_time)
+        WHERE id = ${bookingId.toString()}`);
+    }
+    static async setBookingOutput(bookingId: Uint256, outAssetId: Uint256, outAmount: BigNumber, connection?: pq.TransactionSql): Promise<void> {
+        const sql = connection || this.connection;
+        await this.resultOf(sql`UPDATE bookings SET out_asset_id = ${outAssetId.toString()}, out_amount = ${outAmount.toString()} WHERE id = ${bookingId.toString()}`);
+    }
+    static async setBookingWithdrawal(bookingId: Uint256, withdrawHash: Uint256, bridgeHash: Uint256 | null | undefined, expiresBlock: number, clearPipeline: boolean, connection?: pq.TransactionSql): Promise<void> {
+        const sql = connection || this.connection;
+        await this.resultOf(sql`
+        UPDATE bookings SET
+            withdraw_hash = ${withdrawHash.toUint8Array()},
+            bridge_hash = COALESCE(${bridgeHash?.toUint8Array() ?? null}, bridge_hash),
+            expires_block = ${expiresBlock},
+            broadcast_hash = CASE WHEN ${clearPipeline} THEN NULL ELSE broadcast_hash END,
+            proof_transaction_id = CASE WHEN ${clearPipeline} THEN NULL ELSE proof_transaction_id END,
+            relay_error = CASE WHEN ${clearPipeline} THEN NULL ELSE relay_error END,
+            attestate_hash = CASE WHEN ${clearPipeline} THEN NULL ELSE attestate_hash END
+        WHERE id = ${bookingId.toString()}`);
+    }
+    static async setBookingRouting(bookingId: Uint256, routingAddress: string, connection?: pq.TransactionSql): Promise<void> {
+        const sql = connection || this.connection;
+        await this.resultOf(sql`
+        UPDATE bookings SET routing_address = ${routingAddress}
+        WHERE id = ${bookingId.toString()}`);
+    }
+    static async setBookingBroadcastProof(bookingId: Uint256, broadcastHash: Uint256, proofTransactionId: string, connection?: pq.TransactionSql): Promise<void> {
+        const sql = connection || this.connection;
+        await this.resultOf(sql`
+        UPDATE bookings SET broadcast_hash = ${broadcastHash.toUint8Array()}, proof_transaction_id = ${proofTransactionId}, relay_error = NULL
+        WHERE id = ${bookingId.toString()}`);
+    }
+    static async setBookingBroadcastError(bookingId: Uint256, broadcastHash: Uint256, relayError: string, connection?: pq.TransactionSql): Promise<void> {
+        const sql = connection || this.connection;
+        await this.resultOf(sql`
+        UPDATE bookings SET broadcast_hash = ${broadcastHash.toUint8Array()}, relay_error = ${relayError}
+        WHERE id = ${bookingId.toString()}`);
+    }
+    static async setBookingAttestate(bookingId: Uint256, attestateHash: Uint256, connection?: pq.TransactionSql): Promise<void> {
+        const sql = connection || this.connection;
+        await this.resultOf(sql`UPDATE bookings SET attestate_hash = ${attestateHash.toUint8Array()} WHERE id = ${bookingId.toString()}`);
+    }
+    private static async getBookingsByProofTransactionId(proofTransactionId: string, connection?: pq.TransactionSql): Promise<Booking[]> {
+        const sql = connection || this.connection;
+        const result = await this.resultOf(sql`
+        ${this.bookingSelect(sql)}
+        WHERE bookings.proof_transaction_id = ${proofTransactionId}
+            AND bookings.status IN (${BookingStatus.FinalizingWithdrawal}, ${BookingStatus.FailingWithdrawal})
+        ORDER BY bookings.id`);
+        const bookings: Booking[] = [];
+        for (let i = 0; i < result.length; i++) {
+            try {
+                bookings.push(this.toBooking(result[i]));
+            } catch { }
+        }
+
+        return bookings;
+    }
+    private static async getBookingsByWithdrawHash(withdrawHash: Uint256, statuses: string[], connection?: pq.TransactionSql): Promise<Booking[]> {
+        const sql = connection || this.connection;
+        const result = await this.resultOf(sql`
+        ${this.bookingSelect(sql)}
+        WHERE bookings.withdraw_hash = ${withdrawHash.toUint8Array()}
+            AND bookings.status = ANY(${statuses})
+        ORDER BY bookings.id`);
+        const bookings: Booking[] = [];
+        for (let i = 0; i < result.length; i++) {
+            try {
+                bookings.push(this.toBooking(result[i]));
+            } catch { }
+        }
+
+        return bookings;
+    }
+    private static async findSwapRefOutput(events: EventInfo[], txHash: string, connection?: pq.TransactionSql): Promise<{ outAssetId: Uint256, outAmount: BigNumber } | null> {
+        for (let i = 0; i < events.length; i++) {
+            const log = events[i];
+            if (log.hash == txHash && log.event.type == Spot.AMS.Events.SwapRef && Array.isArray(log.event.args) && log.event.args.length >= 4) {
+                const outAssetId = await this.getAssetIdByHash(new AssetId(log.event.args[2]), 'trusted', connection);
+                const outAmount = Common.bn(log.event.args[3]);
+                if (outAssetId != null && outAmount != null)
+                    return { outAssetId: outAssetId, outAmount: outAmount };
+            }
+        }
+
+        return null;
+    }
+    static async withExclusiveLock<T>(action: () => Promise<T>): Promise<T> {
+        if (this.config == null)
+            throw new Error('exchange is not configured');
+
+        const sql = pq({ ...this.config, max: 1 });
+        try {
+            await this.resultOf(sql`SELECT pg_advisory_lock(hashtext('ams:sequencer'))`);
+            return await action();
+        } finally {
+            try {
+                await this.resultOf(sql`SELECT pg_advisory_unlock(hashtext('ams:sequencer'))`);
+            } finally {
+                await sql.end({ timeout: 5 });
+            }
+        }
+    }
+    private static bookingSelect(sql: pq.Sql | pq.TransactionSql) {
+        return sql`
+        SELECT bookings.*, assets.hash AS asset_hash, out_assets.hash AS out_asset_hash, payer_accounts.hash AS deposit_payer_hash
+        FROM bookings
+            INNER JOIN assets ON assets.id = bookings.asset_id
+            LEFT JOIN assets out_assets ON out_assets.id = bookings.out_asset_id
+            LEFT JOIN accounts payer_accounts ON payer_accounts.id = bookings.deposit_payer_account_id
+        `;
+    }
+    private static toBooking(value: pq.Row): Booking {
+        return {
+            id: new Uint256(value['id']),
+            asset: new AssetId(new Uint8Array(value['asset_hash'])),
+            assetId: new Uint256(value['asset_id']),
+            amount: Common.bn(value['amount']) || new BigNumber(0),
+            publicKey: String(value['public_key']),
+            status: String(value['status']),
+            expiresBlock: Common.num(value['expires_block']) || 0,
+            txHash: new Uint256(new Uint8Array(value['tx_hash'])).toHex(),
+            blockNumber: Common.num(value['block_number']) || 0,
+            depositHash: value['deposit_hash'] != null ? new Uint256(new Uint8Array(value['deposit_hash'])).toHex() : null,
+            depositStatus: value['deposit_hash'] == null ? null : (value['deposit_source'] == null ? null : (value['deposit_block'] != null ? 'confirmed' : 'pending')),
+            depositBlock: Common.num(value['deposit_block']) ?? null,
+            depositPayer: value['deposit_payer_hash'] != null ? Signing.encodeAddress(new Pubkeyhash(new Uint8Array(value['deposit_payer_hash']))) || null : null,
+            withdrawHash: value['withdraw_hash'] != null ? new Uint256(new Uint8Array(value['withdraw_hash'])).toHex() : null,
+            bridgeHash: value['bridge_hash'] != null ? new Uint256(new Uint8Array(value['bridge_hash'])).toHex() : null,
+            outAsset: value['out_asset_hash'] != null ? new AssetId(new Uint8Array(value['out_asset_hash'])) : null,
+            outAmount: Common.bn(value['out_amount']) ?? null,
+            broadcastHash: value['broadcast_hash'] != null ? new Uint256(new Uint8Array(value['broadcast_hash'])).toHex() : null,
+            proofTransactionId: value['proof_transaction_id'] != null ? String(value['proof_transaction_id']) : null,
+            relayError: value['relay_error'] != null ? String(value['relay_error']) : null,
+            routingAddress: value['routing_address'] != null ? String(value['routing_address']) : null,
+            attestateHash: value['attestate_hash'] != null ? new Uint256(new Uint8Array(value['attestate_hash'])).toHex() : null
+        };
     }
     private static async resultOf<T>(result: Promise<T>): Promise<T> {
         try {

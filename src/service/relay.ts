@@ -1,43 +1,41 @@
 import { randomBytes } from 'crypto';
-import { AssetId, ByteUtil, UiUtil, Signing, Spot, Uint256 } from 'tangentsdk';
+import { AssetId, ByteUtil, Chain, Hashsig, Messages, RPC, SchemaUtil, Signing, Spot, Stream, Transactions, UiUtil, Uint256, Hashing } from 'tangentsdk';
 import { Log } from '../logging';
-import { Connection, Cursor, Notification, Exchange, PriceDescriptors, RouterPath, TimeCursor, NotificationData } from './exchange';
+import { Connection, Cursor, Notification, Exchange, PriceDescriptors, RouterPath, TimeCursor, NotificationData, Sequencer } from './exchange';
 import { FastifyInstance } from 'fastify/types/instance';
 import { Blockchain, BlockchainInfo } from './blockchain';
-import { AggregatedLog, AggregatedPair, Order, Pool, Market as MarketT, DelegatedPool, PseudoDelegatedPool, Delegator, PseudoDelegatedState, Balance } from '../types';
+import { AggregatedLevel, AggregatedLog, AggregatedPair, Contract, ContractType, Order, Pool, DelegatedPool, PseudoDelegatedPool, PseudoDelegatedState, Balance } from '../types';
 import fastify, { FastifyReply, FastifyRequest } from 'fastify';
 import fastifyWebsocket, { WebSocket } from '@fastify/websocket';
 import cors from '@fastify/cors';
 import BigNumber from 'bignumber.js';
 import { Peers } from './peers';
 import { Quotes } from './market';
-
-function variable(data: any): string {
-    try {
-        const size = 48;
-        const text = JSON.stringify(data);
-        return text.length > size ? text.substring(0, size) + '...' : text;
-    } catch {
-        return '(unserializable)';
-    }
-}
-function setHasAnyOf(set: Set<string>, containsOf: string[]): boolean {
-    for (let i = 0; i < containsOf.length; i++) {
-        if (set.has(containsOf[i]))
-            return true;
-    }
-    return false;
-}
+import { Common } from '../common';
+import { Booking, BookingStatus, BookingSwap, AmsParameters, SpendMessageParams, RespendMessageParams } from '../types';
 
 export type Options = {
     host: string,
     port: number
-};
+}
 
 export type ChannelNode = {
     id: string;
     socket: WebSocket,
     accounts: Set<string>
+}
+
+export type SwapExecution = {
+    contractAccount: string,
+    contractFunction: string,
+    args: unknown[],
+    describe: string,
+    bridgeSend?: boolean
+}
+
+export type SwapReference = {
+    transaction: string | null,
+    amount?: string
 }
 
 export class Result {
@@ -93,6 +91,7 @@ export class Relay {
         new Router.Account(server);
         new Router.Asset(server);
         new Router.Market(server);
+        new Router.Swaps(server);
         new Router.Channel(server);
     }
     static callable(context: any, callback: (args?: any, response?: FastifyReply) => Promise<any>, asIs?: boolean): ((request: FastifyRequest, reply: FastifyReply) => Promise<any>) {
@@ -120,17 +119,18 @@ export class Relay {
             try {
                 const result = await callback.apply(context, [args, reply]);
                 const response = asIs ? result : Result.data(result);
-                Log.info('relay', `${request.ip}${request.url} call:`, variable(args), '=>', variable(response));
+                Log.info('relay', `${request.ip} ${request.method.toLowerCase()} ${request.url} call:`, Relay.variable(args), '=>', Relay.variable(response));
                 return response;
             } catch (exception: any) {
-                Log.error('relay', `${request.ip}${request.url} call:`, variable(args), '=>', exception);
+                Log.error('relay', `${request.ip} ${request.method.toLowerCase()} ${request.url} call:`, Relay.variable(args), '=>', exception);
                 return  Result.error(exception);
             }
         };
     }
-    static channelable(context: any, callback: (channel: ChannelNode, args?: any) => Promise<any>): ((socket: WebSocket) => void) {
-        return (socket: WebSocket) => {
+    static channelable(context: any, callback: (channel: ChannelNode, args?: any) => Promise<any>): ((socket: WebSocket, request: FastifyRequest) => void) {
+        return (socket: WebSocket, request: FastifyRequest) => {
             const id = ByteUtil.uint8ArrayToHexString(randomBytes(16));
+            const ip = request.ip || id;
             const channel = { id: id, socket: socket, accounts: new Set<string>() };
             this.channels[id] = channel;
             socket.on('close', () => delete this.channels[id]);
@@ -138,18 +138,18 @@ export class Relay {
                 try {
                     const body = JSON.parse(message.toString());
                     const args = typeof body != 'object' ? { } : body;
-                    const url = args?.method || 'get://';
+                    const url = (args?.method || 'get null').replace('://', ' ');
                     try {
                         const result = await callback.apply(context, [channel, args]);
                         socket.send(JSON.stringify(result));
-                        Log.info('relay', `${id}/${url} call:`, variable(args), '=>', variable(result));
+                        Log.info('relay', `${ip} ${url} call:`, Relay.variable(args), '=>', Relay.variable(result));
                     } catch (exception: any) {
                         socket.send(JSON.stringify(Result.error(exception, id)));
-                        Log.error('relay', `${id}/${url} call:`, variable(args), '=>', exception);
+                        Log.error('relay', `${ip} ${url} call:`, Relay.variable(args), '=>', exception);
                     }
                 } catch (exception: any) {
                     socket.send(JSON.stringify(Result.error(exception, id)));
-                    Log.error('relay', `${id}/null://err call:`, null, '=>', exception);
+                    Log.error('relay', `${ip} error call:`, null, '=>', exception);
                 }
             });
         };
@@ -161,7 +161,7 @@ export class Relay {
             for (let id in this.channels) {
                 try {
                     const channel = this.channels[id];
-                    if (!body.accounts || setHasAnyOf(channel.accounts, body.accounts)) {
+                    if (!body.accounts || Relay.anyOf(channel.accounts, body.accounts)) {
                         channel.socket.send(JSON.stringify({ id: id, error: null, notification: data }));
                         ++notifications;
                     }
@@ -169,12 +169,28 @@ export class Relay {
             }
         } else {
             const channel = this.channels[body.channelId];
-            if (channel != null && (!body.accounts || setHasAnyOf(channel.accounts, body.accounts))) {
+            if (channel != null && (!body.accounts || Relay.anyOf(channel.accounts, body.accounts))) {
                 channel.socket.send(JSON.stringify({ id: body.channelId, error: null, notification: data }));
                 ++notifications;
             }
         }
         return notifications;
+    }
+    private static variable(data: any): string {
+        try {
+            const size = 48;
+            const text = JSON.stringify(data);
+            return text.length > size ? text.substring(0, size) + '...' : text;
+        } catch {
+            return '(unserializable)';
+        }
+    }
+    private static anyOf(set: Set<string>, containsOf: string[]): boolean {
+        for (let i = 0; i < containsOf.length; i++) {
+            if (set.has(containsOf[i]))
+                return true;
+        }
+        return false;
     }
 }
 
@@ -191,19 +207,18 @@ export namespace Router {
 
     export class Asset {
         constructor(server: FastifyInstance) {
-            Channel.register(server, 'get', '/assets/portfolio', Asset, Asset.getPortfolio);
+            Channel.register(server, 'get', '/assets', Asset, Asset.getPortfolio);
             Channel.register(server, 'get', '/asset/prices', Asset, Asset.getPrices);
             Channel.register(server, 'get', '/asset/descriptors', Asset, Asset.getDescriptors);
             Channel.register(server, 'get', '/asset/query', Asset, Asset.getQuery);
             Channel.register(server, 'get', '/asset', Asset, Asset.get);
         }
-        static async getPortfolio(args?: { base?: string }): Promise<{ prices: PriceDescriptors, descriptors: BlockchainInfo[], markets: Market[], delegators: Delegator[], rate: BigNumber | null }> {
-            const [prices, descriptors, markets, delegators, rate] = await Promise.all([this.getPrices(), this.getDescriptors(), Exchange.getMarkets(), Exchange.getDelegators(), Market.rateOf(args?.base)]);
+        static async getPortfolio(args?: { base?: string }): Promise<{ prices: PriceDescriptors, descriptors: BlockchainInfo[], contracts: Contract[], rate: BigNumber | null }> {
+            const [prices, descriptors, contracts, rate] = await Promise.all([this.getPrices(), this.getDescriptors(), Exchange.getContracts(), Market.rateOf(args?.base)]);
             return {
                 prices: prices,
                 descriptors: descriptors,
-                markets: markets,
-                delegators: delegators,
+                contracts: contracts,
                 rate: rate
             };
         }
@@ -259,7 +274,8 @@ export namespace Router {
             Channel.register(server, 'get', '/market/pair/logs', Asset, Market.getPairLogs);
             Channel.register(server, 'get', '/market/pair/price/series', Asset, Market.getPairPriceSeries);
             Channel.register(server, 'get', '/market/pair/price/levels', Asset, Market.getPairPriceLevels);
-            Channel.register(server, 'get', '/markets', Asset, Market.getMarkets);
+            Channel.register(server, 'get', '/contracts', Asset, Market.getContracts);
+            Channel.register(server, 'get', '/contract', Asset, Market.getContract);
             Channel.register(server, 'get', '/market/rate', Asset, Market.getRate);
         }
         static async rateOf(base?: string): Promise<BigNumber | null> {
@@ -291,12 +307,18 @@ export namespace Router {
             }
             return await Exchange.getOverallMetrics();
         }
-        static async getMarkets() {
-            const [markets, delegators] = await Promise.all([Exchange.getMarkets(), Exchange.getDelegators()]);
-            return {
-                markets: markets,
-                delegators: delegators
-            }
+        static async getContracts(): Promise<Contract[]> {
+            return await Exchange.getContracts();
+        }
+        static async getContract(args: { type?: string }): Promise<Contract> {
+            if (typeof args.type != 'string' || args.type.length == 0)
+                throw new Error('Contract type is required');
+
+            const contract = await Exchange.getContractByType(args.type as ContractType);
+            if (contract == null)
+                throw new Error('Contract not found: ' + args.type);
+
+            return contract;
         }
         static async getOrder(args: { id?: string | number }): Promise<Order> {
             if (typeof args.id != 'string' && typeof args.id != 'number')
@@ -345,27 +367,18 @@ export namespace Router {
             if (!assetIdIn)
                 throw new Error('Asset hash in not found');
 
-            const result: (AssetId & { marketId?: Uint256, liquidity?: BigNumber })[] = await Exchange.getAggregatedPolyAssetIdsByMarket(assetIdIn);
+            const result: (AssetId & { liquidity?: BigNumber })[] = await Exchange.getAggregatedPolyAssetIdsByMarket(assetIdIn);
             if (args.liquidity) {
-                const markets: Record<string, MarketT | null> = { };
-                const accounts: Record<string, Balance[] | null> = { };
-                for (let i = 0; i < result.length; i++) {
-                    const asset = result[i];
-                    let market = markets[asset.marketId?.toString() || ''];
-                    market = (market || !asset.marketId ? market : (markets[asset.marketId?.toString() || ''] = await Exchange.getMarketById(asset.marketId)));
-                    if (market != null && market.account != null) {
-                        let balances = accounts[market.account];
-                        balances = (balances ? balances : (accounts[market.account] = await Account.balancesOf({ id: market.accountId, address: market.account })))
-                        asset.liquidity = balances?.find(x => x.asset.id == asset.id)?.available || new BigNumber(0);
-                    }
+                const dex = await Exchange.getContractByType(ContractType.DEX);
+                if (dex != null && dex.account != null) {
+                    const balances = await Account.balancesOf({ id: dex.accountId, address: dex.account });
+                    for (let i = 0; i < result.length; i++)
+                        result[i].liquidity = balances.find(x => x.asset.id == result[i].id)?.available || new BigNumber(0);
                 }
             }
             return result;
         }
-        static async getPaths(args: { marketId?: string | number, assetHashIn?: string, assetHashOut?: string, amountIn?: BigNumber | string | number, slippage?: BigNumber | string | number }): Promise<RouterPath[]> {
-            if (typeof args.marketId != 'string' && typeof args.marketId != 'number')
-                throw new Error('Market id required');
-
+        static async getPaths(args: { assetHashIn?: string, assetHashOut?: string, amountIn?: BigNumber | string | number, slippage?: BigNumber | string | number }): Promise<RouterPath[]> {
             if (typeof args.assetHashIn != 'string')
                 throw new Error('Asset hash in is required');
 
@@ -393,9 +406,8 @@ export namespace Router {
             const assetIdOut = await Exchange.getAssetIdByHash(new AssetId(args.assetHashOut), 'untrusted');
             if (!assetIdOut)
                 throw new Error('Asset hash out not found');
-                
-            const marketId = new Uint256(args.marketId);
-            return await Exchange.getRoutingPathsByAssetIds(marketId, assetIdIn, assetIdOut, amountIn, slippage, 6);
+
+            return await Exchange.getRoutingPathsByAssetIds(assetIdIn, assetIdOut, amountIn, slippage, 6);
         }
         static async getPrice(args: { primaryAssetHash?: string, secondaryAssetHash?: string, interval?: BigNumber | string | number }): Promise<BigNumber | null> {
             if (typeof args.primaryAssetHash != 'string')
@@ -419,7 +431,7 @@ export namespace Router {
             const price = interval ? await Exchange.getAssetTWAP(primaryAssetId, secondaryAssetId, interval) : await Exchange.getAssetPrice(primaryAssetId, secondaryAssetId);
             return price;
         }
-        static async getPriceHistory(args: { assetHashes: string, interval: BigNumber | string | number, points: BigNumber | string | number }): Promise<Record<string, AssetId & { history: [number, BigNumber][] }>> {      
+        static async getPriceHistory(args: { assetHashes: string, interval: BigNumber | string | number, points: BigNumber | string | number }): Promise<Record<string, AssetId & { history: [number, BigNumber][] }>> {
             const assets = typeof args.assetHashes == 'string' ? args.assetHashes.split(',').map(v => new AssetId(v.toString())) : [];
             if (!Array.isArray(assets) || !assets.length)
                 throw new Error('Asset hashes must be a non-empty array');
@@ -434,35 +446,27 @@ export namespace Router {
 
             return await Exchange.getAssetPriceHistory(assets, interval, points);
         }
-        static async getPair(args: { id?: string | number, primaryAssetHash?: string, secondaryAssetHash?: string, createIfNotExists?: boolean }): Promise<AggregatedPair> {
-            if (typeof args.id != 'string' && typeof args.id != 'number')
-                throw new Error('Market id or account is required');
-
+        static async getPair(args: { primaryAssetHash?: string, secondaryAssetHash?: string, createIfNotExists?: boolean }): Promise<AggregatedPair> {
             if (typeof args.primaryAssetHash != 'string')
                 throw new Error('Primary asset hash is required');
 
             if (typeof args.secondaryAssetHash != 'string')
                 throw new Error('Secondary asset hash is required');
 
-            const marketId = new Uint256(args.id);
             const primaryAssetId = await Exchange.getAssetIdByHash(new AssetId(args.primaryAssetHash), 'untrusted');
             const secondaryAssetId = await Exchange.getAssetIdByHash(new AssetId(args.secondaryAssetHash), 'untrusted');
-            const pairId = await Exchange.getPairByAssetIds(primaryAssetId, secondaryAssetId, marketId, !!args.createIfNotExists);
+            const pairId = await Exchange.getPairByAssetIds(primaryAssetId, secondaryAssetId, !!args.createIfNotExists);
             if (!pairId)
                 throw new Error('Pair is not valid');
 
-            const symbols = await Exchange.getAggregatedPairs(marketId, pairId);
+            const symbols = await Exchange.getAggregatedPairs(pairId);
             if (!symbols.length)
                 throw new Error('Symbol is not valid');
 
             return symbols[0];
         }
-        static async getPairs(args: { id?: string | number }): Promise<AggregatedPair[]> {
-            if (typeof args.id != 'string' && typeof args.id != 'number')
-                throw new Error('Market id is required');
-
-            const marketId = new Uint256(args.id);
-            return await Exchange.getAggregatedPairs(marketId, null);
+        static async getPairs(): Promise<AggregatedPair[]> {
+            return await Exchange.getAggregatedPairs(null);
         }
         static async getPairPriceSeries(args: { pairId?: string | number, interval?: string | number, page?: string | number }, reply?: FastifyReply): Promise<[number, BigNumber, BigNumber, BigNumber, BigNumber, BigNumber][]> {
             const pairId = typeof args.pairId == 'string' || typeof args.pairId == 'number' ? new Uint256(args.pairId) : null;
@@ -488,11 +492,7 @@ export namespace Router {
             }
             return compressedResult as any;
         }
-        static async getPairPriceLevels(args: { marketId?: string | number, pairId?: string | number, levels?: number }): Promise<{ ask: any[], bid: any[] }> {
-            const marketId = typeof args.marketId == 'string' || typeof args.marketId == 'number' ? new Uint256(args.marketId) : null;
-            if (!marketId)
-                throw new Error('Market id is required');
-
+        static async getPairPriceLevels(args: { pairId?: string | number, levels?: number }): Promise<{ ask: any[], bid: any[] }> {
             const pairId = typeof args.pairId == 'string' || typeof args.pairId == 'number' ? new Uint256(args.pairId) : null;
             if (!pairId)
                 throw new Error('Pair id is required');
@@ -501,49 +501,40 @@ export namespace Router {
             if (!levels || levels > 128)
                 throw new Error('Levels must be within (0; 128]')
 
-            const result = await Exchange.getAggregatedLevelsByMarketPair(marketId, pairId, levels);
+            const result = await Exchange.getAggregatedLevelsByPair(pairId, levels);
             return {
-                ask: result.ask.map((v) => v.curve ? [v.id.toInteger(), v.price, v.quantity, v.curve.minPrice, v.curve.maxPrice, v.curve.primaryValue, v.curve.secondaryValue, v.curve.feeRate] : [v.id.toInteger(), v.price, v.quantity]),
-                bid: result.bid.map((v) => v.curve ? [v.id.toInteger(), v.price, v.quantity, v.curve.minPrice, v.curve.maxPrice, v.curve.primaryValue, v.curve.secondaryValue, v.curve.feeRate] : [v.id.toInteger(), v.price, v.quantity]),
+                ask: result.ask.map((v: AggregatedLevel) => v.curve ? [v.id.toInteger(), v.price, v.quantity, v.curve.minPrice, v.curve.maxPrice, v.curve.primaryValue, v.curve.secondaryValue, v.curve.feeRate] : [v.id.toInteger(), v.price, v.quantity]),
+                bid: result.bid.map((v: AggregatedLevel) => v.curve ? [v.id.toInteger(), v.price, v.quantity, v.curve.minPrice, v.curve.maxPrice, v.curve.primaryValue, v.curve.secondaryValue, v.curve.feeRate] : [v.id.toInteger(), v.price, v.quantity]),
             }
         }
-        static async getPairLogs(args: { marketId?: string | number, pairId?: string | number } & PageQuery): Promise<AggregatedLog[]> {
-            const marketId = typeof args.marketId == 'string' || typeof args.marketId == 'number' ? new Uint256(args.marketId) : null;
-            if (!marketId)
-                throw new Error('Market id is required');
-
+        static async getPairLogs(args: { pairId?: string | number } & PageQuery): Promise<AggregatedLog[]> {
             const pairId = typeof args.pairId == 'string' || typeof args.pairId == 'number' ? new Uint256(args.pairId) : null;
             if (!pairId)
                 throw new Error('Pair id is required');
 
-            const result = await Exchange.getAggregatedLogsByMarketPair(marketId, pairId, Cursor.page(args.page || 0));
+            const result = await Exchange.getAggregatedLogsByPair(pairId, Cursor.page(args.page || 0));
             return result;
         }
-        static async getPairPolyAssets(args: { marketId?: string | number, pairId?: string | number }): Promise<{ primary: AssetId[], secondary: AssetId[] }> {
-            const marketId = typeof args.marketId == 'string' || typeof args.marketId == 'number' ? new Uint256(args.marketId) : null;
-            if (!marketId)
-                throw new Error('Market id is required');
-
+        static async getPairPolyAssets(args: { pairId?: string | number }): Promise<{ primary: AssetId[], secondary: AssetId[] }> {
             const pairId = typeof args.pairId == 'string' || typeof args.pairId == 'number' ? new Uint256(args.pairId) : null;
             if (!pairId)
                 throw new Error('Pair id is required');
-
-            const result = await Exchange.getAggregatedPolyAssetIdsByMarketPair(marketId, pairId);
-            return result;
+            return await Exchange.getAggregatedPolyAssetIdsByPair(pairId);
         }
-        static async get(args: { id?: string | number, accountId?: string | number }): Promise<Market> {
+        static async get(args: { id?: string | number, accountId?: string | number }): Promise<Contract> {
+            const contracts = await Exchange.getContracts();
             if (typeof args.id == 'string' || typeof args.id == 'number') {
                 const id = new Uint256(args.id);
-                const result = await Exchange.getMarketById(id);
+                const result = contracts.find(v => v.id.eq(id));
                 if (result != null)
                     return result;
             } else if (typeof args.accountId == 'string' || typeof args.accountId == 'number') {
                 const id = new Uint256(args.accountId);
-                const result = await Exchange.getMarketByAccountId(id);
+                const result = contracts.find(v => v.accountId.eq(id));
                 if (result != null)
                     return result;
             }
-            throw new Error('Market not found');
+            throw new Error('Contract not found');
         }
     }
 
@@ -565,18 +556,14 @@ export namespace Router {
             const result = await this.balancesOf(account);
             return result;
         }
-        static async getTiers(args: { marketId?: string | number, pairId?: string | number } & AccountQuery): Promise<{ primary: { volume: BigNumber | null, makerFee: BigNumber | null, takerFee: BigNumber | null }, secondary: { volume: BigNumber | null, makerFee: BigNumber | null, takerFee: BigNumber | null } }> {
-            const marketId = typeof args.marketId == 'string' || typeof args.marketId == 'number' ? new Uint256(args.marketId) : null;
-            if (!marketId)
-                throw new Error('Market id is required');
-            
+        static async getTiers(args: { pairId?: string | number } & AccountQuery): Promise<{ primary: { volume: BigNumber | null, makerFee: BigNumber | null, takerFee: BigNumber | null }, secondary: { volume: BigNumber | null, makerFee: BigNumber | null, takerFee: BigNumber | null } }> {
             const pairId = typeof args.pairId == 'string' || typeof args.pairId == 'number' ? new Uint256(args.pairId) : null;
             if (!pairId)
                 throw new Error('Pair id is required');
 
-            const market = await Exchange.getMarketById(marketId);
-            if (!market || !market.account)
-                throw new Error('Not a valid market');
+            const dex = await Exchange.getContractByType(ContractType.DEX);
+            if (!dex || !dex.account)
+                throw new Error('Not a valid dex contract');
 
             const pair = await Exchange.getPairById(pairId);
             if (!pair || !pair.primaryAsset || !pair.secondaryAsset)
@@ -587,22 +574,22 @@ export namespace Router {
                 throw new Error('Not a valid account');
 
             const fetchAccountTier = async (asset: AssetId, assetId: Uint256) => {
-                const currentTier = await Blockchain.call(market.account || '', UiUtil.toFunction(Spot.DEX.accountAssetOf), [account.address, ['$uint256', asset.toHex()]]);
-                await Exchange.setSyncedAccountTierByAccountIdAndMarketAsset(account.id, marketId, assetId, new BigNumber(currentTier.account?.volume?.toString() || ''), new BigNumber(currentTier.maker_fee?.toString() || ''), new BigNumber(currentTier.taker_fee?.toString() || ''));
+                const currentTier = await Blockchain.call(dex.account || '', UiUtil.toFunction(Spot.DEX.accountAssetOf), [account.address, ['$uint256', asset.toHex()]]);
+                await Exchange.setSyncedAccountTierByAccountIdAndAsset(account.id, assetId, new BigNumber(currentTier.account?.volume?.toString() || ''), new BigNumber(currentTier.maker_fee?.toString() || ''), new BigNumber(currentTier.taker_fee?.toString() || ''));
             };
 
-            let syncedPrimaryTier = await Exchange.getSyncedAccountTierByAccountIdAndMarketAsset(account.id, marketId, pair.primaryAsset.id);
+            let syncedPrimaryTier = await Exchange.getSyncedAccountTierByAccountIdAndAsset(account.id, pair.primaryAsset.id);
             if (!syncedPrimaryTier) {
                 await fetchAccountTier(pair.primaryAsset.hash, pair.primaryAsset.id);
-                syncedPrimaryTier = await Exchange.getSyncedAccountTierByAccountIdAndMarketAsset(account.id, marketId, pair.primaryAsset.id);
+                syncedPrimaryTier = await Exchange.getSyncedAccountTierByAccountIdAndAsset(account.id, pair.primaryAsset.id);
             }
-            
-            let syncedSecondaryTier = await Exchange.getSyncedAccountTierByAccountIdAndMarketAsset(account.id, marketId, pair.secondaryAsset.id);
+
+            let syncedSecondaryTier = await Exchange.getSyncedAccountTierByAccountIdAndAsset(account.id, pair.secondaryAsset.id);
             if (!syncedSecondaryTier) {
                 await fetchAccountTier(pair.secondaryAsset.hash, pair.secondaryAsset.id);
-                syncedSecondaryTier = await Exchange.getSyncedAccountTierByAccountIdAndMarketAsset(account.id, marketId, pair.secondaryAsset.id);
+                syncedSecondaryTier = await Exchange.getSyncedAccountTierByAccountIdAndAsset(account.id, pair.secondaryAsset.id);
             }
-            
+
             return {
                 primary: {
                     volume: syncedPrimaryTier?.volume || null,
@@ -616,43 +603,40 @@ export namespace Router {
                 }
             };
         }
-        static async getOrders(args: { marketId?: string | number, pairId?: string | number, active?: boolean } & AccountQuery & PageQuery): Promise<Order[]> {
+        static async getOrders(args: { pairId?: string | number, active?: boolean } & AccountQuery & PageQuery): Promise<Order[]> {
             const filter = typeof args.active == 'boolean' ? args.active : null;
             const account = await this.accountOf(args);
             if (!account)
                 return [];
 
-            const marketId = typeof args.marketId == 'string' || typeof args.marketId == 'number' ? new Uint256(args.marketId) : null;
             const pairId = typeof args.pairId == 'string' || typeof args.pairId == 'number' ? new Uint256(args.pairId) : null;
-            if (marketId != null && pairId != null)
-                return await Exchange.getOrdersByAccountIdAndMarketPair(account.id, marketId, pairId, filter, Cursor.page(args.page || 0));
+            if (pairId != null)
+                return await Exchange.getOrdersByAccountIdAndPair(account.id, pairId, filter, Cursor.page(args.page || 0));
 
             return await Exchange.getOrdersByAccountId(account.id, filter, Cursor.page(args.page || 0));
         }
-        static async getPools(args: { marketId?: string | number, pairId?: string | number, active?: boolean } & AccountQuery & PageQuery): Promise<Pool[]> {
+        static async getPools(args: { pairId?: string | number, active?: boolean } & AccountQuery & PageQuery): Promise<Pool[]> {
             const filter = typeof args.active == 'boolean' ? args.active : null;
             const account = await this.accountOf(args);
             if (!account)
                 return [];
 
-            const marketId = typeof args.marketId == 'string' || typeof args.marketId == 'number' ? new Uint256(args.marketId) : null;
             const pairId = typeof args.pairId == 'string' || typeof args.pairId == 'number' ? new Uint256(args.pairId) : null;
-            if (marketId != null && pairId != null)
-                return await Exchange.getPoolsByAccountIdAndMarketPair(account.id, marketId, pairId, filter, Cursor.page(args.page || 0));
+            if (pairId != null)
+                return await Exchange.getPoolsByAccountIdAndPair(account.id, pairId, filter, Cursor.page(args.page || 0));
 
             return await Exchange.getPoolsByAccountId(account.id, filter, Cursor.page(args.page || 0));
         }
-        static async getDelegatedPools(args: { marketId?: string | number, pairId?: string | number, active?: boolean } & AccountQuery & PageQuery): Promise<DelegatedPool[]> {
+        static async getDelegatedPools(args: { pairId?: string | number, active?: boolean } & AccountQuery & PageQuery): Promise<DelegatedPool[]> {
             const filter = typeof args.active == 'boolean' ? args.active : null;
             const account = await this.accountOf(args);
             if (!account)
                 return [];
 
             const cursor = Cursor.page(args.page || 0);
-            const marketId = typeof args.marketId == 'string' || typeof args.marketId == 'number' ? new Uint256(args.marketId) : null;
             const pairId = typeof args.pairId == 'string' || typeof args.pairId == 'number' ? new Uint256(args.pairId) : null;
-            const marketPair = marketId != null && pairId != null;
-            return await (marketPair ? Exchange.getDelegatedPoolsByAccountIdAndMarketPair(account.id, marketId, pairId, filter, cursor) : Exchange.getDelegatedPoolsByAccountId(account.id, filter, cursor));
+            const withPair = pairId != null;
+            return await (withPair ? Exchange.getDelegatedPoolsByAccountIdAndPair(account.id, pairId, filter, cursor) : Exchange.getDelegatedPoolsByAccountId(account.id, filter, cursor));
         }
         static async getDelegations(args: AccountQuery): Promise<PseudoDelegatedState[]> {
             const account = await this.accountOf(args);
@@ -663,9 +647,9 @@ export namespace Router {
         }
         static async get(args: AccountQuery): Promise<{ id: number, account: string }> {
             const account = await this.accountOf(args);
-            if (!account) 
+            if (!account)
                 throw new Error('Account not found');
-            
+
             return { id: account.id.toInteger(), account: account.address };
         }
         private static async accountOf(args: AccountQuery): Promise<{ id: Uint256, address: string, resync: boolean } | null> {
@@ -692,6 +676,654 @@ export namespace Router {
                 });
             }
             return syncedBalances || [];
+        }
+    }
+
+    export class Swaps {
+        constructor(server: FastifyInstance) {
+            Channel.register(server, 'get', '/swaps', Swaps, Swaps.getBooking);
+            Channel.register(server, 'get', '/swaps/history', Swaps, Swaps.getHistory);
+            Channel.register(server, 'post', '/swaps', Swaps, Swaps.book);
+            Channel.register(server, 'post', '/swaps/spend', Swaps, Swaps.spend);
+            Channel.register(server, 'post', '/swaps/preview', Swaps, Swaps.preview);
+            Channel.register(server, 'post', '/swaps/respend', Swaps, Swaps.respend);
+        }
+        private static sequencer(): Sequencer {
+            const sequencer = Exchange.sequencer;
+            if (sequencer == null)
+                throw new Error('Signer is not configured; the exchange cannot execute swap requests');
+            return sequencer;
+        }
+        private static async contract(): Promise<Contract<AmsParameters>> {
+            const contract = await Exchange.getAmsContract();
+            if (contract == null)
+                throw new Error('AMS contract is not registered');
+
+            return contract;
+        }
+        private static rawBytesToHex(value: unknown): string | null {
+            if (typeof value == 'string') {
+                if (value.startsWith('0x') || value.startsWith('0X'))
+                    return value.toLowerCase();
+
+                if (/^[0-9a-fA-F]+$/.test(value))
+                    return '0x' + value.toLowerCase();
+
+                if (value.length > 0 && value.length < 0x100 && [...value].every((x) => x.charCodeAt(0) < 0x100))
+                    return ByteUtil.uint8ArrayToHexString(ByteUtil.byteStringToUint8Array(value)).toLowerCase();
+            } else if (value instanceof Uint8Array)
+                return ByteUtil.uint8ArrayToHexString(value).toLowerCase();
+
+            return null;
+        }
+        private static normalizePublicKey(value: unknown): string | null {
+            const hex = this.rawBytesToHex(value);
+            if (hex == null || hex.length != 2 + 33 * 2)
+                return null;
+
+            const prefix = hex.substring(2, 4);
+            if (prefix != '02' && prefix != '03')
+                return null;
+
+            return hex;
+        }
+        private static normalizeSignature(value: unknown): string | null {
+            const hex = this.rawBytesToHex(value);
+            if (hex == null || hex.length != 2 + Chain.size.HASHSIG * 2)
+                return null;
+
+            return hex;
+        }
+        private static recoverSigner(hash: Uint256, signatureHex: string): string | null {
+            try {
+                const data = ByteUtil.hexStringToUint8Array(signatureHex);
+                if (data.length != Chain.size.HASHSIG)
+                    return null;
+
+                const signature = new Hashsig();
+                signature.data = data;
+                const recovered = Signing.recover(hash, signature);
+                return recovered ? ByteUtil.uint8ArrayToHexString(recovered.data).toLowerCase() : null;
+            } catch {
+                return null;
+            }
+        }
+        private static swapFrom(raw: unknown): BookingSwap {
+            if (raw == null || typeof raw != 'object' || Array.isArray(raw))
+                throw new Error('swap leg must be an object');
+
+            const decimal = (value: unknown, name: string): BigNumber => {
+                if (typeof value != 'string' && typeof value != 'number' && !BigNumber.isBigNumber(value))
+                    throw new Error(name + ' must be a decimal number');
+
+                const result = new BigNumber(value);
+                if (!result.isFinite())
+                    throw new Error(name + ' is not a finite number');
+
+                return result;
+            };
+
+            const source = raw as Record<string, unknown>;
+            const symbol = source.symbol == null ? '' : String(source.symbol);
+            if (typeof source.asset != 'string' && typeof source.asset != 'number' && !(source.asset instanceof Uint8Array))
+                throw new Error('swap leg asset must be an asset id (hex, decimal, or handle)');
+
+            const asset = new AssetId(source.asset);
+            if (!asset.isValid())
+                throw new Error('swap leg asset is not a valid asset id');
+
+            const price = decimal(source.price, 'swap leg price');
+            if (!price.gt(0))
+                throw new Error('swap leg price must be positive');
+
+            const amount = decimal(source.amount, 'swap leg amount');
+            if (!amount.gt(0))
+                throw new Error('swap leg amount must be positive');
+
+            const slippage = decimal(source.slippage, 'swap leg slippage');
+            if (slippage.lt(0) || slippage.gte(1))
+                throw new Error('swap leg slippage must be within [0; 1) range');
+
+            return { symbol, asset, price, amount, slippage, buying: source.buying === true };
+        }
+        private static writeAddress(message: Stream, address: string): void {
+            const decoded = Signing.decodeAddress(address);
+            if (!decoded)
+                throw new Error('invalid address: ' + address);
+
+            message.writeBinaryStringOptimized(decoded.data);
+        }
+        private static encodeSpendMessage(params: SpendMessageParams): Uint8Array {
+            const message = new Stream();
+            message.writeInteger(params.depositHash);
+            message.writeInteger(params.bridgeHash);
+            message.writeInteger(params.inputAsset.toUint256());
+            message.writeDecimal(params.inputAmount, true);
+            this.writeAddress(message, params.contractAddress);
+            this.writeAddress(message, params.sequencerAddress);
+            message.writeString(params.routingAddress);
+            message.writeInteger(params.tokenPath.length + params.feePath.length);
+            for (let order of params.tokenPath.concat(params.feePath)) {
+                message.writeString(order.symbol);
+                message.writeInteger(order.asset.toUint256());
+                message.writeDecimal(order.price);
+                message.writeDecimal(order.amount);
+                message.writeDecimal(order.slippage);
+                message.writeBoolean(order.buying);
+            }
+
+            return message.data;
+        }
+        private static encodeRespendMessage(params: RespendMessageParams): Uint8Array {
+            const message = new Stream();
+            message.writeInteger(params.depositHash);
+            message.writeInteger(params.broadcastHash);
+            message.writeInteger(params.bridgeHash);
+            message.writeInteger(params.asset.toUint256());
+            message.writeDecimal(params.amount, true);
+            this.writeAddress(message, params.contractAddress);
+            this.writeAddress(message, params.sequencerAddress);
+            message.writeString(params.routingAddress);
+            return message.data;
+        }
+        private static async constCall(contractAccount: string, method: string, args: unknown[]): Promise<unknown> {
+            const receipt = await RPC.callTransaction(new AssetId(), Exchange.sequencer?.address ?? '', contractAccount, method, args);
+            if (receipt == null)
+                throw new Error(`constant call ${method} returned no receipt`);
+
+            return receipt.result;
+        }
+        private static buildCall(options: SwapExecution, nonce: Uint256, gasPrice: BigNumber, gasLimit: Uint256): Stream {
+            const transaction = {
+                signature: new Hashsig(),
+                asset: new AssetId(),
+                nonce: nonce,
+                gasPrice: gasPrice,
+                gasLimit: gasLimit,
+                callable: Signing.decodeAddress(options.contractAccount),
+                pays: [],
+                function: (options.bridgeSend === true ? '^' : '') + UiUtil.toFunction(options.contractFunction),
+                args: options.args
+            };
+
+            let stream = new Stream();
+            SchemaUtil.store(stream, transaction, Messages.asSigningSchema(new Transactions.Call()));
+
+            const sequencer = this.sequencer();
+            const signature = Signing.sign(stream.hash(), sequencer.secretKey);
+            if (!signature)
+                throw new Error('failed to sign a transaction');
+
+            stream = new Stream();
+            SchemaUtil.store(stream, { ...transaction, signature: signature }, new Transactions.Call());
+            return stream;
+        }
+        private static nonceCache: { address: string, value: Uint256, time: number } | null = null;
+        private static gasPriceCache: { value: BigNumber, time: number } | null = null;
+        private static async sequencerNonce(): Promise<Uint256> {
+            const sequencer = this.sequencer();
+            if (this.nonceCache == null || this.nonceCache.address != sequencer.address || Date.now() - this.nonceCache.time > 60_000)
+                this.nonceCache = { address: sequencer.address, value: new Uint256((await RPC.getNextAccountNonce(sequencer.address))?.toString()), time: Date.now() };
+
+            return this.nonceCache.value;
+        }
+        private static async sequencerGasPrice(): Promise<BigNumber> {
+            if (this.gasPriceCache == null || Date.now() - this.gasPriceCache.time > 15_000)
+                this.gasPriceCache = { value: new BigNumber((await RPC.getGasPrice(new AssetId(), 0.95))?.price.toString() || 0), time: Date.now() };
+
+            return this.gasPriceCache.value;
+        }
+        private static invalidateCaches(): void {
+            this.nonceCache = null;
+            this.gasPriceCache = null;
+        }
+        private static nextBlockSignal(): Promise<void> {
+            return new Promise((resolve) => {
+                const off = Blockchain.addBlockListener(() => {
+                    off();
+                    resolve();
+                });
+                setTimeout(() => {
+                    off();
+                    resolve();
+                }, 2_000);
+            });
+        }
+        private static async execute(options: SwapExecution): Promise<string | null> {
+            const sequencer = this.sequencer();
+            const nonce = await this.sequencerNonce();
+            const gasPrice = await this.sequencerGasPrice();
+            if (sequencer.maxGasPrice != null && gasPrice.gt(sequencer.maxGasPrice))
+                throw new Error(`gas price ${gasPrice.toString()} exceeds policy cap ${sequencer.maxGasPrice}`);
+
+            const build = (gasLimit: Uint256): Stream => this.buildCall(options, nonce, gasPrice, gasLimit);
+            const simulation = build(new Uint256(1_000_000));
+            try {
+                const receipt = await RPC.simulateTransaction(simulation.encode());
+                const gasLimit = new Uint256(receipt?.relative_gas_use?.toString() || 0);
+                if (!receipt?.successful)
+                    throw new Error(`${options.describe} rejected by simulation: ${JSON.stringify(receipt?.message ?? receipt?.error ?? 'unknown simulation error')}`);
+
+                if (!gasLimit.gt(0))
+                    throw new Error('failed to simulate transaction');
+
+                if (sequencer.simulation) {
+                    Log.info(`${options.describe} simulated (gas: ${gasLimit.toString()}): ${JSON.stringify(receipt, null, 2)}`);
+                    return null;
+                }
+
+                const transactionHash = await RPC.submitTransaction(build(gasLimit).encode());
+                if (!transactionHash)
+                    throw new Error('failed to submit transaction');
+
+                if (this.nonceCache != null && this.nonceCache.address == sequencer.address)
+                    this.nonceCache = { address: sequencer.address, value: this.nonceCache.value.add(1), time: Date.now() };
+
+                const deadline = Date.now() + sequencer.confirmTimeout * 1_000;
+                while (true) {
+                    await this.nextBlockSignal();
+                    let confirmation: unknown = null;
+                    try {
+                        confirmation = await RPC.getTransactionByHash(transactionHash);
+                    } catch {
+                        confirmation = null;
+                    }
+
+                    if (confirmation)
+                        break;
+
+                    if (Date.now() >= deadline)
+                        throw new Error(`transaction ${transactionHash} not confirmed within ${sequencer.confirmTimeout}s`);
+                }
+
+                Log.info(`${options.describe} finalized (tx: ${transactionHash})`);
+                return transactionHash;
+            } catch (exception) {
+                this.invalidateCaches();
+                Log.info('TX message:', simulation.encode());
+                throw exception;
+            }
+        }
+        private static async spendContext(args: Record<string, any>): Promise<{ booking: Booking, contract: Contract<AmsParameters>, signature: string, callArgs: unknown[] }> {
+            const sequencer = this.sequencer();
+            const depositHash = Common.u256(args.depositHash);
+            if (depositHash == null)
+                throw new Error('Deposit hash is required');
+
+            const booking = await Exchange.getBookingByDepositHash(depositHash);
+            if (booking == null)
+                throw new Error('Deposit does not match a booking (multi-asset payment or unknown booking)');
+
+            if (booking.depositBlock == null)
+                throw new Error('Deposit is not mined yet');
+
+            const contract = await this.contract();
+
+            const bridgeHash = Common.u256(args.bridgeHash);
+            if (bridgeHash == null || bridgeHash.compareTo(new Uint256()) <= 0)
+                throw new Error('Bridge hash must be set');
+
+            if (typeof args.routingAddress != 'string' || args.routingAddress.length < 1)
+                throw new Error('Routing address is required');
+
+            const parsePath = (raw: unknown, name: string): BookingSwap[] => {
+                if (raw == null)
+                    return [];
+
+                if (!Array.isArray(raw))
+                    throw new Error(name + ' must be an array');
+
+                return raw.map((leg) => this.swapFrom(leg));
+            };
+
+            const tokenPath = parsePath(args.tokenPath, 'Token path');
+            const feePath = parsePath(args.feePath, 'Fee path');
+            for (let i = 0; i < tokenPath.length; i++) {
+                const previous = i == 0 ? booking.asset : tokenPath[i - 1].asset;
+                if (tokenPath[i].asset.equals(previous))
+                    throw new Error(`token path leg ${i} swaps an asset into itself`);
+            }
+
+            const finalAsset = tokenPath.length > 0 ? tokenPath[tokenPath.length - 1].asset : booking.asset;
+            const baseAsset = AssetId.fromHandle(finalAsset.chain || Chain.policy.TOKEN_NAME);
+            if (finalAsset.equals(baseAsset)) {
+                if (feePath.length > 0)
+                    throw new Error('fee path must be empty when the output asset is already the network base asset');
+            } else if (feePath.length == 0)
+                throw new Error('fee path is required when the output asset differs from the network base asset');
+
+            if (feePath.length > 0 && !feePath[feePath.length - 1].asset.equals(baseAsset))
+                throw new Error(`fee path must end at the network base asset (${baseAsset.id})`);
+
+            const signature = this.normalizeSignature(args.signature);
+            if (signature == null)
+                throw new Error('Signature must be a 65-byte recoverable signature');
+
+            const message = this.encodeSpendMessage({
+                depositHash: depositHash,
+                bridgeHash: bridgeHash,
+                inputAsset: booking.asset,
+                inputAmount: booking.amount,
+                contractAddress: contract.account || '',
+                sequencerAddress: sequencer.address,
+                routingAddress: args.routingAddress,
+                tokenPath: tokenPath,
+                feePath: feePath
+            });
+            const signer = this.recoverSigner(new Uint256(Hashing.hash256(message)), signature);
+            const expected = this.normalizePublicKey(booking.publicKey);
+            if (signer == null || expected == null || signer != expected)
+                throw new Error('Spend signature does not match the booking public key');
+
+            const top = await Exchange.getLatestBlock();
+            if (top == null)
+                throw new Error('Blockchain is not synced yet');
+
+            if (top.blockNumber - booking.depositBlock > contract.parameters.bookValidityBlocks)
+                throw new Error('Deposit transaction has timed out');
+
+            if (top.blockNumber > booking.expiresBlock)
+                throw new Error('Booking has expired');
+
+            if (await this.constCall(contract.account || '', Spot.AMS.bookingAlive, [booking.asset.toUint256(), booking.amount]) !== true)
+                throw new Error('Booking is not alive on-chain (expired or spent)');
+
+            const encodePath = (path: BookingSwap[]): string => {
+                const stream = new Stream();
+                stream.writeInteger(path.length);
+                for (let order of path) {
+                    stream.writeString(order.symbol);
+                    stream.writeInteger(order.asset.toUint256());
+                    stream.writeDecimal(order.price);
+                    stream.writeDecimal(order.amount);
+                    stream.writeDecimal(order.slippage);
+                    stream.writeBoolean(order.buying);
+                }
+
+                return stream.encode();
+            };
+
+            return {
+                booking: booking,
+                contract: contract,
+                signature: signature,
+                callArgs: [depositHash, bridgeHash, args.routingAddress, encodePath(tokenPath), encodePath(feePath), ByteUtil.hexStringToUint8Array(signature)]
+            };
+        }
+        static async getBooking(args: Record<string, any>): Promise<Booking> {
+            const contract = await this.contract();
+            if (args.id != null) {
+                const id = Common.u256(args.id);
+                if (id == null)
+                    throw new Error('Booking id is not a valid id');
+
+                const booking = await Exchange.getBookingById(id);
+                if (booking == null)
+                    throw new Error('Booking not found');
+
+                return booking;
+            }
+
+            if (typeof args.asset != 'string' && typeof args.asset != 'number')
+                throw new Error('Asset is required');
+
+            const asset = new AssetId(args.asset);
+            if (!asset.isValid())
+                throw new Error('Asset is not a valid asset id');
+
+            const assetId = await Exchange.getAssetIdByHash(asset, 'trusted');
+            if (assetId == null)
+                throw new Error('Asset not found: ' + asset.id);
+
+            const amount = Common.bn(args.amount);
+            if (amount == null || !amount.gt(0))
+                throw new Error('Amount must be a positive decimal');
+
+            const booking = await Exchange.getBookingByHandle(assetId, amount.decimalPlaces(contract.parameters.depositPrecision ?? 6, BigNumber.ROUND_DOWN), null);
+            if (booking == null)
+                throw new Error('Booking not found');
+
+            return booking;
+        }
+        static async getHistory(args: PageQuery & { publicKey?: unknown, publicKeys?: unknown, status?: unknown }): Promise<Booking[]> {
+            const raw = args.publicKeys == null ? [] : (Array.isArray(args.publicKeys) ? args.publicKeys : [args.publicKeys]);
+            if (args.publicKey != null)
+                raw.push(args.publicKey);
+
+            const keys: string[] = [];
+            for (const value of raw) {
+                const key = this.normalizePublicKey(value);
+                if (key == null)
+                    throw new Error('Public key filter must be a valid compressed secp256k1 point (epoint264, 0x hex)');
+                if (!keys.includes(key))
+                    keys.push(key);
+            }
+
+            const rawStatuses = args.status == null ? [] : (Array.isArray(args.status) ? args.status : [args.status]);
+            const statuses: string[] = [];
+            for (const value of rawStatuses) {
+                const status = typeof value == 'string' ? value : null;
+                if (status == null || !Object.values(BookingStatus).includes(status as BookingStatus))
+                    throw new Error('Status filter must be a known booking status');
+                if (!statuses.includes(status))
+                    statuses.push(status);
+            }
+
+            return await Exchange.getBookings(Cursor.page(args.page || 0), keys.length > 0 ? keys : null, statuses.length > 0 ? statuses : null);
+        }
+        static async book(args: { contract?: string, asset?: string | number, amount?: string | number, publicKey?: string }): Promise<SwapReference> {
+            const contract = await this.contract();
+            this.sequencer();
+            if (typeof args.asset != 'string' && typeof args.asset != 'number')
+                throw new Error('Asset is required');
+
+            let asset: AssetId;
+            try {
+                asset = new AssetId(args.asset);
+            } catch {
+                throw new Error('Asset is not a valid asset id');
+            }
+            if (!asset.isValid())
+                throw new Error('Asset is not a valid asset id');
+
+            const assetId = await Exchange.getAssetIdByHash(asset, 'trusted');
+            if (assetId == null)
+                throw new Error('Asset not found: ' + asset.id);
+
+            let amount = Common.bn(args.amount);
+            if (amount == null || !amount.gt(0))
+                throw new Error('Amount must be a positive decimal');
+            
+            const precision = contract.parameters.depositPrecision ?? 6;
+            amount = amount.decimalPlaces(precision, BigNumber.ROUND_DOWN);
+            if (amount == null || !amount.gt(0))
+                throw new Error(`Amount is too small to book: it truncates to zero at ${precision} decimals`);
+
+            const publicKey = this.normalizePublicKey(args.publicKey);
+            if (publicKey == null)
+                throw new Error('Public key must be a valid compressed secp256k1 point (epoint264, 0x hex)');
+
+            const openStatuses = Object.values(BookingStatus).filter((v) => v != BookingStatus.Finalized && v != BookingStatus.Expired);
+            const tick = new BigNumber(10).pow(-precision);
+            let reserved = false;
+            for (let attempt = 0; attempt < 8 && !reserved; attempt++) {
+                const taken = await Exchange.getBookingByHandle(assetId, amount, openStatuses);
+                if (taken == null) {
+                    reserved = true;
+                    break;
+                }
+                amount = amount.minus(tick);
+                if (!amount.gt(0))
+                    break;
+            }
+            if (!reserved)
+                throw new Error('Could not reserve a unique amount for this asset');
+
+            const transaction = await Exchange.withExclusiveLock(() => this.execute({
+                contractAccount: contract.account || '',
+                contractFunction: Spot.AMS.bookDeposit,
+                args: [asset.toUint256(), amount, ByteUtil.hexStringToUint8Array(publicKey)],
+                describe: `book ${asset.id} ${amount.toString()} @ ${contract.account}`
+            }));
+
+            return { transaction: transaction, amount: amount.toString() };
+        }
+        static async spend(args: { depositHash?: string, bridgeHash?: string, routingAddress?: string, tokenPath?: unknown, feePath?: unknown, signature?: string }): Promise<SwapReference> {
+            const context = await this.spendContext(args);
+            const depositHash = Common.u256(args.depositHash)!, contract = context.contract;
+            const routing = String(args.routingAddress);
+            const transaction = await Exchange.withExclusiveLock(async () => {
+                const liveBooking = await Exchange.getBookingById(context.booking.id);
+                if (liveBooking == null || liveBooking.status != BookingStatus.AwaitingExecution)
+                    throw new Error('Booking is no longer awaiting execution');
+
+                if (liveBooking.depositBlock == null)
+                    throw new Error('Deposit is not mined yet');
+
+                const top = await Exchange.getLatestBlock();
+                if (top != null && contract.parameters.bookValidityBlocks > 0 && top.blockNumber - liveBooking.depositBlock > contract.parameters.bookValidityBlocks)
+                    throw new Error('Deposit transaction has timed out');
+
+                if (top != null && top.blockNumber > liveBooking.expiresBlock)
+                    throw new Error('Booking has expired');
+
+                if (await this.constCall(contract.account || '', Spot.AMS.bookingAlive, [liveBooking.asset.toUint256(), liveBooking.amount]) !== true)
+                    throw new Error('Booking is not alive on-chain (expired or spent)');
+
+                return await this.execute({
+                    contractAccount: contract.account || '',
+                    contractFunction: Spot.AMS.spendDeposit,
+                    args: context.callArgs,
+                    describe: `spend ${depositHash.toHex()} @ ${contract.account}`,
+                    bridgeSend: true
+                });
+            });
+
+            await Exchange.setBookingRouting(context.booking.id, routing);
+            return { transaction: transaction };
+        }
+        static async preview(args: { depositHash?: string, bridgeHash?: string, routingAddress?: string, tokenPath?: unknown, feePath?: unknown, signature?: string }): Promise<{ successful: boolean, gas: string | null, outAsset: string | null, outAmount: string | null, error: string | null }> {
+            const fail = (message: string) => ({ successful: false, gas: null, outAsset: null, outAmount: null, error: message });
+            try {
+                const context = await this.spendContext(args);
+                const nonce = await this.sequencerNonce();
+                const gasPrice = await this.sequencerGasPrice();
+                const stream = this.buildCall({
+                    contractAccount: context.contract.account || '',
+                    contractFunction: Spot.AMS.spendDeposit,
+                    args: context.callArgs,
+                    describe: `preview spend ${args.depositHash} @ ${context.contract.account}`,
+                    bridgeSend: true
+                }, nonce, gasPrice, new Uint256(1_000_000));
+
+                const receipt = await RPC.simulateTransaction(stream.encode());
+                if (receipt == null)
+                    return fail('Simulation returned no receipt');
+
+                if (!receipt.successful)
+                    return fail(`Rejected by simulation: ${String(receipt.message ?? receipt.error ?? 'unknown simulation error')}`);
+
+                const events: any[] = Array.isArray(receipt.events) ? receipt.events : [];
+                const swapRef = events.find((event: any) => event.event == Spot.AMS.Events.SwapRef && Array.isArray(event.args) && event.args.length >= 4);
+                const outAmount = swapRef != null ? Common.bn(swapRef.args[3]) : null;
+                return {
+                    successful: true,
+                    gas: receipt.relative_gas_use?.toString() ?? null,
+                    outAsset: swapRef != null ? String(swapRef.args[2]) : null,
+                    outAmount: outAmount != null ? outAmount.toString() : null,
+                    error: null
+                };
+            } catch (exception: any) {
+                return fail(String(exception?.message ?? exception));
+            }
+        }
+        static async respend(args: { depositHash?: string, broadcastHash?: string, bridgeHash?: string, routingAddress?: string, signature?: string }): Promise<SwapReference> {
+            const sequencer = this.sequencer();
+            const depositHash = Common.u256(args.depositHash);
+            if (depositHash == null)
+                throw new Error('Deposit hash is required');
+
+            const booking = await Exchange.getBookingByDepositHash(depositHash);
+            if (booking == null)
+                throw new Error('Deposit does not match a booking');
+
+            if (booking.status != BookingStatus.FailingWithdrawal)
+                throw new Error(`Booking status (${booking.status}) does not accept a respend request`);
+
+            const contract = await this.contract();
+
+            const broadcastHash = Common.u256(args.broadcastHash);
+            if (broadcastHash == null)
+                throw new Error('Broadcast hash is required');
+
+            if (booking.broadcastHash != null && booking.broadcastHash != broadcastHash.toHex())
+                throw new Error('Broadcast hash does not match the recorded failing withdrawal attempt');
+
+            const bridgeHash = Common.u256(args.bridgeHash);
+            if (bridgeHash == null || bridgeHash.compareTo(new Uint256()) <= 0)
+                throw new Error('Bridge hash must be set');
+
+            if (typeof args.routingAddress != 'string' || args.routingAddress.length < 1)
+                throw new Error('Routing address is required');
+
+            if (booking.outAsset == null || booking.outAmount == null)
+                throw new Error('Booking has no recorded swap output to respend');
+
+            const signature = this.normalizeSignature(args.signature);
+            if (signature == null)
+                throw new Error('Signature must be a 65-byte recoverable signature');
+
+            const message = this.encodeRespendMessage({
+                depositHash: depositHash,
+                broadcastHash: broadcastHash,
+                bridgeHash: bridgeHash,
+                asset: booking.outAsset,
+                amount: booking.outAmount.decimalPlaces(contract.parameters.depositPrecision ?? 6, BigNumber.ROUND_DOWN),
+                contractAddress: contract.account || '',
+                sequencerAddress: sequencer.address,
+                routingAddress: args.routingAddress
+            });
+            const signer = this.recoverSigner(new Uint256(Hashing.hash256(message)), signature);
+            const expected = this.normalizePublicKey(booking.publicKey);
+            if (signer == null || expected == null || signer != expected)
+                throw new Error('Respend signature does not match the booking public key');
+
+            if (booking.bridgeHash != null && booking.bridgeHash != bridgeHash.toHex())
+                Log.info(`ams respend: bridge hash changed (${booking.bridgeHash} -> ${bridgeHash.toHex()}); fee-rise rule enforced by contract simulation at submission time`);
+
+            const routing = args.routingAddress;
+            const transaction = await Exchange.withExclusiveLock(async () => {
+                const liveBooking = await Exchange.getBookingById(booking.id);
+                if (liveBooking == null || liveBooking.status != BookingStatus.FailingWithdrawal)
+                    throw new Error('Booking is no longer a failing withdrawal');
+
+                if (liveBooking.broadcastHash != null && liveBooking.broadcastHash != broadcastHash.toHex())
+                    throw new Error('Broadcast hash does not match the recorded failing withdrawal attempt');
+
+                const top = await Exchange.getLatestBlock();
+                if (top != null && top.blockNumber > liveBooking.expiresBlock)
+                    throw new Error('Booking has expired');
+
+                if (await this.constCall(contract.account || '', Spot.AMS.depositSpent, [depositHash]) !== true)
+                    throw new Error('Deposit is not spent on-chain; nothing to respend');
+
+                return await this.execute({
+                    contractAccount: contract.account || '',
+                    contractFunction: Spot.AMS.respendDeposit,
+                    args: [
+                        depositHash,
+                        broadcastHash,
+                        bridgeHash,
+                        routing,
+                        ByteUtil.hexStringToUint8Array(signature)
+                    ],
+                    describe: `respend ${depositHash.toHex()} @ ${contract.account}`,
+                    bridgeSend: true
+                });
+            });
+            await Exchange.setBookingRouting(booking.id, routing);
+
+            return { transaction: transaction };
         }
     }
 
@@ -730,10 +1362,10 @@ export namespace Router {
                     }
                 }
 
-                throw new Error('Illegal operation'); 
+                throw new Error('Illegal operation');
             } catch (exception: any) {
                 return Result.error(exception, args.id);
-            } 
+            }
         }
         static register(server: FastifyInstance, method: 'get' | 'post', path: string, context: any, callback: (args?: any, response?: FastifyReply) => Promise<any>, asIs?: boolean): (args?: any, response?: FastifyReply) => Promise<any> {
             switch (method) {

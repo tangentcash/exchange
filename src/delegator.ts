@@ -1,4 +1,4 @@
-import { AssetId, ByteUtil, Chain, Hashing, Hashsig, LiquidityPool, Messages, RPC, SchemaUtil, Seckey, Signing, Spot, Stream, Transactions, Uint256, UiUtil } from 'tangentsdk';
+import { AssetId, ByteUtil, Chain, Hashsig, Hashing, LiquidityPool, Messages, RPC, SchemaUtil, Seckey, Signing, Spot, Stream, Transactions, UiUtil, Uint256 } from 'tangentsdk';
 import { Log } from './logging';
 import BigNumber from 'bignumber.js';
 import process from 'node:process';
@@ -10,9 +10,9 @@ type RuleConfig = {
     twapInterval?: number,
     threshold?: number,
     fee?: number,
-    range?: number | null,
-    reserve?: number,
-    cooldownInterval?: number,
+    range: number | null,
+    reserve: number,
+    cooldownInterval: number,
     rebalanceInterval?: number | null
 };
 
@@ -55,14 +55,18 @@ type PoolState = {
     nextCheckAt: number
 };
 
-type DelegationRow = {
-    primaryAsset: string,
-    secondaryAsset: string,
-    primaryLiquidity: string,
-    secondaryLiquidity: string,
-    price: string,
-    poolId: string,
-    delegatorAccount: string
+type BotIdentity = {
+    secretKey: Seckey,
+    address: string
+};
+
+type SubmitOptions = {
+    contractAccount: string,
+    contractFunction: string,
+    args: unknown[],
+    describe: string,
+    maxGasPrice?: number | null,
+    bridgeSend?: boolean
 };
 
 type ExchangeOptions = {
@@ -73,21 +77,31 @@ type ExchangeOptions = {
     onNotification?: (type: string, data: any) => void
 };
 
+type DelegationRow = {
+    primaryAsset: string,
+    secondaryAsset: string,
+    primaryLiquidity: string,
+    secondaryLiquidity: string,
+    price: string,
+    poolId: string,
+    delegatorAccount: string
+};
+
 class Exchange {
     static url: string;
-    static accounts: string[] = [ ];
+    static accounts: string[] = [];
     static callTimeout = 30;
     static connectTimeout = 15;
     static onNotification: (type: string, data: any) => void = () => { };
     static socket: WebSocket | null = null;
     static connecting = false;
     static reconnectTimer: NodeJS.Timeout | null = null;
-    static awaitables: (() => void)[ ] = [ ];
+    static awaitables: (() => void)[] = [];
     static requests = { pending: new Map<string, (value: any | Error) => void>( ), count: 0 };
 
     static init(options: ExchangeOptions): void {
         Exchange.url = options.url;
-        Exchange.accounts = options.accounts || [ ];
+        Exchange.accounts = options.accounts || [];
         Exchange.callTimeout = options.callTimeout ?? Exchange.callTimeout;
         Exchange.connectTimeout = options.connectTimeout ?? Exchange.connectTimeout;
         if (options.onNotification != null)
@@ -173,56 +187,156 @@ class Exchange {
         for (let awaitable of Exchange.awaitables.splice(0))
             awaitable();
     }
-    static async fetch(location: string, args: Record<string, unknown>): Promise<unknown> {
-        if (Exchange.socket == null || Exchange.socket.readyState != WebSocket.OPEN)
-            await new Promise<void>((resolve) => {
-                Exchange.awaitables.push(resolve);
-                Exchange.establish();
-            });
+    private static async request(scheme: string, location: string, args: Record<string, unknown>): Promise<unknown> {
+        if (Exchange.socket == null || Exchange.socket.readyState != WebSocket.OPEN) {
+            const { promise, resolve } = Promise.withResolvers<void>();
+            Exchange.awaitables.push(resolve);
+            Exchange.establish();
+            await promise;
+        }
 
         const socket = Exchange.socket;
         if (socket == null || socket.readyState != WebSocket.OPEN)
             throw new Error(`exchange call ${location} failed: connection reset`);
 
         const id = (++Exchange.requests.count).toString();
-        const data: any = await new Promise((resolve, reject) => {
-            const settle = (value: any | Error) => {
-                Exchange.requests.pending.delete(id);
-                clearTimeout(timeout);
-                if (value instanceof Error)
-                    reject(value);
-                else
-                    resolve(value);
-            };
-            Exchange.requests.pending.set(id, settle);
-            const timeout = setTimeout(() => settle(new Error(`connection timed out after ${Exchange.callTimeout}s`)), Exchange.callTimeout * 1_000);
-            try { socket.send(JSON.stringify({ id: id, method: 'get://' + location, params: args })); } catch {
-                settle(new Error('connection reset'));
-            }
-        });
+        const { promise, resolve, reject } = Promise.withResolvers<any>();
+        const settle = (value: any | Error) => {
+            Exchange.requests.pending.delete(id);
+            clearTimeout(timeout);
+            if (value instanceof Error)
+                reject(value);
+            else
+                resolve(value);
+        };
+        Exchange.requests.pending.set(id, settle);
+        const timeout = setTimeout(() => settle(new Error(`connection timed out after ${Exchange.callTimeout}s`)), Exchange.callTimeout * 1_000);
+        try { socket.send(JSON.stringify({ id: id, method: scheme + '://' + location, params: args })); } catch {
+            settle(new Error('connection reset'));
+        }
+        const data: any = await promise;
 
         if (data.error != null)
             throw new Error(`${data.error} — E${ByteUtil.uint8ArrayToHexString(Hashing.hash160(ByteUtil.byteStringToUint8Array(String(data.error)))).substring(0, 8).toUpperCase()}`);
         return data.result ?? null;
     }
+    private static async fetch(location: string, args: Record<string, unknown>): Promise<unknown> {
+        return await Exchange.request('get', location, args);
+    }
     static async marketPrice(primary: AssetId, secondary: AssetId, interval?: number): Promise<BigNumber> {
         const args: Record<string, unknown> = { primaryAssetHash: primary.id, secondaryAssetHash: secondary.id };
         if (interval != null)
             args.interval = interval;
+
         return new BigNumber(String((await Exchange.fetch('market/price', args)) ?? '0'));
+    }
+    static async delegations(account: string): Promise<DelegationRow[] | null> {
+        const rows = await Exchange.fetch('account/delegations', { account }).catch((exception) => {
+            Log.error(exception);
+            return null;
+        });
+
+        return Array.isArray(rows) ? rows as DelegationRow[] : null;
     }
 }
 
 const pools: Record<string, PoolState> = { };
-const wakeListeners: (() => void)[] = [ ];
 const deactivatedPools: Record<string, number> = { };
+const wakeListeners: (() => void)[] = [];
 let config: DelegatorConfig;
-let address: string;
-let secretKey: Seckey;
+let identity: BotIdentity;
 let wakeups = 0;
+let startedAt = 0;
 
-function resolveConfig(raw: string): DelegatorConfig {
-    const parsed: unknown = JSON.parse(raw);
+function numberOr(source: Record<string, unknown>, key: string, fallback: number): number {
+    return typeof source[key] == 'number' ? source[key] as number : fallback;
+}
+function stringOr(source: Record<string, unknown>, key: string): string | undefined {
+    return typeof source[key] == 'string' ? source[key] as string : undefined;
+}
+function backoff(config: { base: number, cap: number }, attempts: number): number {
+    return Math.min(config.cap, config.base * Math.pow(2, attempts - 1));
+}
+function delay(ms: number): Promise<void> {
+    const { promise, resolve } = Promise.withResolvers<void>();
+    setTimeout(resolve, ms);
+    return promise;
+}
+async function submit(config: { confirmTimeout: number, simulation: boolean }, identity: BotIdentity, options: SubmitOptions): Promise<string | null> {
+    const nonce = new Uint256((await RPC.getNextAccountNonce(identity.address))?.toString());
+    const gasPrice = new BigNumber((await RPC.getGasPrice(new AssetId(), 0.95))?.price.toString() || 0);
+    if (options.maxGasPrice != null && gasPrice.gt(options.maxGasPrice))
+        throw new Error(`gas price ${gasPrice.toString()} exceeds policy cap ${options.maxGasPrice}`);
+
+    const build = (gasLimit: Uint256): Stream => {
+        const transaction = {
+            signature: new Hashsig(),
+            asset: new AssetId(),
+            nonce: nonce,
+            gasPrice: gasPrice,
+            gasLimit: gasLimit,
+            callable: Signing.decodeAddress(options.contractAccount),
+            pays: [],
+            function: (options.bridgeSend === true ? '^' : '') + UiUtil.toFunction(options.contractFunction),
+            args: options.args
+        };
+
+        let stream = new Stream();
+        SchemaUtil.store(stream, transaction, Messages.asSigningSchema(new Transactions.Call()));
+        const signature = Signing.sign(stream.hash(), identity.secretKey);
+        if (!signature)
+            throw new Error('failed to sign a transaction');
+
+        stream = new Stream();
+        SchemaUtil.store(stream, { ...transaction, signature: signature }, new Transactions.Call());
+        return stream;
+    };
+
+    const simulation = build(new Uint256(1_000_000));
+    try {
+        const receipt = await RPC.simulateTransaction(simulation.encode());
+        const gasLimit = new Uint256(receipt?.relative_gas_use?.toString() || 0);
+        if (!receipt?.successful) {
+            const reason = receipt?.message ?? receipt?.error ?? 'unknown simulation error';
+            throw new Error(`simulation rejected ${options.describe}: ${JSON.stringify(reason)}`);
+        }
+
+        if (!gasLimit.gt(0))
+            throw new Error('failed to simulate transaction');
+
+        if (config.simulation) {
+            Log.info(`${options.describe} simulated (gas: ${gasLimit.toString()}): ${JSON.stringify(receipt, null, 2)}`);
+            return null;
+        }
+
+        const transactionHash = await RPC.submitTransaction(build(gasLimit).encode());
+        if (!transactionHash)
+            throw new Error('failed to submit transaction');
+
+        const deadline = Date.now() + config.confirmTimeout * 1_000;
+        while (true) {
+            let confirmation: unknown = null;
+            try {
+                confirmation = await RPC.getTransactionByHash(transactionHash);
+            } catch {
+                confirmation = null;
+            }
+            if (confirmation)
+                break;
+            if (Date.now() >= deadline)
+                throw new Error(`transaction ${transactionHash} not confirmed within ${config.confirmTimeout}s`);
+            await delay(1_000);
+        }
+
+        Log.info(`${options.describe} finalized (tx: ${transactionHash})`);
+        return transactionHash;
+    } catch (exception) {
+        Log.info('TX message:', simulation.encode());
+        throw exception;
+    }
+}
+function resolveConfig(path: string): DelegatorConfig {
+    const parsed: unknown = JSON.parse(fs.readFileSync(path).toString('utf8'));
     if (typeof parsed != 'object' || parsed == null || Array.isArray(parsed))
         throw new Error('config must be an object');
 
@@ -251,8 +365,6 @@ function resolveConfig(raw: string): DelegatorConfig {
     }
 
     const backoff = typeof source.backoff == 'object' && source.backoff != null ? source.backoff as Record<string, unknown> : { };
-    const numberOr = (source: Record<string, unknown>, key: string, fallback: number): number => typeof source[key] == 'number' ? source[key] as number : fallback;
-    const stringOr = (source: Record<string, unknown>, key: string): string | undefined => typeof source[key] == 'string' ? source[key] as string : undefined;
     return {
         network: source.network,
         validator: source.validator,
@@ -315,79 +427,16 @@ async function rebalance(pool: {
     primaryValue = BigNumber.min(primaryCap, primaryValue);
     secondaryValue = BigNumber.min(secondaryCap, secondaryValue);
     Log.info(`LP ${pool.name} rebalancing${pool.pull ? ' (pulled)' : ''} at ${pool.price.toString()} (range: ${minPrice != null && maxPrice != null ? `${minPrice.toString()}-${maxPrice.toString()}` : 'uniform'}, fee: ${pool.fee.toString()}, alloc: ${allocate.multipliedBy(100).toFixed(2)}%)`);
-    const nonce = new Uint256((await RPC.getNextAccountNonce(address))?.toString());
-    const gasPrice = new BigNumber((await RPC.getGasPrice(new AssetId(), 0.95))?.price.toString() || 0);
-    const build = (gasLimit: Uint256): Stream => {
-        const transaction = {
-            signature: new Hashsig(),
-            asset: new AssetId(),
-            nonce: nonce,
-            gasPrice: gasPrice,
-            gasLimit: gasLimit,
-            callable: Signing.decodeAddress(pool.delegatedAccount),
-            pays: [],
-            function: UiUtil.toFunction(Spot.DLP.transferLiquidity),
-            args: [pool.primaryAsset.toUint256(), pool.secondaryAsset.toUint256(), primaryValue, secondaryValue, pool.price, pool.range ? minPrice : new BigNumber(-1), pool.range ? maxPrice : new BigNumber(-1), pool.fee]
-        };
-
-        let stream = new Stream();
-        SchemaUtil.store(stream, transaction, Messages.asSigningSchema(new Transactions.Call()));
-        const signature = Signing.sign(stream.hash(), secretKey);
-        if (!signature)
-            throw new Error('Failed to sign a transaction');
-
-        stream = new Stream();
-        SchemaUtil.store(stream, { ...transaction, signature: signature }, new Transactions.Call());
-        return stream;
-    };
-
-    const simulation = build(new Uint256(1_000_000));
-    try {
-        const receipt = await RPC.simulateTransaction(simulation.encode());
-        const gasLimit = new Uint256(receipt?.relative_gas_use?.toString() || 0);
-        if (!gasLimit.gt(0))
-            throw new Error('Failed to simulate transaction');
-
-        if (config.simulation) {
-            Log.info(`LP ${pool.name} renewal simulated (price: ${pool.price.toString()}, gas: ${gasLimit.toString()}): ${JSON.stringify(receipt, null, 2)}`);
-            return;
-        }
-
-        const transactionHash = await RPC.submitTransaction(build(gasLimit).encode());
-        if (!transactionHash)
-            throw new Error('Failed to submit transaction');
-
-        const deadline = Date.now() + config.confirmTimeout * 1_000;
-        while (true) {
-            let confirmation: unknown = null;
-            try {
-                confirmation = await RPC.getTransactionByHash(transactionHash);
-            } catch {
-                confirmation = null;
-            }
-            if (confirmation)
-                break;
-            if (Date.now() >= deadline)
-                throw new Error(`Transaction ${transactionHash} not confirmed within ${config.confirmTimeout}s`);
-            await new Promise<void>((resolve) => setTimeout(resolve, 1_000));
-        }
-
-        Log.info(`LP ${pool.name} renewal finalized (price: ${pool.price.toString()}, tx: ${transactionHash})`);
-    } catch (exception) {
-        Log.info('TX message:', simulation.encode());
-        throw exception;
-    }
+    await submit(config, identity, {
+        contractAccount: pool.delegatedAccount,
+        contractFunction: Spot.DLP.transferLiquidity,
+        args: [pool.primaryAsset.toUint256(), pool.secondaryAsset.toUint256(), primaryValue, secondaryValue, pool.price, pool.range ? minPrice : new BigNumber(-1), pool.range ? maxPrice : new BigNumber(-1), pool.fee],
+        describe: `LP ${pool.name} renewal`
+    });
 }
-async function main(): Promise<void> {
-    BigNumber.config({ DECIMAL_PLACES: 18, ROUNDING_MODE: 1 });
-    try {
-        config = resolveConfig(fs.readFileSync(process.argv[2]).toString('utf8'));
-        Chain.props = (Chain as unknown as Record<string, typeof Chain.props>)[config.network];
-        RPC.applyValidator(config.validator);
-    } catch (exception) {
-        Log.error('path', process.argv[2] || null, ' failed to load a config:', exception);
-        return process.exit(1);
-    }
+function boot(config: DelegatorConfig): BotIdentity {
+    Chain.props = (Chain as unknown as Record<string, typeof Chain.props>)[config.network];
+    RPC.applyValidator(config.validator);
 
     const decodedSecretKey = Signing.decodeSecretKey(config.secretKey ?? (process.env[config.secretKeyEnv || 'WSK'] || ''));
     if (!decodedSecretKey) {
@@ -395,18 +444,66 @@ async function main(): Promise<void> {
         return process.exit(1);
     }
 
-    secretKey = decodedSecretKey;
-    address = Signing.encodeAddress(Signing.derivePublicKeyHash(Signing.derivePublicKey(secretKey))) || '';
+    const address = Signing.encodeAddress(Signing.derivePublicKeyHash(Signing.derivePublicKey(decodedSecretKey))) || '';
     if (!address) {
         Log.error('invalid address');
         return process.exit(1);
     }
 
-    let startedAt = Date.now(), woke = false;
-    Log.info(`LP delegator account: ${address}`);
+    return { secretKey: decodedSecretKey, address: address };
+}
+function wake(): void {
+    wakeups++;
+    for (let listener of wakeListeners.splice(0))
+        listener();
+}
+async function loop(label: string, cycle: (forced: boolean) => Promise<number>): Promise<void> {
+    let woke = false;
+    while (true) {
+        const sequence = wakeups, forced = woke; woke = false;
+        let timeout: number;
+        try {
+            timeout = await cycle(forced);
+        } catch (exception) {
+            Log.error(`${label} loop: cycle failed:`, exception);
+            timeout = Date.now() + 60_000;
+        }
+
+        if (wakeups == sequence) {
+            const { promise, resolve } = Promise.withResolvers<void>();
+            const finish = () => {
+                clearTimeout(timer);
+                const index = wakeListeners.indexOf(finish);
+                if (index >= 0)
+                    wakeListeners.splice(index, 1);
+                resolve();
+            };
+            const timer = setTimeout(finish, Math.max(0, timeout - Date.now()));
+            wakeListeners.push(finish);
+            await promise;
+        }
+
+        if (wakeups != sequence) {
+            Log.info(`${label} loop: wake signal received, forcing next cycle immediately`);
+            woke = true;
+        }
+    }
+}
+async function main(): Promise<void> {
+    BigNumber.config({ DECIMAL_PLACES: 18, ROUNDING_MODE: 1 });
+    try {
+        config = resolveConfig(process.argv[2]);
+    } catch (exception) {
+        Log.error('path', process.argv[2] || null, ' failed to load a config:', exception);
+        return process.exit(1);
+    }
+
+    identity = boot(config);
+    startedAt = Date.now();
+    Log.info(`LP delegator account: ${identity.address}`);
     Exchange.init({
         url: config.relay || config.exchange.replace(/^https/, 'wss').replace(/^http/, 'ws'),
-        accounts: [address],
+        accounts: [identity.address],
         callTimeout: config.callTimeout,
         connectTimeout: config.watch?.connectTimeout,
         onNotification: (type: string, data: any): void => {
@@ -418,24 +515,19 @@ async function main(): Promise<void> {
             if ((deactivatedPools[poolId] || 0) + 10_000 >= now)
                 return;
 
-            deactivatedPools[poolId] = now; wakeups++;
+            deactivatedPools[poolId] = now;
             Log.info(`LP pool ${poolId} invalidated by relay, forcing cycle`);
-            for (let listener of wakeListeners.splice(0))
-                listener();
+            wake();
         }
     });
 
-    while (true) {
-        const sequence = wakeups, time = Date.now(), forced = woke; woke = false;
+    await loop('LP', async (forced: boolean): Promise<number> => {
+        const time = Date.now();
         Log.info(`LP loop: cycle started${forced ? ' (forced by relay wake)' : ''} (LPs: ${Object.keys(pools).length})`);
-        const rows = ((await Exchange.fetch('account/delegations', { account: address }).catch((exception) => {
-            Log.error(exception);
-            return null;
-        })) || []) as DelegationRow[];
-        if (!Array.isArray(rows)) {
+        const rows = await Exchange.delegations(identity.address);
+        if (rows == null) {
             Log.error('failed to fetch delegations, retrying within 10s');
-            await new Promise((resolve) => setTimeout(resolve, 10_000));
-            continue;
+            return Date.now() + 10_000;
         }
 
         const mutations: Record<string, string | boolean> = { };
@@ -503,14 +595,14 @@ async function main(): Promise<void> {
                         await redeploy(price, false);
                     }
                 }
-                
+
                 state.failCount = 0;
                 state.backoffUntil = 0;
                 if (rule.rebalanceInterval != null)
                     state.nextCheckAt = Math.min(state.nextCheckAt, Math.max(state.lastRedeploy, startedAt) + rule.rebalanceInterval * 1_000);
             } catch (exception) {
                 state.failCount++;
-                const delay = Math.min(config.backoff.cap, config.backoff.base * Math.pow(2, state.failCount - 1));
+                const delay = backoff(config.backoff, state.failCount);
                 state.backoffUntil = Date.now() + delay * 1_000;
                 state.nextCheckAt = state.backoffUntil;
                 Log.error(`LP ${name} renewal failed (attempt ${state.failCount}, retry in ${delay}s):`, exception);
@@ -533,27 +625,10 @@ async function main(): Promise<void> {
         }
 
         timeout = Math.max(timeout, Date.now() + 60_000);
-        Exchange.subscribe([address, ...new Set(rows.map((x) => x.delegatorAccount))]);
+        Exchange.subscribe([identity.address, ...new Set(rows.map((x) => x.delegatorAccount))]);
         Log.info(`LP loop: cycle finished in ${Date.now() - time}ms, next cycle in ${Math.max(0, Math.ceil((timeout - Date.now()) / 1_000))}s (at ${new Date(timeout).toISOString()})`);
-        if (wakeups == sequence) {
-            await new Promise<void>((resolve) => {
-                const finish = () => {
-                    clearTimeout(timer);
-                    const index = wakeListeners.indexOf(finish);
-                    if (index >= 0)
-                        wakeListeners.splice(index, 1);
-                    resolve();
-                };
-                const timer = setTimeout(finish, Math.max(0, timeout - Date.now()));
-                wakeListeners.push(finish);
-            });
-        }
-
-        if (wakeups != sequence) {
-            Log.info('LP loop: wake signal received, forcing next cycle immediately');
-            woke = true;
-        }
-    }
+        return timeout;
+    });
 }
 
 main();
