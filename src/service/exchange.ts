@@ -20,6 +20,8 @@ const BOOKING_STATUS_EDGES: Record<string, string[]> = {
     [BookingStatus.Expired]: []
 };
 
+const canTransition = (from: string, to: string) => (BOOKING_STATUS_EDGES[from] || []).includes(to);
+
 export type PriceDescriptors = Record<string, { whitelist: boolean, base: string | null, price: { open: BigNumber | null, close: BigNumber | null } }>;
 
 export type Connection = pq.TransactionSql;
@@ -52,7 +54,8 @@ export type RouterPath = {
     pair: Pair,
     side: OrderSide,
     input: { min: BigNumber, max: BigNumber },
-    output: { min: BigNumber, max: BigNumber }
+    output: { min: BigNumber, max: BigNumber },
+    capped: boolean
 }[];
 
 export type PseudoOrder = {
@@ -282,6 +285,7 @@ export class Exchange {
             deployer_account_id BIGINT REFERENCES accounts (id) ON DELETE CASCADE,
             block_number BIGINT REFERENCES blocks (block_number) ON DELETE CASCADE,
             parameters JSONB NOT NULL DEFAULT '{}'::jsonb,
+            synced BOOLEAN NOT NULL DEFAULT FALSE,
             PRIMARY KEY (id),
             UNIQUE (type)
         );
@@ -425,7 +429,13 @@ export class Exchange {
             expires_block BIGINT NOT NULL,
             tx_hash BYTEA NOT NULL,
             block_number BIGINT NOT NULL REFERENCES blocks (block_number) ON DELETE CASCADE,
+            routing_address TEXT DEFAULT NULL,
+            deposit_id TEXT DEFAULT NULL,
             deposit_hash BYTEA DEFAULT NULL,
+            deposit_source TEXT DEFAULT NULL,
+            deposit_block BIGINT DEFAULT NULL,
+            deposit_payer_account_id BIGINT DEFAULT NULL,
+            deposit_preattested_time BIGINT DEFAULT NULL,
             withdraw_hash BYTEA DEFAULT NULL,
             bridge_hash BYTEA DEFAULT NULL,
             out_asset_id BIGINT REFERENCES assets (id) ON DELETE SET NULL,
@@ -440,26 +450,6 @@ export class Exchange {
         CREATE UNIQUE INDEX IF NOT EXISTS bookings_active_handle ON bookings (asset_id, amount) WHERE status NOT IN ('finalized', 'expired');
         CREATE INDEX IF NOT EXISTS bookings_lookup ON bookings (asset_id, amount);
         CREATE INDEX IF NOT EXISTS bookings_status ON bookings (status);
-        ALTER TABLE bookings ADD COLUMN IF NOT EXISTS routing_address TEXT DEFAULT NULL;
-        ALTER TABLE bookings ADD COLUMN IF NOT EXISTS deposit_source TEXT DEFAULT NULL;
-        ALTER TABLE bookings ADD COLUMN IF NOT EXISTS deposit_block BIGINT DEFAULT NULL;
-        ALTER TABLE bookings ADD COLUMN IF NOT EXISTS deposit_payer_account_id BIGINT DEFAULT NULL;
-        ALTER TABLE bookings ADD COLUMN IF NOT EXISTS deposit_preattested_time BIGINT DEFAULT NULL;
-
-        CREATE TABLE IF NOT EXISTS deposits
-        (
-            id BIGSERIAL,
-            deposit_hash BYTEA NOT NULL UNIQUE,
-            booking_id BIGINT REFERENCES bookings (id) ON DELETE SET NULL,
-            payer_account_id BIGINT REFERENCES accounts (id) ON DELETE SET NULL,
-            asset_id BIGINT NOT NULL REFERENCES assets (id) ON DELETE CASCADE,
-            amount NUMERIC(96, 18) NOT NULL,
-            source TEXT NOT NULL,
-            block_number BIGINT REFERENCES blocks (block_number) ON DELETE CASCADE,
-            preattested_time BIGINT DEFAULT NULL,
-            auto_time BIGINT DEFAULT floor(EXTRACT(EPOCH FROM CURRENT_TIMESTAMP)),
-            PRIMARY KEY (id)
-        );
 
         CREATE MATERIALIZED VIEW IF NOT EXISTS pairs_view AS (
             WITH timings AS (
@@ -1187,7 +1177,7 @@ export class Exchange {
                                         await this.setBookingOutput(booking.id, output.outAssetId, output.outAmount, connection);
                                 }
 
-                                await this.setBookingWithdrawal(booking.id, withdrawHash, bridgeHash, expiresBlock, true, connection);
+                                await this.setBookingWithdrawal(booking.id, withdrawHash, bridgeHash, expiresBlock, booking.withdrawHash != withdrawHash.toHex(), connection);
 
                                 if (booking.status == BookingStatus.AwaitingExecution || booking.status == BookingStatus.FailingWithdrawal)
                                     await this.updateBookingStatus(booking.id, BookingStatus.AwaitingWithdrawal, connection);
@@ -1209,7 +1199,9 @@ export class Exchange {
                                 }
 
                                 const payerAccountId = row.payerAccount != null ? await this.getAccountIdByAddress(row.payerAccount, false, connection) : null;
-                                let booking = await this.getBookingByDepositHash(row.txHash, connection);
+                                let booking = row.txId != null ? await this.getBookingByDepositId(row.txId, connection) : null;
+                                if (booking == null && row.source == 'mined')
+                                    booking = await this.getBookingByDepositHash(row.txHash, connection);
                                 if (booking == null && row.isSinglePayment) {
                                     const amsContract = await this.getAmsContract(connection);
                                     const paidAmount = row.amount.decimalPlaces(amsContract?.parameters.depositPrecision ?? 6, BigNumber.ROUND_DOWN);
@@ -1221,28 +1213,34 @@ export class Exchange {
                                     break;
                                 }
 
-                                const known = booking.depositHash == row.txHash.toHex();
-                                if (known && (row.source != 'mined' || booking.depositBlock != null))
-                                    break;
-
-                                if (booking.depositHash != null && booking.depositHash != row.txHash.toHex()) {
-                                    Log.info(`exchange ${contract.account} ams preattestation ignored (booking ${booking.id} already linked to ${booking.depositHash}): ${row.txHash.toHex()}`);
-                                    break;
-                                }
-
-                                await this.setBookingDepositFacts(booking.id, {
-                                    depositHash: row.txHash,
-                                    source: row.source,
-                                    blockNumber: row.source == 'mined' ? block.number : null,
-                                    payerAccountId: payerAccountId,
-                                    preattestedTime: row.source == 'mined' ? null : Math.floor(Date.now() / 1_000)
-                                }, connection);
-
                                 if (row.source == 'mined') {
+                                    if (booking.depositBlock != null)
+                                        break;
+                                    if (booking.depositHash != null && booking.depositHash != row.txHash.toHex()) {
+                                        Log.info(`exchange ${contract.account} ams deposit ignored (booking ${booking.id} already linked to ${booking.depositHash}): ${row.txHash.toHex()}`);
+                                        break;
+                                    }
+                                    await this.setBookingDepositFacts(booking.id, {
+                                        depositHash: row.txHash,
+                                        depositId: row.txId ?? row.txHash.toHex(),
+                                        source: 'mined',
+                                        blockNumber: block.number,
+                                        payerAccountId: payerAccountId
+                                    }, connection);
                                     if (booking.status != BookingStatus.AwaitingExecution)
                                         await this.updateBookingStatus(booking.id, BookingStatus.AwaitingExecution, connection);
-                                } else if (booking.status == BookingStatus.AwaitingDeposit)
-                                    await this.updateBookingStatus(booking.id, BookingStatus.FinalizingDeposit, connection);
+                                } else {
+                                    if (row.txId == null || booking.depositHash != null || booking.depositId != null)
+                                        break;
+                                    await this.setBookingDepositFacts(booking.id, {
+                                        depositId: row.txId,
+                                        source: 'preattestation',
+                                        payerAccountId: payerAccountId,
+                                        preattestedTime: Math.floor(Date.now() / 1_000)
+                                    }, connection);
+                                    if (booking.status == BookingStatus.AwaitingDeposit)
+                                        await this.updateBookingStatus(booking.id, BookingStatus.FinalizingDeposit, connection);
+                                }
                             } catch (exception) {
                                 Log.error(`exchange ${contract.account} ams preattestation ingest error (preattestation: ${row.txHash.toHex()}):`, exception);
                             }
@@ -1252,19 +1250,21 @@ export class Exchange {
                             const row = log.event.args[0] as BroadcastEvent;
                             Log.info(`exchange ${contract.account} ams broadcast: ${row.txHash.toHex()} (withdraw: ${row.withdrawHash.toHex()}${row.error != null ? ', error: ' + row.error : row.proofTransactionId != null ? ', proof: ' + row.proofTransactionId : ''}) @ block ${block.number}`);
                             try {
-                                const bookings = await this.getBookingsByWithdrawHash(row.withdrawHash, [BookingStatus.AwaitingWithdrawal, BookingStatus.FinalizingWithdrawal, BookingStatus.FailingWithdrawal], connection);
+                                const bookings = await this.getBookingsByWithdrawHash(row.withdrawHash, null, connection);
                                 for (let j = 0; j < bookings.length; j++) {
                                     const booking = bookings[j];
                                     if (row.proofTransactionId != null) {
+                                        if (booking.broadcastHash == row.txHash.toHex() && booking.proofTransactionId == row.proofTransactionId && booking.status == BookingStatus.FinalizingWithdrawal)
+                                            continue;
                                         await this.setBookingBroadcastProof(booking.id, row.txHash, row.proofTransactionId, connection);
-                                        if (booking.status != BookingStatus.FinalizingWithdrawal)
+                                        if (booking.status != BookingStatus.FinalizingWithdrawal && canTransition(booking.status, BookingStatus.FinalizingWithdrawal))
                                             await this.updateBookingStatus(booking.id, BookingStatus.FinalizingWithdrawal, connection);
                                     } else if (row.error != null) {
                                         if (booking.status == BookingStatus.FailingWithdrawal && booking.broadcastHash == row.txHash.toHex())
                                             continue;
 
                                         await this.setBookingBroadcastError(booking.id, row.txHash, row.error, connection);
-                                        if (booking.status != BookingStatus.FailingWithdrawal)
+                                        if (booking.status != BookingStatus.FailingWithdrawal && canTransition(booking.status, BookingStatus.FailingWithdrawal))
                                             await this.updateBookingStatus(booking.id, BookingStatus.FailingWithdrawal, connection);
                                     }
                                 }
@@ -1280,9 +1280,28 @@ export class Exchange {
                                 const bookings = await this.getBookingsByProofTransactionId(row.hashdata, connection);
                                 for (let j = 0; j < bookings.length; j++) {
                                     const booking = bookings[j];
+                                    if (booking.status == BookingStatus.Finalized && booking.attestateHash == row.txHash.toHex())
+                                        continue;
                                     await this.setBookingAttestate(booking.id, row.txHash, connection);
                                     if (booking.status != BookingStatus.Finalized)
-                                        await this.updateBookingStatus(booking.id, BookingStatus.Finalized, connection);
+                                        await this.updateBookingStatus(booking.id, BookingStatus.Finalized, connection, { force: true });
+                                }
+
+                                if (typeof row.hashdata == 'string' && row.hashdata.length > 0) {
+                                    let depositBooking = await this.getBookingByDepositId(row.hashdata, connection);
+                                    if (depositBooking == null && row.asset != null && row.amount != null) {
+                                        const depositAssetId = await this.getAssetIdByHash(row.asset, 'trusted', connection);
+                                        if (depositAssetId != null) {
+                                            const amsContract = await this.getAmsContract(connection);
+                                            const paidAmount = row.amount.decimalPlaces(amsContract?.parameters.depositPrecision ?? 6, BigNumber.ROUND_DOWN);
+                                            depositBooking = await this.getBookingByHandle(depositAssetId, paidAmount, [BookingStatus.AwaitingDeposit, BookingStatus.FinalizingDeposit], connection);
+                                        }
+                                    }
+                                    if (depositBooking != null && depositBooking.depositHash == null && (depositBooking.status == BookingStatus.AwaitingDeposit || depositBooking.status == BookingStatus.FinalizingDeposit)) {
+                                        Log.info(`exchange ${contract.account} ams deposit vault transfer ${row.txHash.toHex()} linked to booking ${depositBooking.id} (off-chain: ${row.hashdata}, block: ${block.number})`);
+                                        await this.setBookingDepositFacts(depositBooking.id, { depositHash: row.txHash, depositId: row.hashdata, source: 'mined', blockNumber: block.number }, connection);
+                                        await this.updateBookingStatus(depositBooking.id, BookingStatus.AwaitingExecution, connection);
+                                    }
                                 }
                             } catch (exception) {
                                 Log.error(`exchange ${contract.account} ams attestation ingest error (attestation: ${row.txHash.toHex()}):`, exception);
@@ -2508,6 +2527,10 @@ export class Exchange {
             return null;
         }
     }
+    static async setContractsSynced(connection?: pq.TransactionSql): Promise<void> {
+        const sql = connection || this.connection;
+        await this.resultOf(sql`UPDATE contracts SET synced = TRUE`);
+    }
     static async getContractByType<T extends ContractParameters = ContractParameters>(type: ContractType, connection?: pq.TransactionSql): Promise<Contract<T> | null> {
         const sql = connection || this.connection;
         const result = await this.resultOf(sql`
@@ -3575,74 +3598,184 @@ export class Exchange {
             assets.push(polyAsset);
         return assets;
     }
-    static async getRoutingAmountByPairId(pairId: Uint256, side: OrderSide, amount: [BigNumber, BigNumber], slippage: BigNumber, connection?: pq.TransactionSql): Promise<[BigNumber, BigNumber]> {
+    static async getRoutingAmountByPairId(pairId: Uint256, side: OrderSide, amount: [BigNumber, BigNumber], slippage: BigNumber, connection?: pq.TransactionSql): Promise<[BigNumber, BigNumber, boolean]> {
         const sql = connection || this.connection;
-        const result = await this.resultOf(side == OrderSide.Buy ? sql`
+        const result = await this.resultOf(sql`
         WITH levels AS (
             (
                 SELECT
+                    0 AS kind,
                     last_price AS price,
-                    last_quantity AS quantity
-                FROM orders WHERE pair_id = ${pairId.toString()} AND side = ${OrderSide.Sell} AND active = TRUE AND last_price > 0 AND last_quantity > 0
+                    last_quantity AS quantity,
+                    NULL::NUMERIC(96, 18) AS primary_value,
+                    NULL::NUMERIC(96, 18) AS secondary_value,
+                    NULL::NUMERIC(96, 18) AS liquidity,
+                    NULL::NUMERIC(96, 18) AS state_price,
+                    NULL::NUMERIC(96, 18) AS min_price,
+                    NULL::NUMERIC(96, 18) AS max_price,
+                    NULL::NUMERIC(96, 18) AS fee_rate
+                FROM orders WHERE pair_id = ${pairId.toString()} AND side = ${side == OrderSide.Buy ? OrderSide.Sell : OrderSide.Buy} AND active = TRUE AND last_price > 0 AND last_quantity > 0
             )
             UNION ALL
             (
                 SELECT
-                    last_ask_price AS price,
-                    primary_value AS quantity
-                FROM pools WHERE pair_id = ${pairId.toString()} AND active = TRUE AND last_ask_price > 0 AND primary_value > 0 AND (max_price IS NULL OR last_ask_price <= max_price)
+                    1 AS kind,
+                    NULL::NUMERIC(96, 18) AS price,
+                    0 AS quantity,
+                    primary_value,
+                    secondary_value,
+                    liquidity,
+                    price AS state_price,
+                    min_price,
+                    max_price,
+                    fee_rate
+                FROM pools WHERE pair_id = ${pairId.toString()} AND active = TRUE AND price > 0 AND primary_value > 0 AND secondary_value > 0
             )
-        ) SELECT price, SUM(quantity) AS quantity FROM levels GROUP BY price ORDER BY price ASC` : sql`
-        WITH levels AS (
-            (
-                SELECT
-                    last_price AS price,
-                    last_quantity AS quantity
-                FROM orders WHERE pair_id = ${pairId.toString()} AND side = ${OrderSide.Buy} AND active = TRUE AND last_price > 0 AND last_quantity > 0
-                ORDER BY price DESC
-            )
-            UNION ALL
-            (
-                SELECT
-                    last_bid_price AS price,
-                    secondary_value / last_bid_price AS quantity
-                FROM pools WHERE pair_id = ${pairId.toString()} AND active = TRUE AND last_bid_price > 0 AND secondary_value > 0 AND (min_price IS NULL OR last_bid_price >= min_price)
-                ORDER BY price ASC
-            )
-        ) SELECT price, SUM(quantity) AS quantity FROM levels GROUP BY price ORDER BY price DESC`);
-        const levels: { price: BigNumber, quantity: BigNumber }[] = result.map((x) => ({ price: Common.bn(x['price']) || new BigNumber(0), quantity: Common.bn(x['quantity']) || new BigNumber(0) }));
-        const fee = new BigNumber(1).minus(slippage);
-        let minAmountIn = new BigNumber(amount[0]);
-        let maxAmountIn = new BigNumber(amount[1]);
-        let minAmountOut = new BigNumber(0);
-        let maxAmountOut = new BigNumber(0);
-        while (levels.length > 0 && (minAmountIn.gt(0) || maxAmountIn.gt(0))) {
-            const level = levels.shift()!;
-            if (side == OrderSide.Sell) {
-                if (minAmountIn.gt(0)) {
-                    const quantity = BigNumber.min(minAmountIn, level.quantity);
-                    minAmountIn = minAmountIn.minus(quantity);
-                    minAmountOut = minAmountOut.plus(quantity.multipliedBy(level.price)).multipliedBy(fee);
-                }
-                if (maxAmountIn.gt(0)) {
-                    const quantity = BigNumber.min(maxAmountIn, level.quantity);
-                    maxAmountIn = maxAmountIn.minus(quantity);
-                    maxAmountOut = maxAmountOut.plus(quantity.multipliedBy(level.price));
+        ) SELECT kind, price, quantity, primary_value, secondary_value, liquidity, state_price, min_price, max_price, fee_rate FROM levels`);
+        type RoutingPool = {
+            primaryValue: BigNumber,
+            secondaryValue: BigNumber,
+            liquidity: BigNumber,
+            price: BigNumber,
+            minPrice: BigNumber,
+            maxPrice: BigNumber,
+            feeRate: BigNumber,
+            concentrated: boolean
+        };
+        const segments: { price: BigNumber, orderQuantity?: BigNumber, pool?: RoutingPool }[] = [];
+        const orderLevels = new Map<string, { price: BigNumber, orderQuantity: BigNumber }>();
+        for (const row of result) {
+            if (Number(row['kind']) == 0) {
+                const price = Common.bn(row['price']);
+                const quantity = Common.bn(row['quantity']);
+                if (price == null || quantity == null || price.lte(0) || quantity.lte(0))
+                    continue;
+
+                const level = orderLevels.get(price.toString());
+                if (level)
+                    level.orderQuantity = level.orderQuantity.plus(quantity);
+                else {
+                    const created = { price: price, orderQuantity: quantity };
+                    orderLevels.set(price.toString(), created);
+                    segments.push(created);
                 }
             } else {
-                if (minAmountIn.gt(0)) {
-                    const quantity = BigNumber.min(minAmountIn, level.price.multipliedBy(level.quantity));
-                    minAmountIn = minAmountIn.minus(quantity);
-                    minAmountOut = minAmountOut.plus(quantity.dividedBy(level.price)).multipliedBy(fee);
-                }
-                if (maxAmountIn.gt(0)) {
-                    const quantity = BigNumber.min(maxAmountIn, level.price.multipliedBy(level.quantity));
-                    maxAmountIn = maxAmountIn.minus(quantity);
-                    maxAmountOut = maxAmountOut.plus(quantity.dividedBy(level.price));
-                }
+                const primaryValue = Common.bn(row['primary_value']);
+                const secondaryValue = Common.bn(row['secondary_value']);
+                const liquidity = Common.bn(row['liquidity']);
+                const statePrice = Common.bn(row['state_price']);
+                const minPrice = Common.bn(row['min_price']);
+                const maxPrice = Common.bn(row['max_price']);
+                const feeRate = Common.bn(row['fee_rate']) || new BigNumber(0);
+                if (primaryValue == null || secondaryValue == null || liquidity == null || statePrice == null || liquidity.lte(0) || primaryValue.lte(0) || secondaryValue.lte(0) || statePrice.lte(0))
+                    continue;
+
+                const concentrated = minPrice != null && maxPrice != null && minPrice.gt(0) && maxPrice.gt(0);
+                if (concentrated && (statePrice.lt(minPrice!) || statePrice.gt(maxPrice!)))
+                    continue;
+
+                const levelPrice = side == OrderSide.Buy ? statePrice.multipliedBy(feeRate.plus(1)) : BigNumber.max(statePrice.multipliedBy(new BigNumber(1).minus(feeRate)), new BigNumber(0));
+                segments.push({ price: levelPrice, pool: { primaryValue: primaryValue, secondaryValue: secondaryValue, liquidity: liquidity, price: statePrice, minPrice: concentrated ? minPrice!.sqrt() : new BigNumber(0), maxPrice: concentrated ? maxPrice!.sqrt() : new BigNumber(0), feeRate: feeRate, concentrated: concentrated } });
             }
         }
-        return [minAmountOut, maxAmountOut];
+
+        segments.sort(side == OrderSide.Buy ? (a, b) => a.price.comparedTo(b.price) || 0 : (a, b) => b.price.comparedTo(a.price) || 0);
+        const best = segments.length > 0 ? segments[0].price : null;
+        const fill = (amountIn: BigNumber, feeFactor: BigNumber): [BigNumber, BigNumber] => {
+            let remaining = new BigNumber(amountIn);
+            let totalOut = new BigNumber(0);
+            if (best == null || remaining.lte(0) || slippage.lt(0))
+                return [totalOut, remaining];
+
+            const slip = BigNumber.min(slippage, new BigNumber(0.999999));
+            const bound = side == OrderSide.Buy ? best.multipliedBy(slip.plus(1)) : best.multipliedBy(new BigNumber(1).minus(slip));
+            if (bound.lte(0))
+                return [totalOut, remaining];
+
+            const boundSqrt = bound.sqrt();
+            for (const segment of segments) {
+                if (remaining.lte(0))
+                    break;
+                if (side == OrderSide.Buy ? segment.price.gt(bound) : segment.price.lt(bound))
+                    break;
+
+                if (segment.orderQuantity != null) {
+                    const quantity = side == OrderSide.Buy ? BigNumber.min(remaining, segment.price.multipliedBy(segment.orderQuantity)) : BigNumber.min(remaining, segment.orderQuantity);
+                    if (quantity.lte(0))
+                        continue;
+
+                    remaining = remaining.minus(quantity);
+                    totalOut = totalOut.plus((side == OrderSide.Buy ? quantity.dividedBy(segment.price) : quantity.multipliedBy(segment.price)).multipliedBy(feeFactor));
+                    continue;
+                }
+
+                const pool = segment.pool!;
+                const feeRate = pool.feeRate.gt(0) && pool.feeRate.lt(1) ? pool.feeRate : new BigNumber(0);
+                if (side == OrderSide.Buy) {
+                    const capacity = pool.concentrated ? BigNumber.min(pool.liquidity.multipliedBy(BigNumber.max(boundSqrt.minus(pool.minPrice), new BigNumber(0))).minus(pool.secondaryValue), pool.liquidity.multipliedBy(pool.maxPrice.minus(pool.minPrice)).minus(pool.secondaryValue)) : pool.liquidity.multipliedBy(bound).sqrt().minus(pool.secondaryValue);
+                    if (capacity.lte(0))
+                        continue;
+
+                    const amountBought = BigNumber.min(remaining, capacity);
+                    const amountInAfterFee = amountBought.multipliedBy(new BigNumber(1).minus(feeRate));
+                    if (!amountInAfterFee.gt(0))
+                        continue;
+
+                    const secondaryValue = pool.secondaryValue.plus(amountInAfterFee);
+                    let primaryValue: BigNumber;
+                    if (pool.concentrated) {
+                        const sqrtPrice = secondaryValue.plus(pool.liquidity.multipliedBy(pool.minPrice)).dividedBy(pool.liquidity);
+                        if (!sqrtPrice.gt(0) || sqrtPrice.gt(pool.maxPrice))
+                            continue;
+
+                        primaryValue = pool.liquidity.multipliedBy(BigNumber.max(pool.maxPrice.minus(sqrtPrice), new BigNumber(0))).dividedBy(sqrtPrice.multipliedBy(pool.maxPrice));
+                    } else {
+                        primaryValue = pool.liquidity.dividedBy(secondaryValue);
+                    }
+
+                    const amountSold = pool.primaryValue.minus(primaryValue);
+                    if (!amountSold.gt(0))
+                        continue;
+
+                    remaining = remaining.minus(amountBought);
+                    totalOut = totalOut.plus(amountSold.multipliedBy(feeFactor));
+                } else {
+                    const capacity = pool.concentrated ? BigNumber.min(pool.liquidity.multipliedBy(BigNumber.max(pool.maxPrice.minus(boundSqrt), new BigNumber(0))).dividedBy(boundSqrt.multipliedBy(pool.maxPrice)).minus(pool.primaryValue), pool.liquidity.multipliedBy(pool.maxPrice.minus(pool.minPrice)).dividedBy(pool.minPrice.multipliedBy(pool.maxPrice)).minus(pool.primaryValue)) : pool.liquidity.dividedBy(bound).sqrt().minus(pool.primaryValue);
+                    if (capacity.lte(0))
+                        continue;
+
+                    const amountSold = BigNumber.min(remaining, capacity);
+                    const amountInAfterFee = amountSold.multipliedBy(new BigNumber(1).minus(feeRate));
+                    if (!amountInAfterFee.gt(0))
+                        continue;
+
+                    const primaryValue = pool.primaryValue.plus(amountInAfterFee);
+                    let secondaryValue: BigNumber;
+                    if (pool.concentrated) {
+                        const sqrtPrice = pool.liquidity.multipliedBy(pool.maxPrice).dividedBy(primaryValue.multipliedBy(pool.maxPrice).plus(pool.liquidity));
+                        if (!sqrtPrice.gt(0) || sqrtPrice.lt(pool.minPrice))
+                            continue;
+
+                        secondaryValue = pool.liquidity.multipliedBy(BigNumber.max(sqrtPrice.minus(pool.minPrice), new BigNumber(0)));
+                    } else {
+                        secondaryValue = pool.liquidity.dividedBy(primaryValue);
+                    }
+
+                    const amountBought = pool.secondaryValue.minus(secondaryValue);
+                    if (!amountBought.gt(0))
+                        continue;
+
+                    remaining = remaining.minus(amountSold);
+                    totalOut = totalOut.plus(amountBought.multipliedBy(feeFactor));
+                }
+            }
+
+            return [totalOut, remaining];
+        };
+
+        const minFill = fill(amount[0], new BigNumber(1).minus(slippage));
+        const maxFill = fill(amount[1], new BigNumber(1));
+        return [minFill[0], maxFill[0], minFill[1].gt(0) || maxFill[1].gt(0)];
     }
     static async getRoutingPathsByAssetIds(fromAssetId: Uint256, toAssetId: Uint256, amount: BigNumber, slippage: BigNumber, depth: number, connection?: pq.TransactionSql): Promise<RouterPath[]> {
         const allPaths: RouterPath[] = [];
@@ -3666,18 +3799,18 @@ export class Exchange {
                     continue;
 
                 const side = isSelling ? OrderSide.Sell : OrderSide.Buy;
-                const amountOut = await this.getRoutingAmountByPairId(pair.id, side, amountIn, slippage, connection);
-                if (amountOut[0].gt(0) || amountOut[1].gt(0)) {
+                const [minOut, maxOut, capped] = await this.getRoutingAmountByPairId(pair.id, side, amountIn, slippage, connection);
+                if (minOut.gt(0) || maxOut.gt(0)) {
                     queue.push([
                         assetOut.id,
-                        amountOut,
+                        [minOut, maxOut],
                         new Set(set).add(assetOut.id.toCompactHex()),
-                        [...path, { pair, side: side, input: { min: amountIn[0], max: amountIn[1] }, output: { min: amountOut[0], max: amountOut[1] } }],
+                        [...path, { pair, side: side, input: { min: amountIn[0], max: amountIn[1] }, output: { min: minOut, max: maxOut }, capped: capped }],
                     ]);
                 }
             }
         }
-        return allPaths.sort((a, b) => b[b.length - 1].output.min.comparedTo(a[a.length - 1].output.min) || 0);
+        return allPaths.sort((a, b) => (a.some((leg) => leg.capped) ? 1 : 0) - (b.some((leg) => leg.capped) ? 1 : 0) || b[b.length - 1].output.min.comparedTo(a[a.length - 1].output.min) || 0);
     }
     private static toBlock(value: pq.Row): Block {
         return {
@@ -3736,7 +3869,8 @@ export class Exchange {
             deployerAccountId: value['deployer_account_id'] ? new Uint256(value['deployer_account_id']) : null,
             deployerAccount: value['deployer_account_hash'] ? Signing.encodeAddress(new Pubkeyhash(new Uint8Array(value['deployer_account_hash']))) || undefined : null,
             blockNumber: Common.num(value['block_number']) ?? null,
-            parameters: this.parametersOf(value['type'], value['parameters'])
+            parameters: this.parametersOf(value['type'], value['parameters']),
+            synced: value['synced'] === true
         };
     }
     private static toOrder(value: pq.Row): Order {
@@ -3950,14 +4084,17 @@ export class Exchange {
         }
         return result.reverse();
     }
-    static async updateBookingStatus(bookingId: Uint256, to: string, connection?: pq.TransactionSql): Promise<Booking | null> {
+    static async updateBookingStatus(bookingId: Uint256, to: string, connection?: pq.TransactionSql, options?: { force?: boolean }): Promise<Booking | null> {
         const sql = connection || this.connection;
         const booking = await this.getBookingById(bookingId, connection);
         if (booking == null)
             throw new Error('AMS booking not found: ' + bookingId.toString());
 
-        if (to != booking.status && !(BOOKING_STATUS_EDGES[booking.status] || []).includes(to))
+        if (to != booking.status && !canTransition(booking.status, to) && options?.force !== true)
             throw new Error(`illegal AMS booking transition (${booking.status} -> ${to})`);
+
+        if (to != booking.status)
+            Log.info(`ams booking ${bookingId.toString()}: ${booking.status} -> ${to}${!canTransition(booking.status, to) ? ' (forced)' : ''}`);
 
         await this.resultOf(sql`UPDATE bookings SET status = ${to} WHERE id = ${bookingId.toString()}`);
 
@@ -4127,14 +4264,31 @@ export class Exchange {
     static async hasPendingBookings(connection?: pq.TransactionSql): Promise<boolean> {
         const sql = connection || this.connection;
         const result = await this.resultOf(sql`
-        SELECT EXISTS (SELECT TRUE FROM bookings WHERE status IN ('awaiting_deposit', 'finalizing_deposit')) AS pending`);
+        SELECT EXISTS (SELECT TRUE FROM bookings
+            WHERE bookings.status = 'awaiting_deposit'
+                AND bookings.deposit_hash IS NULL
+                AND bookings.expires_block > (SELECT COALESCE(MAX(block_number), 0) FROM blocks)) AS pending`);
         return result[0]?.['pending'] === true;
     }
-    static async setBookingDepositFacts(bookingId: Uint256, facts: { depositHash: Uint256, source: string, blockNumber?: number | null, payerAccountId?: Uint256 | null, preattestedTime?: number | null }, connection?: pq.TransactionSql): Promise<void> {
+    static async getBookingByDepositId(depositId: string, connection?: pq.TransactionSql): Promise<Booking | null> {
+        const sql = connection || this.connection;
+        const normalized = depositId.toLowerCase().replace(/^0x/, '');
+        const result = await this.resultOf(sql`
+        ${this.bookingSelect(sql)}
+        WHERE LOWER(CASE WHEN bookings.deposit_id LIKE '0x%' THEN SUBSTRING(bookings.deposit_id FROM 3) ELSE bookings.deposit_id END) = ${normalized}
+        ORDER BY bookings.id DESC LIMIT 1`);
+        try {
+            return this.toBooking(result[0]);
+        } catch {
+            return null;
+        }
+    }
+    static async setBookingDepositFacts(bookingId: Uint256, facts: { depositHash?: Uint256 | null, depositId?: string | null, source: string, blockNumber?: number | null, payerAccountId?: Uint256 | null, preattestedTime?: number | null }, connection?: pq.TransactionSql): Promise<void> {
         const sql = connection || this.connection;
         await this.resultOf(sql`
         UPDATE bookings SET
-            deposit_hash = ${facts.depositHash.toUint8Array()},
+            deposit_hash = COALESCE(${facts.depositHash?.toUint8Array() ?? null}, deposit_hash),
+            deposit_id = COALESCE(${facts.depositId ?? null}, deposit_id),
             deposit_source = ${facts.source},
             deposit_block = COALESCE(${facts.blockNumber ?? null}, deposit_block),
             deposit_payer_account_id = COALESCE(${facts.payerAccountId?.toString() ?? null}, deposit_payer_account_id),
@@ -4185,7 +4339,6 @@ export class Exchange {
         const result = await this.resultOf(sql`
         ${this.bookingSelect(sql)}
         WHERE bookings.proof_transaction_id = ${proofTransactionId}
-            AND bookings.status IN (${BookingStatus.FinalizingWithdrawal}, ${BookingStatus.FailingWithdrawal})
         ORDER BY bookings.id`);
         const bookings: Booking[] = [];
         for (let i = 0; i < result.length; i++) {
@@ -4196,12 +4349,12 @@ export class Exchange {
 
         return bookings;
     }
-    private static async getBookingsByWithdrawHash(withdrawHash: Uint256, statuses: string[], connection?: pq.TransactionSql): Promise<Booking[]> {
+    private static async getBookingsByWithdrawHash(withdrawHash: Uint256, statuses: string[] | null, connection?: pq.TransactionSql): Promise<Booking[]> {
         const sql = connection || this.connection;
         const result = await this.resultOf(sql`
         ${this.bookingSelect(sql)}
         WHERE bookings.withdraw_hash = ${withdrawHash.toUint8Array()}
-            AND bookings.status = ANY(${statuses})
+            AND (${statuses == null ? null : 'set'}::text IS NULL OR bookings.status = ANY(${statuses ?? []}))
         ORDER BY bookings.id`);
         const bookings: Booking[] = [];
         for (let i = 0; i < result.length; i++) {
@@ -4261,8 +4414,9 @@ export class Exchange {
             expiresBlock: Common.num(value['expires_block']) || 0,
             txHash: new Uint256(new Uint8Array(value['tx_hash'])).toHex(),
             blockNumber: Common.num(value['block_number']) || 0,
+            depositId: value['deposit_id'] != null ? String(value['deposit_id']) : null,
             depositHash: value['deposit_hash'] != null ? new Uint256(new Uint8Array(value['deposit_hash'])).toHex() : null,
-            depositStatus: value['deposit_hash'] == null ? null : (value['deposit_source'] == null ? null : (value['deposit_block'] != null ? 'confirmed' : 'pending')),
+            depositStatus: value['deposit_hash'] != null ? 'confirmed' : (value['deposit_id'] != null ? 'pending' : null),
             depositBlock: Common.num(value['deposit_block']) ?? null,
             depositPayer: value['deposit_payer_hash'] != null ? Signing.encodeAddress(new Pubkeyhash(new Uint8Array(value['deposit_payer_hash']))) || null : null,
             withdrawHash: value['withdraw_hash'] != null ? new Uint256(new Uint8Array(value['withdraw_hash'])).toHex() : null,

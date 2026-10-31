@@ -51,45 +51,51 @@ async function main(): Promise<void> {
         return process.exit(1);
     }
 
+    let rescanContracts: string[] = [ ];
+    try {
+        Log.info('running blockchain boot check');
+        const configured: Record<string, string> = blockchain.contracts || { };
+        const contracts = await Exchange.getContracts();
+        for (let type in configured) {
+            const account = configured[type];
+            if (typeof account != 'string' || account.length == 0 || !Object.values(ContractType).includes(type as ContractType))
+                continue;
+            const row = contracts.find((v) => v.type == type && v.account == account);
+            if (row == null ? contracts.length > 0 : !row.synced)
+                rescanContracts.push(account);
+        }
+        if (contracts.length == 0)
+            Log.info('blockchain boot check: no contracts registered yet (the first sync will index from scratch)');
+        else if (rescanContracts.length == 0)
+            Log.info('blockchain boot check: configured contracts match the database (no rescan needed)');
+        else
+            Log.info('blockchain boot check: targeted contract rescan queued for ' + rescanContracts.length + ' contract(s): ' + rescanContracts.join(', '));
+    } catch (exception: any) {
+        Log.error('blockchain boot check error:', exception);
+        return process.exit(1);
+    }
     try {
         Log.info('blockchain client setup (network: ' + (blockchain.network || 'default') + ', validator: ' + (blockchain.validator || 'null') + ')');
         await Blockchain.setup({
             validator: blockchain.validator,
             contracts: blockchain.contracts,
-            network: blockchain.network || undefined
+            network: blockchain.network || undefined,
+            rescan: rescanContracts
         });
     } catch (exception: any) {
         Log.error('blockchain setup error:', exception);
-        return process.exit(1);
-    }
-    try {
-        Log.info('running blockchain boot check');
-        const configured = Blockchain.contracts;
-        const contracts = await Exchange.getContracts();
-        let mismatch = contracts.length != Object.keys(configured).length;
-        for (let type in configured) {
-            const row = contracts.find((v) => v.account == configured[type as ContractType]);
-            if (row == null || row.type != type)
-                mismatch = true;
-        }
-        if (!mismatch) {
-            Log.info('blockchain boot check: configured contracts match the database');
-        } else if (contracts.length > 0) {
-            Log.info('blockchain boot check: configured contracts do not match the database, forcing a full rescan');
-            await Exchange.rollbackToBlock(0);
-        } else {
-            Log.info('blockchain boot check: no contracts registered yet (the first sync will register them)');
-        }
-    } catch (exception: any) {
-        Log.error('blockchain boot check error:', exception);
         return process.exit(1);
     }
 
     try {
         Log.info('running background jobs');
         if (options.jobs?.blockSync === true) {
-            await Blockchain.sync();
-            Log.info('background jobs: initial block sync complete (event-driven from now on)');
+            if (await Blockchain.sync()) {
+                await Exchange.setContractsSynced();
+                Log.info('background jobs: initial block sync complete (contracts marked synced, event-driven from now on)');
+            } else {
+                Log.info('background jobs: initial block sync incomplete (contracts left unsynced, event-driven from now on)');
+            }
         }
         if (typeof options.jobs?.assetsCleanup == 'number') {
             await Jobs.runAssetCleanup(options.jobs.assetsCleanup);
@@ -141,7 +147,9 @@ async function main(): Promise<void> {
         Log.info('relay server setup (http: ' + (relay.host || '?') + ':' + (relay.port || '?') + ')');
         await Relay.setup({
             host: relay.host,
-            port: relay.port || 19420
+            port: relay.port || 19420,
+            ipSource: relay.ipSource,
+            rateLimits: relay.rateLimits
         });
     } catch (exception: any) {
         Log.error('relay setup error:', exception);

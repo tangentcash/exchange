@@ -92,6 +92,7 @@ export type Contract<T extends ContractParameters = ContractParameters> = {
     deployerAccount?: string | null;
     blockNumber: number | null;
     parameters: T;
+    synced: boolean;
 }
 
 export type AggregatedPair = {
@@ -283,6 +284,7 @@ export type Booking = {
     expiresBlock: number,
     txHash: string,
     blockNumber: number,
+    depositId: string | null,
     depositHash: string | null,
     depositStatus: string | null,
     depositBlock: number | null,
@@ -343,6 +345,7 @@ export type RespendMessageParams = {
 
 export type PreattestationEvent = {
     txHash: Uint256,
+    txId: string | null,
     payerAccount: string | null,
     asset: AssetId,
     amount: BigNumber,
@@ -359,7 +362,9 @@ export type BroadcastEvent = {
 
 export type AttestationEvent = {
     txHash: Uint256,
-    hashdata: string
+    hashdata: string,
+    asset: AssetId | null,
+    amount: BigNumber | null
 };
 
 export enum PseudoEvent {

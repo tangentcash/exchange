@@ -13,16 +13,24 @@ import { Peers } from './peers';
 import { Quotes } from './market';
 import { Common } from '../common';
 import { Booking, BookingStatus, BookingSwap, AmsParameters, SpendMessageParams, RespendMessageParams } from '../types';
+import { BookingAcquisition, BookingLimits, BookingRateLimit } from './ratelimit';
 
 export type Options = {
     host: string,
-    port: number
+    port: number,
+    ipSource?: 'direct' | 'x-real-ip' | 'x-forwarded-for',
+    rateLimits?: Partial<BookingLimits>
+}
+
+export type CallMeta = {
+    ip: string | null
 }
 
 export type ChannelNode = {
     id: string;
     socket: WebSocket,
-    accounts: Set<string>
+    accounts: Set<string>,
+    ip: string
 }
 
 export type SwapExecution = {
@@ -46,15 +54,36 @@ export class Result {
         return { id: id || undefined, error: null, notification: result };
     }
     static error(error: any, id?: string) {
-        return { id: id || undefined, error: error && error.message ? error.message : null, result: null };
+        const retryAfter = error != null && typeof error.retryAfter == 'number' ? { retryAfter: error.retryAfter } : { };
+        return { id: id || undefined, error: error && error.message ? error.message : null, result: null, ...retryAfter };
     }
 }
 
 export class Relay {
     static channels: Record<string, ChannelNode> = { };
     static server: any;
+    static ipSource: 'direct' | 'x-real-ip' | 'x-forwarded-for' = 'direct';
 
+    static resolveIp(request: FastifyRequest): string | null {
+        if (this.ipSource == 'x-real-ip') {
+            const header = request.headers['x-real-ip'];
+            const value = Array.isArray(header) ? header[0] : header;
+            if (typeof value == 'string' && value.trim().length > 0)
+                return value.trim();
+        } else if (this.ipSource == 'x-forwarded-for') {
+            const header = request.headers['x-forwarded-for'];
+            const value = Array.isArray(header) ? header[0] : header;
+            if (typeof value == 'string' && value.length > 0) {
+                const first = value.split(',')[0].trim();
+                if (first.length > 0)
+                    return first;
+            }
+        }
+        return request.socket?.remoteAddress ?? request.ip ?? null;
+    }
     static async setup(config: Options): Promise<void> {
+        this.ipSource = config.ipSource || 'direct';
+        BookingRateLimit.configure(config.rateLimits);
         const server = fastify({
             trustProxy: true
         });
@@ -94,7 +123,7 @@ export class Relay {
         new Router.Swaps(server);
         new Router.Channel(server);
     }
-    static callable(context: any, callback: (args?: any, response?: FastifyReply) => Promise<any>, asIs?: boolean): ((request: FastifyRequest, reply: FastifyReply) => Promise<any>) {
+    static callable(context: any, callback: (args?: any, response?: FastifyReply, meta?: CallMeta) => Promise<any>, asIs?: boolean): ((request: FastifyRequest, reply: FastifyReply) => Promise<any>) {
         return async (request: FastifyRequest, reply: FastifyReply): Promise<any> => {
             const args: Record<string, any> | any[] = typeof request.body != 'object' || request.body == null ? { } : request.body;
             if (!Array.isArray(args)) {
@@ -117,7 +146,7 @@ export class Relay {
             }
 
             try {
-                const result = await callback.apply(context, [args, reply]);
+                const result = await callback.apply(context, [args, reply, { ip: Relay.resolveIp(request) }]);
                 const response = asIs ? result : Result.data(result);
                 Log.info('relay', `${request.ip} ${request.method.toLowerCase()} ${request.url} call:`, Relay.variable(args), '=>', Relay.variable(response));
                 return response;
@@ -130,8 +159,8 @@ export class Relay {
     static channelable(context: any, callback: (channel: ChannelNode, args?: any) => Promise<any>): ((socket: WebSocket, request: FastifyRequest) => void) {
         return (socket: WebSocket, request: FastifyRequest) => {
             const id = ByteUtil.uint8ArrayToHexString(randomBytes(16));
-            const ip = request.ip || id;
-            const channel = { id: id, socket: socket, accounts: new Set<string>() };
+            const ip = Relay.resolveIp(request) || id;
+            const channel = { id: id, socket: socket, accounts: new Set<string>(), ip: ip };
             this.channels[id] = channel;
             socket.on('close', () => delete this.channels[id]);
             socket.on('message', async (message: Buffer) => {
@@ -1111,7 +1140,15 @@ export namespace Router {
 
             return await Exchange.getBookings(Cursor.page(args.page || 0), keys.length > 0 ? keys : null, statuses.length > 0 ? statuses : null);
         }
-        static async book(args: { contract?: string, asset?: string | number, amount?: string | number, publicKey?: string }): Promise<SwapReference> {
+        static async book(args: { contract?: string, asset?: string | number, amount?: string | number, publicKey?: string }, _response?: FastifyReply, meta?: CallMeta): Promise<SwapReference> {
+            const limit: BookingAcquisition = BookingRateLimit.acquireBooking(meta != null ? meta.ip : null);
+            if (!limit.ok) {
+                const exception = new Error(limit.scope == 'instance'
+                    ? `Swap booking capacity reached, retry in ${limit.retryAfter} second${limit.retryAfter == 1 ? '' : 's'}`
+                    : `Too many swap bookings from your address, retry in ${limit.retryAfter} second${limit.retryAfter == 1 ? '' : 's'}`) as Error & { retryAfter?: number };
+                exception.retryAfter = limit.retryAfter;
+                throw exception;
+            }
             const contract = await this.contract();
             this.sequencer();
             if (typeof args.asset != 'string' && typeof args.asset != 'number')
@@ -1328,7 +1365,7 @@ export namespace Router {
     }
 
     export class Channel {
-        static routes: Record<string, { context: any, callback: (args?: any, response?: FastifyReply) => Promise<any> }> = { };
+        static routes: Record<string, { context: any, callback: (args?: any, response?: FastifyReply, meta?: CallMeta) => Promise<any> }> = { };
 
         constructor(server: FastifyInstance) {
             server.get('/', { websocket: true }, Relay.channelable(Channel, Channel.message));
@@ -1357,7 +1394,7 @@ export namespace Router {
                         if (!target)
                             break;
 
-                        const result = await target.callback.apply(target.context, [params]);
+                        const result = await target.callback.apply(target.context, [params, undefined, { ip: channel.ip }]);
                         return Result.data(result, args.id);
                     }
                 }
@@ -1367,7 +1404,7 @@ export namespace Router {
                 return Result.error(exception, args.id);
             }
         }
-        static register(server: FastifyInstance, method: 'get' | 'post', path: string, context: any, callback: (args?: any, response?: FastifyReply) => Promise<any>, asIs?: boolean): (args?: any, response?: FastifyReply) => Promise<any> {
+        static register(server: FastifyInstance, method: 'get' | 'post', path: string, context: any, callback: (args?: any, response?: FastifyReply, meta?: CallMeta) => Promise<any>, asIs?: boolean): (args?: any, response?: FastifyReply, meta?: CallMeta) => Promise<any> {
             switch (method) {
                 case 'get':
                     server.get(path, Relay.callable(context, callback, asIs));

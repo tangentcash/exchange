@@ -10,6 +10,7 @@ export type Options = {
     contracts?: Record<string, string>;
     network?: 'regtest' | 'testnet' | 'mainnet';
     tip?: number;
+    rescan?: string[];
 }
 
 export type Events = {
@@ -42,6 +43,9 @@ export class Blockchain {
     static timer: number | null = null;
     static syncing: boolean;
     static blockListeners: ((number: number) => void)[] = [ ];
+    static rescanContracts: string[] = [ ];
+    static offchainAccounts: { loaded: boolean, addresses: string[], assets: Record<string, string> } = { loaded: false, addresses: [], assets: { } };
+    
     static addBlockListener(callback: (number: number) => void): () => void {
         this.blockListeners.push(callback);
         return () => this.removeBlockListener(callback);
@@ -51,14 +55,13 @@ export class Blockchain {
         if (index != -1)
             this.blockListeners.splice(index, 1);
     }
-    private static fireBlock(number: number): void {
+    static fireBlock(number: number): void {
         for (let listener of this.blockListeners.slice()) {
             try {
                 listener(number);
             } catch { }
         }
     }
-
     static accountOf(account: string): ({ account: string, type: ContractType }) | null {
         for (let type in this.contracts)
             if (this.contracts[type as ContractType] == account)
@@ -78,6 +81,7 @@ export class Blockchain {
                     this.contracts[type as ContractType] = account;
             }
         }
+        this.rescanContracts = Array.isArray(config.rescan) ? config.rescan.filter((v) => typeof v == 'string' && v.length > 0) : [ ];
         RPC.applyValidator(config.validator || null);
         RPC.applyImplementation({
             onNodeMessage: (method: string, message: { args: any; error: unknown; } | { args: any; result: any; }, _: number) => Log.query(`blockchain rpc`, method, message),
@@ -118,53 +122,60 @@ export class Blockchain {
             this.timer = setTimeout(() => this.keepAlive(healthCheck, hadConnection), 5000) as any;
         }
     }
-    static async sync(tipBlockNumber?: number): Promise<void> {
+    static async sync(tipBlockNumber?: number): Promise<boolean> {
         const addresses = Object.values(this.contracts);
-        if (!addresses.length || this.syncing)
-            return;
+        if (!addresses.length)
+            return false;
+        else if (this.syncing)
+            return false;
 
         this.syncing = true;
         try {
             let pendingQueue: number[] = [], syncedBlockNumber = (await Exchange.getLatestBlock())?.blockNumber || null;
-            while (true) {
-                let boundaryBlock: number | null = null;
-                const queue: number[] = [];
+            for (let a = 0; a < addresses.length; a++) {
                 while (true) {
-                    const transactions = await RPC.getTransactionsByOwner(addresses, queue.length, queue.length > 0 ? 32 : 1, 0, 2);
-                    if (!Array.isArray(transactions) || !transactions.length)
-                        break;
+                    let boundaryBlock: number | null = null;
+                    const queue: number[] = [];
+                    while (true) {
+                        const transactions = await RPC.getTransactionsByOwner(addresses[a], queue.length, queue.length > 0 ? 32 : 1, 0, 2);
+                        if (!Array.isArray(transactions) || !transactions.length)
+                            break;
 
-                    let finalize = false;
-                    for (let i = 0; i < transactions.length && !finalize; i++) {
-                        const blockNumber = parseInt(transactions[i].receipt.block_number.toString());
-                        if (syncedBlockNumber && blockNumber <= syncedBlockNumber) {
-                            if (boundaryBlock == null || blockNumber > boundaryBlock)
-                                boundaryBlock = blockNumber;
-                            finalize = true;
+                        let finalize = false;
+                        for (let i = 0; i < transactions.length && !finalize; i++) {
+                            const blockNumber = parseInt(transactions[i].receipt.block_number.toString());
+                            if (syncedBlockNumber && blockNumber <= syncedBlockNumber) {
+                                if (boundaryBlock == null || blockNumber > boundaryBlock)
+                                    boundaryBlock = blockNumber;
+                                finalize = true;
+                            }
+                            if (!finalize)
+                                queue.unshift(blockNumber);
                         }
-                        if (!finalize)
-                            queue.unshift(blockNumber);
+
+                        if (finalize)
+                            break;
                     }
 
-                    if (finalize)
+                    if (queue.length > 0)
+                        Log.info(`blockchain indexing: ${queue.length} transaction${queue.length > 1 ? 's' : ''} (address: ${addresses[a]})`);
+
+                    for (let i = 0; i < queue.length; i++)
+                        if (pendingQueue.indexOf(queue[i]) == -1)
+                            pendingQueue.push(queue[i]);
+
+                    if (boundaryBlock == null)
                         break;
+
+                    const stored = await Exchange.getBlockByNumber(boundaryBlock);
+                    if (stored != null && await this.findBlock(stored.blockHash) != null)
+                        break;
+
+                    const forkPoint = stored ? await this.resolveForkPoint(boundaryBlock) : 0;
+                    Log.info(`blockchain reorganize: ${forkPoint > 0 ? 'rollback to block ' + forkPoint : 'rebuild from scratch'} (boundary: ${boundaryBlock}, collision: ${stored ? stored.blockHash.toHex() : 'null'})`);
+                    await Exchange.rollbackToBlock(forkPoint);
+                    syncedBlockNumber = forkPoint > 0 ? forkPoint : null;
                 }
-
-                if (queue.length > 0)
-                    Log.info(`blockchain indexing: ${queue.length} transaction${queue.length > 1 ? 's' : ''}`);
-
-                pendingQueue = queue;
-                if (boundaryBlock == null)
-                    break;
-
-                const stored = await Exchange.getBlockByNumber(boundaryBlock);
-                if (stored != null && await this.findBlock(stored.blockHash) != null)
-                    break;
-
-                const forkPoint = stored ? await this.resolveForkPoint(boundaryBlock) : 0;
-                Log.info(`blockchain reorganize: ${forkPoint > 0 ? 'rollback to block ' + forkPoint : 'rebuild from scratch'} (boundary: ${boundaryBlock}, collision: ${stored ? stored.blockHash.toHex() : 'null'})`);
-                await Exchange.rollbackToBlock(forkPoint);
-                syncedBlockNumber = forkPoint > 0 ? forkPoint : null;
             }
 
             if (!pendingQueue.length) {
@@ -175,6 +186,22 @@ export class Blockchain {
                     await Exchange.rollbackToBlock(forkPoint);
                     syncedBlockNumber = forkPoint > 0 ? forkPoint : null;
                 }
+            }
+            if (this.rescanContracts.length > 0) {
+                for (let i = 0; i < this.rescanContracts.length; i++) {
+                    const account = this.rescanContracts[i];
+                    const transactions = await RPC.fetchAll((offset, count) => RPC.getTransactionsByOwner(account, offset, count, 0, 2)) || [];
+                    let collected = 0;
+                    for (let j = 0; j < transactions.length; j++) {
+                        const blockNumber = parseInt(transactions[j]?.receipt?.block_number?.toString());
+                        if (!isNaN(blockNumber) && pendingQueue.indexOf(blockNumber) == -1) {
+                            pendingQueue.push(blockNumber);
+                            collected++;
+                        }
+                    }
+                    Log.info(`blockchain contract rescan: ${account} (${transactions.length} transactions, ${collected} blocks queued)`);
+                }
+                this.rescanContracts = [ ];
             }
 
             pendingQueue.sort((a: any, b: any) => a - b);
@@ -192,8 +219,11 @@ export class Blockchain {
             }
         } catch (exception) {
             Log.error('blockchain sync failed:', exception);
+            this.syncing = false;
+            return false;
         }
         this.syncing = false;
+        return true;
     }
     static async call(toAccount: string, method: string, args: any[]): Promise<any> {
         const asset = AssetId.fromHandle('BTC');
@@ -236,6 +266,41 @@ export class Blockchain {
     static async getAssetHolders(asset: AssetId): Promise<number | null> {
         return RPC.getAssetHolders(asset, 0);
     }
+    static async offchainRecipients(): Promise<Set<string>> {
+        const amsAccount = this.contracts[ContractType.AMS];
+        if (amsAccount != null && !this.offchainAccounts.loaded) {
+            try {
+                const rows: any[] = await RPC.getWitnessAccounts(amsAccount, 0, 64) || [];
+                const addresses: string[] = [];
+                const assets: Record<string, string> = { };
+                for (const row of rows) {
+                    if (row?.purpose != 'bridge' || !Array.isArray(row.addresses))
+                        continue;
+
+                    const assetId = row?.asset?.id;
+                    if (typeof assetId != 'string' || assetId.length < 1)
+                        continue;
+
+                    for (const address of row.addresses) {
+                        const value = String(address);
+                        if (value.length > 0 && !addresses.includes(value))
+                            addresses.push(value);
+
+                        assets[value] = assetId;
+                    }
+                }
+                this.offchainAccounts = { loaded: true, addresses, assets };
+                Log.info(`offchain accounts loaded (addresses: ${addresses.length})`);
+            } catch (exception) {
+                Log.error('failed to load offchain accounts:', exception);
+            }
+        }
+
+        const recipients = new Set<string>(amsAccount != null ? [amsAccount] : []);
+        for (const address of this.offchainAccounts.addresses)
+            recipients.add(address);
+        return recipients;
+    }
     static async dispatchBlock(number: number): Promise<void> {
         const block = await RPC.getBlockByNumber(number, 3);
         if (block == null) {
@@ -250,6 +315,9 @@ export class Blockchain {
         const preattestations: Record<string, PreattestationEvent[]> = { };
         const broadcasts: BroadcastEvent[] = [];
         const attestates: AttestationEvent[] = [];
+        const amsAccount = this.contracts[ContractType.AMS];
+        const depositRecipients = await this.offchainRecipients();
+        let linksChanged = false;
         if (Array.isArray(transactions)) {
             for (let i = 0; i < transactions.length; i++) {
                 const result = transactions[i];
@@ -264,8 +332,31 @@ export class Blockchain {
                     const proof = result.transaction['proof'];
                     if (result.transaction.type == 'attestate') {
                         const hashdata = String((proof != null && typeof proof == 'object' ? proof['hashdata'] ?? proof['hash_data'] ?? proof['transaction_id'] ?? proof['transactionId'] : null) ?? result.transaction['hashdata'] ?? result.transaction['hash_data'] ?? '');
+                        let attestAsset: AssetId | null = null;
+                        let attestAmount: BigNumber | null = null;
+                        const rawAsset = result.transaction['asset'];
+                        if (rawAsset != null && typeof rawAsset == 'object' && typeof rawAsset['id'] == 'string' && rawAsset['id'].length > 0) {
+                            try {
+                                attestAsset = new AssetId(rawAsset['id']);
+                            } catch {
+                                attestAsset = null;
+                            }
+                        }
+                        if (attestAsset != null && proof != null && typeof proof == 'object' && Array.isArray(proof['outputs'])) {
+                            const outputs = proof['outputs'];
+                            for (let k = 0; k < outputs.length; k++) {
+                                const output = outputs[k];
+                                if (output == null || typeof output != 'object')
+                                    continue;
+                                const link = output['link'];
+                                const address = link != null && typeof link == 'object' && typeof link['address'] == 'string' ? link['address'] : null;
+                                const value = output['value'] != null ? new BigNumber(output['value']) : null;
+                                if (address != null && depositRecipients.has(address) && value != null && !value.isNaN() && value.isGreaterThan(0))
+                                    attestAmount = (attestAmount ?? new BigNumber(0)).plus(value);
+                            }
+                        }
                         if (txHash != null && hashdata.length > 0)
-                            attestates.push({ txHash: txHash, hashdata: hashdata });
+                            attestates.push({ txHash: txHash, hashdata: hashdata, asset: attestAsset, amount: attestAmount });
                     } else {
                         const withdrawHash = Common.u256(result.transaction['withdraw_hash'] ?? null);
                         if (txHash != null && withdrawHash != null) {
@@ -302,17 +393,19 @@ export class Blockchain {
                 for (let j = 0; j < subtransactions.length; j++) {
                     const target = subtransactions[j];
                     const toAccount = target.transaction.callable || target.transaction.recipient || '';
-                    const payments = this.transactionPayments(target.transaction);
+                    if (amsAccount != null && !linksChanged && toAccount == amsAccount && target.transaction.function == 'reconstruct_link')
+                        linksChanged = true;
+                    const payments = this.transactionPayments(target.transaction, this.offchainAccounts.assets);
                     if (payments != null) {
                         const depositHash = Common.u256(target.transaction.hash);
                         if (depositHash != null) {
                             for (let recipient in payments) {
-                                if (this.contracts[ContractType.AMS] != recipient)
+                                if (!depositRecipients.has(recipient))
                                     continue;
 
-                                const rows = this.preattestationEvents(payments[recipient], depositHash, target.sender || null, 'mined');
-                                if (rows.length > 0) {
-                                    const subdeposits = preattestations[recipient] || (preattestations[recipient] = []);
+                                const rows = this.preattestationEvents(payments[recipient], depositHash, typeof target.transaction.hash == 'string' ? target.transaction.hash : null, target.sender || null, 'mined');
+                                if (rows.length > 0 && amsAccount != null) {
+                                    const subdeposits = preattestations[amsAccount] || (preattestations[amsAccount] = []);
                                     for (let k = 0; k < rows.length; k++)
                                         subdeposits.push(rows[k]);
                                 }
@@ -353,8 +446,12 @@ export class Blockchain {
         const blockHash = new Uint256(block.hash, 16);
         const blockRef = { number: number, time: blockDate };
         await Exchange.setBlock({ blockNumber: number, blockHash: blockHash }, accounts);
+
+        if (linksChanged) {
+            this.offchainAccounts.loaded = false;
+            await this.offchainRecipients();
+        }
         
-        const amsAccount = this.contracts[ContractType.AMS];
         if (amsAccount != null) {
             const deposits: EventInfo[] = [];
             for (let account in preattestations) {
@@ -383,14 +480,14 @@ export class Blockchain {
             }
         }
     }
-    private static async findBlock(hash?: Uint256): Promise<any> {
+    static async findBlock(hash?: Uint256): Promise<any> {
         try {
             return await RPC.forcedPolicy('no-cache', () => RPC.getBlockByHash(hash?.toHex() || ''));
         } catch {
             return null;
         }
     }
-    private static async resolveForkPoint(upperBound: number): Promise<number> {
+    static async resolveForkPoint(upperBound: number): Promise<number> {
         let lo = 0, hi = upperBound;
         while (hi - lo > 1) {
             const mid = Math.floor((lo + hi) / 2);
@@ -402,7 +499,7 @@ export class Blockchain {
 
         return lo;
     }
-    private static async blockMatchesNode(blockNumber: number): Promise<boolean> {
+    static async blockMatchesNode(blockNumber: number): Promise<boolean> {
         const stored = await Exchange.getBlockByNumber(blockNumber);
         if (stored == null)
             return false;
@@ -419,7 +516,8 @@ export class Blockchain {
         if (amsAccount == null)
             return;
 
-        const result = await RPC.getMempoolPreattestations(0, count, { transactionIds: [], addresses: [amsAccount], memoAccounts: [] });
+        const recipients = await this.offchainRecipients();
+        const result = await RPC.getMempoolPreattestations(0, count, { transactionIds: [], addresses: [...recipients], memoAccounts: [amsAccount] });
         const items: any[] = Array.isArray(result) ? result : (result != null && typeof result == 'object' && Array.isArray(result['transactions']) ? result['transactions'] : []);
         const preattestations: Record<string, PreattestationEvent[]> = { };
         for (let i = 0; i < items.length; i++) {
@@ -428,25 +526,26 @@ export class Blockchain {
                 continue;
 
             const transaction = entry['transaction'] != null && typeof entry['transaction'] == 'object' ? entry['transaction'] : entry;
-            if (entry['successful'] === false || transaction['successful'] === false)
+            if (entry['successful'] === false || transaction['successful'] === false || transaction['success'] === false)
                 continue;
 
-            const payments = this.transactionPayments(transaction);
+            const payments = this.transactionPayments(transaction, this.offchainAccounts.assets);
             if (payments == null)
                 continue;
 
-            const depositHash = Common.u256(entry['transactionId'] ?? transaction['hash'] ?? entry['hash'] ?? null);
+            const rawId = entry['transaction_id'] ?? entry['transactionId'] ?? transaction['transaction_id'] ?? transaction['hash'] ?? entry['hash'] ?? null;
+            const depositHash = Common.u256(typeof rawId == 'string' && rawId.length > 0 && !rawId.startsWith('0x') ? '0x' + rawId : rawId);
             if (depositHash == null)
                 continue;
 
             const payerAccount = typeof transaction['from'] == 'string' ? transaction['from'] : (typeof transaction['fromAccount'] == 'string' ? transaction['fromAccount'] : null);
             for (let recipient in payments) {
-                if (this.contracts[ContractType.AMS] != recipient)
+                if (!recipients.has(recipient))
                     continue;
 
-                const rows = this.preattestationEvents(payments[recipient], depositHash, payerAccount, 'preattestation');
+                const rows = this.preattestationEvents(payments[recipient], depositHash, typeof rawId == 'string' ? rawId : null, payerAccount, 'preattestation');
                 if (rows.length > 0) {
-                    const subdeposits = preattestations[recipient] || (preattestations[recipient] = []);
+                    const subdeposits = preattestations[amsAccount] || (preattestations[amsAccount] = []);
                     for (let j = 0; j < rows.length; j++)
                         subdeposits.push(rows[j]);
                 }
@@ -465,7 +564,7 @@ export class Blockchain {
             }
         }
     }
-    private static transactionPayments(transaction: unknown): Record<string, unknown[]> | null {
+    static transactionPayments(transaction: unknown, assets?: Record<string, string>): Record<string, unknown[]> | null {
         if (transaction == null || typeof transaction != 'object')
             return null;
 
@@ -496,12 +595,25 @@ export class Blockchain {
             }
         }
 
+        if (assets != null && Array.isArray(tx.outputs)) {
+            for (let i = 0; i < tx.outputs.length; i++) {
+                const output = tx.outputs[i] as Record<string, unknown> | null;
+                const link = output != null && typeof output == 'object' ? output.link as Record<string, unknown> | null : null;
+                const address = link != null ? String(link.address ?? '') : '';
+                const asset = address.length > 0 ? assets[address] : undefined;
+                if (asset == null || output == null || output.value == null)
+                    continue;
+
+                remember(address, { asset: asset, value: output.value });
+            }
+        }
+
         return result;
     }
-    private static amsIndexedEvent(type: PseudoEvent, hash: string, toAccount: string, args: any[]): EventInfo {
+    static amsIndexedEvent(type: PseudoEvent, hash: string, toAccount: string, args: any[]): EventInfo {
         return { hash: hash, fromAccount: '', toAccount: toAccount, method: null, args: [], pays: [], event: { type: type, args: args } };
     }
-    private static preattestationEvents(pays: any[], depositHash: Uint256, payerAccount: string | null, source: 'preattestation' | 'mined'): PreattestationEvent[] {
+    static preattestationEvents(pays: any[], depositHash: Uint256, txId: string | null, payerAccount: string | null, source: 'preattestation' | 'mined'): PreattestationEvent[] {
         const totals: Record<string, BigNumber> = { };
         const bridged: Record<string, { asset: AssetId, amount: BigNumber }> = { };
         for (let i = 0; i < pays.length; i++) {
@@ -532,7 +644,7 @@ export class Blockchain {
         const isSinglePayment = Object.keys(totals).length == 1;
         const rows: PreattestationEvent[] = [];
         for (let id in bridged)
-            rows.push({ txHash: depositHash, payerAccount: payerAccount, asset: bridged[id].asset, amount: bridged[id].amount, source: source, isSinglePayment: isSinglePayment });
+            rows.push({ txHash: depositHash, txId: txId, payerAccount: payerAccount, asset: bridged[id].asset, amount: bridged[id].amount, source: source, isSinglePayment: isSinglePayment });
         return rows;
     }
 }

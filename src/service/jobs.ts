@@ -22,7 +22,7 @@ export class Jobs {
         interval: number,
         timeout: NodeJS.Timeout | null
     } = {
-        interval: 90_000,
+        interval: 60_000,
         timeout: null
     };
 

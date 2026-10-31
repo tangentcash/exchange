@@ -40,6 +40,14 @@ _Oracle data is used to build the pricing charts and is available only on the ru
 *   **Tiered Fees:** Dynamic maker/taker fees based on volume and configurable exponents.
 *   **Maintenance Jobs:** Automated cleanup for orphaned assets and inactive trading pairs.
 
+### Anti-DoS: Booking Rate Limits
+
+Swap booking submissions (`POST /swaps`, also via the websocket channel) are throttled with two in-memory scopes:
+*   **Per instance** — global bookings per minute across all clients (`bookingsPerMinute`, default `64`).
+*   **Per user** — bookings per minute keyed by client address (`bookingsPerIpPerMinute`, default `1`).
+
+Configured in `relay.rateLimits` of `indexer.json`. Nothing is written to the database: client addresses live only as per-process salted SHA-256 hashes with sliding 60-second windows. When a limit is hit the relay rejects the call with a message and a structured `retryAfter` field (seconds until the next slot frees). Which address to trust is set by `relay.ipSource`: `direct` (default, socket address — use when no reverse proxy is in front, e.g. local/regtest instances; spoofing headers is then impossible), `x-real-ip` (nginx-fronted deployments), or `x-forwarded-for` (leftmost entry).
+
 ## Dependencies
 * [bignumber.js](https://github.com/MikeMcl/bignumber.js)
 * [fastify](https://github.com/fastify/fastify)
