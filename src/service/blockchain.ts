@@ -42,6 +42,7 @@ export class Blockchain {
     static blockchains: BlockchainInfo[] | null = null;
     static timer: number | null = null;
     static syncing: boolean;
+    static pendingBlock: number | null = null;
     static blockListeners: ((number: number) => void)[] = [ ];
     static rescanContracts: string[] = [ ];
     static offchainAccounts: { loaded: boolean, addresses: string[], assets: Record<string, string> } = { loaded: false, addresses: [], assets: { } };
@@ -89,7 +90,12 @@ export class Blockchain {
         RPC.onNodeEvent = async (event) => {
             if (event.type == 'block' && typeof event.result.number == 'number' && event.result.number > 0) {
                 this.fireBlock(event.result.number);
-                await this.sync(event.result.number);
+                if (this.syncing) {
+                    if (this.pendingBlock == null || event.result.number > this.pendingBlock)
+                        this.pendingBlock = event.result.number;
+                } else {
+                    await this.sync(event.result.number);
+                }
             }
         };
         return await this.keepAlive(true);
@@ -219,10 +225,17 @@ export class Blockchain {
             }
         } catch (exception) {
             Log.error('blockchain sync failed:', exception);
+            this.pendingBlock = null;
             this.syncing = false;
             return false;
         }
         this.syncing = false;
+        if (this.pendingBlock != null) {
+            const queued = this.pendingBlock;
+            this.pendingBlock = null;
+            Log.info('blockchain sync: block event queued during scan (block: ' + queued + '), running another iteration');
+            return await this.sync(queued);
+        }
         return true;
     }
     static async call(toAccount: string, method: string, args: any[]): Promise<any> {
