@@ -92,9 +92,8 @@ export type Options = {
     application?: string;
     connections?: number;
     intervals?: number[];
-    signer?: {
+    sequencer?: {
         secretKey?: string;
-        simulation?: boolean;
         confirmTimeout?: number;
         maxGasPrice?: number;
     }
@@ -111,7 +110,6 @@ export type Caches = {
 export type Sequencer = {
     secretKey: Seckey,
     address: string,
-    simulation: boolean,
     confirmTimeout: number,
     maxGasPrice: number | null
 }
@@ -172,24 +170,23 @@ export class Exchange {
         };
     }
     static async setup(config: Options): Promise<void> {
-        const signer = config.signer; this.sequencer = null;
-        if (signer != null && typeof signer.secretKey == 'string') {
-            const secretKey = Signing.decodeSecretKey(signer.secretKey);
+        const sequencer = config.sequencer; this.sequencer = null;
+        if (sequencer != null && typeof sequencer.secretKey == 'string') {
+            const secretKey = Signing.decodeSecretKey(sequencer.secretKey);
             if (secretKey == null)
-                throw new Error('invalid signer secret key (read-only mode)');
+                throw new Error('invalid sequencer secret key (read-only mode)');
 
             const address = Signing.encodeAddress(Signing.derivePublicKeyHash(Signing.derivePublicKey(secretKey)));
             if (address == null)
-                throw new Error('failed to derive signer address (read-only mode)');
+                throw new Error('failed to derive sequencer address (read-only mode)');
 
             this.sequencer = {
                 secretKey: secretKey,
                 address: address,
-                simulation: signer.simulation === true,
-                confirmTimeout: typeof signer.confirmTimeout == 'number' ? signer.confirmTimeout : 120,
-                maxGasPrice: typeof signer.maxGasPrice == 'number' ? signer.maxGasPrice : null
+                confirmTimeout: typeof sequencer.confirmTimeout == 'number' ? sequencer.confirmTimeout : 120,
+                maxGasPrice: typeof sequencer.maxGasPrice == 'number' ? sequencer.maxGasPrice : null
             };
-            Log.info(`sequencer ${address}${this.sequencer.simulation ? ' (simulation mode)' : ''}`);
+            Log.info(`sequencer ${address}`);
         } else {
             this.sequencer = null;
         }

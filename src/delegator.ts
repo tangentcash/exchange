@@ -25,7 +25,6 @@ type DelegatorConfig = {
     secretKeyEnv?: string,
     confirmTimeout: number,
     callTimeout: number,
-    simulation: boolean,
     watch?: {
         connectTimeout?: number
     },
@@ -262,7 +261,7 @@ function delay(ms: number): Promise<void> {
     setTimeout(resolve, ms);
     return promise;
 }
-async function submit(config: { confirmTimeout: number, simulation: boolean }, identity: BotIdentity, options: SubmitOptions): Promise<string | null> {
+async function submit(config: { confirmTimeout: number }, identity: BotIdentity, options: SubmitOptions): Promise<string | null> {
     const nonce = new Uint256((await RPC.getNextAccountNonce(identity.address))?.toString());
     const gasPrice = new BigNumber((await RPC.getGasPrice(new AssetId(), 0.95))?.price.toString() || 0);
     if (options.maxGasPrice != null && gasPrice.gt(options.maxGasPrice))
@@ -303,11 +302,6 @@ async function submit(config: { confirmTimeout: number, simulation: boolean }, i
 
         if (!gasLimit.gt(0))
             throw new Error('failed to simulate transaction');
-
-        if (config.simulation) {
-            Log.info(`${options.describe} simulated (gas: ${gasLimit.toString()}): ${JSON.stringify(receipt, null, 2)}`);
-            return null;
-        }
 
         const transactionHash = await RPC.submitTransaction(build(gasLimit).encode());
         if (!transactionHash)
@@ -374,7 +368,6 @@ function resolveConfig(path: string): DelegatorConfig {
         secretKeyEnv: stringOr(source, 'secretKeyEnv'),
         confirmTimeout: numberOr(source, 'confirmTimeout', 120),
         callTimeout: numberOr(source, 'callTimeout', 30),
-        simulation: source.simulation === true,
         watch: typeof source.watch == 'object' && source.watch != null ? source.watch as { connectTimeout?: number } : undefined,
         backoff: { base: numberOr(backoff, 'base', 15), cap: numberOr(backoff, 'cap', 300) },
         rules

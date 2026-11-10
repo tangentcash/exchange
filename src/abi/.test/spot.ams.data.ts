@@ -24,6 +24,7 @@ const FEE_PATH = [
 const RESPEND_AMOUNT = "1561.404130219803563975";
 const RESPEND_ASSET: [string, string, string] = ["ETH", "USDT", "0xdAC17F958D2ee523a2206206994597C13D831ec7"];
 const RESPEND_BRIDGE = ETH_BRIDGE;
+const DEPOSIT_PRECISION = 6;
 const entropy = new Uint8Array(32).fill(0xAB);
 
 interface Swap {
@@ -49,10 +50,13 @@ function spendDeposit(depositHash: string, bridgeHash: string, asset: string, am
     message.writeInteger(new Uint256(depositHash, 16));
     message.writeInteger(new Uint256(bridgeHash, 16));
     message.writeInteger(assetOf(asset).toUint256());
-    message.writeDecimal(new BigNumber(amount), true);
+    message.writeDecimal(new BigNumber(amount).dp(DEPOSIT_PRECISION, BigNumber.ROUND_DOWN), true);
     message.writeBinaryStringOptimized((Signing.decodeAddress(toAddress) as Pubkeyhash).data);
     message.writeBinaryStringOptimized((Signing.decodeAddress(fromAddress) as Pubkeyhash).data);
     message.writeString(routing);
+    message.writeString('\0'.repeat(65));
+    message.writeInteger(0);
+    message.writeDecimal(new BigNumber(NaN), true);
     message.writeInteger(path.length + feePath.length);
     for (const order of path.concat(feePath))
     {
@@ -71,10 +75,13 @@ function respendDeposit(depositHash: string, broadcastHash: string, bridgeHash: 
     message.writeInteger(new Uint256(broadcastHash, 16));
     message.writeInteger(new Uint256(bridgeHash, 16));
     message.writeInteger(assetOf(asset).toUint256());
-    message.writeDecimal(new BigNumber(amount));
+    message.writeDecimal(new BigNumber(amount).dp(DEPOSIT_PRECISION, BigNumber.ROUND_DOWN), true);
     message.writeBinaryStringOptimized((Signing.decodeAddress(toAddress) as Pubkeyhash).data);
     message.writeBinaryStringOptimized((Signing.decodeAddress(fromAddress) as Pubkeyhash).data);
     message.writeString(routing);
+    message.writeString('\0'.repeat(65));
+    message.writeInteger(0);
+    message.writeDecimal(new BigNumber(NaN), true);
     return message.data;
 }
 function signBlob(message: Uint8Array, secretKey: Seckey, publicKey: Pubkey): string {
@@ -120,6 +127,7 @@ function main(): void {
             `${T}${T}${JSON.stringify(routing)},`,
             swapArray(TOKEN_PATH) + ",",
             swapArray(FEE_PATH) + ",",
+            `${T}${T}{ "$blob": "0x2a0800" },`,
             `${T}${T}{ "$blob": ${JSON.stringify(sig)} }`,
             kind === "try" ? `${T}],` : `${T}]`,
             ""
@@ -133,6 +141,7 @@ function main(): void {
             `${T}${T}${dec(BROADCAST)},`,
             `${T}${T}${dec(RESPEND_BRIDGE)},`,
             `${T}${T}${JSON.stringify(ROUTING)},`,
+            `${T}${T}{ "$blob": "0x2a0800" },`,
             `${T}${T}{ "$blob": ${JSON.stringify(sig)} }`,
             `${T}]`,
             ""

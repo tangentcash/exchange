@@ -320,6 +320,14 @@ export type BookingSwap = {
     buying: boolean
 };
 
+export type SendQuota = {
+    signature: string,
+    blockNumber: string,
+    feeRate: string
+};
+
+export const NoSendQuota: SendQuota = { signature: '', blockNumber: '0', feeRate: '' };
+
 export type SpendMessageParams = {
     depositHash: Uint256,
     bridgeHash: Uint256,
@@ -329,7 +337,8 @@ export type SpendMessageParams = {
     sequencerAddress: string,
     routingAddress: string,
     tokenPath: BookingSwap[],
-    feePath: BookingSwap[]
+    feePath: BookingSwap[],
+    quota: SendQuota
 };
 
 export type RespendMessageParams = {
@@ -340,7 +349,8 @@ export type RespendMessageParams = {
     amount: BigNumber,
     contractAddress: string,
     sequencerAddress: string,
-    routingAddress: string
+    routingAddress: string,
+    quota: SendQuota
 };
 
 export type PreattestationEvent = {

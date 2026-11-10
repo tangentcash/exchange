@@ -109,8 +109,8 @@ async function main(): Promise<void> {
             await Jobs.runMarketData(options.jobs.marketData);
             Log.info('background jobs: market polling now running');
         }
-        if (typeof options.jobs?.amsDeposits == 'object') {
-            await Jobs.runPreattestationsData(options.jobs.amsDeposits);
+        if (typeof options.jobs?.preattestationData == 'object') {
+            await Jobs.runPreattestationsData(options.jobs.preattestationData);
             Log.info('background jobs: preattestation polling now running');
         }
         if (typeof options.jobs?.assetPrices == 'object') {

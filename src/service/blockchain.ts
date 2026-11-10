@@ -309,9 +309,11 @@ export class Blockchain {
             }
         }
 
-        const recipients = new Set<string>(amsAccount != null ? [amsAccount] : []);
-        for (const address of this.offchainAccounts.addresses)
+        const recipients = new Set<string>(amsAccount != null ? [amsAccount, amsAccount.toLowerCase()] : []);
+        for (const address of this.offchainAccounts.addresses) {
             recipients.add(address);
+            recipients.add(address.toLowerCase());
+        }
         return recipients;
     }
     static async dispatchBlock(number: number): Promise<void> {
@@ -329,8 +331,9 @@ export class Blockchain {
         const broadcasts: BroadcastEvent[] = [];
         const attestates: AttestationEvent[] = [];
         const amsAccount = this.contracts[ContractType.AMS];
-        const depositRecipients = await this.offchainRecipients();
+        let depositRecipients = await this.offchainRecipients();
         let linksChanged = false;
+        const deferredPayments: { transaction: any, sender: string | null }[] = [];
         if (Array.isArray(transactions)) {
             for (let i = 0; i < transactions.length; i++) {
                 const result = transactions[i];
@@ -338,8 +341,12 @@ export class Blockchain {
                 if (!receipt.successful)
                     continue;
 
-                if (result.affected && Array.isArray(result.affected.accounts))
-                    accounts = accounts.concat(result.affected.accounts);
+                const touched = result.affected != null && Array.isArray(result.affected.accounts) ? result.affected.accounts as string[] : [ ];
+                if (touched.length > 0)
+                    accounts = accounts.concat(touched);
+                const txType = result.transaction.type != null ? String(result.transaction.type) : '';
+                if (!linksChanged && amsAccount != null && (txType == 'route' || txType == 'bind' || txType == 'imbind') && (receipt.from == amsAccount || touched.indexOf(amsAccount) != -1))
+                    linksChanged = true;
                 if (result.transaction.type == 'broadcast' || result.transaction.type == 'attestate') {
                     const txHash = Common.u256(result.transaction.hash);
                     const proof = result.transaction['proof'];
@@ -355,6 +362,8 @@ export class Blockchain {
                                 attestAsset = null;
                             }
                         }
+                        const proofMemo = proof != null && typeof proof == 'object' && typeof proof['memo'] == 'string' ? proof['memo'] : '';
+                        const depositRoutedToAms = amsAccount != null && proofMemo == amsAccount;
                         if (attestAsset != null && proof != null && typeof proof == 'object' && Array.isArray(proof['outputs'])) {
                             const outputs = proof['outputs'];
                             for (let k = 0; k < outputs.length; k++) {
@@ -364,7 +373,7 @@ export class Blockchain {
                                 const link = output['link'];
                                 const address = link != null && typeof link == 'object' && typeof link['address'] == 'string' ? link['address'] : null;
                                 const value = output['value'] != null ? new BigNumber(output['value']) : null;
-                                if (address != null && depositRecipients.has(address) && value != null && !value.isNaN() && value.isGreaterThan(0))
+                                if (address != null && (depositRecipients.has(address) || depositRoutedToAms) && value != null && !value.isNaN() && value.isGreaterThan(0))
                                     attestAmount = (attestAmount ?? new BigNumber(0)).plus(value);
                             }
                         }
@@ -406,25 +415,8 @@ export class Blockchain {
                 for (let j = 0; j < subtransactions.length; j++) {
                     const target = subtransactions[j];
                     const toAccount = target.transaction.callable || target.transaction.recipient || '';
-                    if (amsAccount != null && !linksChanged && toAccount == amsAccount && target.transaction.function == 'reconstruct_link')
-                        linksChanged = true;
-                    const payments = this.transactionPayments(target.transaction, this.offchainAccounts.assets);
-                    if (payments != null) {
-                        const depositHash = Common.u256(target.transaction.hash);
-                        if (depositHash != null) {
-                            for (let recipient in payments) {
-                                if (!depositRecipients.has(recipient))
-                                    continue;
-
-                                const rows = this.preattestationEvents(payments[recipient], depositHash, typeof target.transaction.hash == 'string' ? target.transaction.hash : null, target.sender || null, 'mined');
-                                if (rows.length > 0 && amsAccount != null) {
-                                    const subdeposits = preattestations[amsAccount] || (preattestations[amsAccount] = []);
-                                    for (let k = 0; k < rows.length; k++)
-                                        subdeposits.push(rows[k]);
-                                }
-                            }
-                        }
-                    }
+                    if ((Array.isArray(target.transaction.pays) && target.transaction.pays.length > 0) || target.transaction.type == 'transfer' || Array.isArray(target.transaction.outputs))
+                        deferredPayments.push({ transaction: target.transaction, sender: target.sender || null });
 
                     if (target.transaction.type != 'call' && target.transaction.type != 'deploy')
                         continue;
@@ -462,7 +454,30 @@ export class Blockchain {
 
         if (linksChanged) {
             this.offchainAccounts.loaded = false;
-            await this.offchainRecipients();
+            depositRecipients = await this.offchainRecipients();
+        }
+
+        for (let i = 0; i < deferredPayments.length; i++) {
+            const target = deferredPayments[i];
+            const payments = this.transactionPayments(target.transaction, this.offchainAccounts.assets);
+            if (payments == null)
+                continue;
+
+            const depositHash = Common.u256(target.transaction.hash);
+            if (depositHash == null)
+                continue;
+
+            for (let recipient in payments) {
+                if (!depositRecipients.has(recipient))
+                    continue;
+
+                const rows = this.preattestationEvents(payments[recipient], depositHash, typeof target.transaction.hash == 'string' ? target.transaction.hash : null, target.sender, 'mined');
+                if (rows.length > 0 && amsAccount != null) {
+                    const subdeposits = preattestations[amsAccount] || (preattestations[amsAccount] = []);
+                    for (let k = 0; k < rows.length; k++)
+                        subdeposits.push(rows[k]);
+                }
+            }
         }
         
         if (amsAccount != null) {
@@ -613,7 +628,7 @@ export class Blockchain {
                 const output = tx.outputs[i] as Record<string, unknown> | null;
                 const link = output != null && typeof output == 'object' ? output.link as Record<string, unknown> | null : null;
                 const address = link != null ? String(link.address ?? '') : '';
-                const asset = address.length > 0 ? assets[address] : undefined;
+                const asset = address.length > 0 ? (assets[address] ?? assets[address.toLowerCase()]) : undefined;
                 if (asset == null || output == null || output.value == null)
                     continue;
 

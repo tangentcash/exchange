@@ -18,11 +18,11 @@ export class Jobs {
     static assetCleanup: NodeJS.Timeout | null = null;
     static pairCleanup: NodeJS.Timeout | null = null;
     static marketData: NodeJS.Timeout | null = null;
-    static amsDeposits: {
+    static preattestationData: {
         interval: number,
         timeout: NodeJS.Timeout | null
     } = {
-        interval: 60_000,
+        interval: 30_000,
         timeout: null
     };
 
@@ -156,15 +156,15 @@ export class Jobs {
     }
     static async runPreattestationsData(config?: { interval?: number }, runDeferred?: boolean): Promise<void> {
         const { promise, resolve } = Promise.withResolvers<void>();
-        if (this.amsDeposits.timeout != null) {
+        if (this.preattestationData.timeout != null) {
             resolve();
             return promise;
         }
 
         if (typeof config?.interval == 'number' && config.interval > 0)
-            this.amsDeposits.interval = config.interval;
+            this.preattestationData.interval = config.interval;
 
-        this.amsDeposits.timeout = setTimeout(async () => {
+        this.preattestationData.timeout = setTimeout(async () => {
             try {
                 if (await Exchange.hasPendingBookings()) {
                     await Blockchain.pollPreattestations();
@@ -174,10 +174,10 @@ export class Jobs {
                 Log.error('job preattestations pull error:', exception);
             }
 
-            this.amsDeposits.timeout = null;
+            this.preattestationData.timeout = null;
             this.runPreattestationsData(config, true);
             resolve();
-        }, runDeferred ? this.amsDeposits.interval : 0);
+        }, runDeferred ? this.preattestationData.interval : 0);
         return promise;
     }
 }

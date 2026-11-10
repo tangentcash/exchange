@@ -12,7 +12,7 @@ import BigNumber from 'bignumber.js';
 import { Peers } from './peers';
 import { Quotes } from './market';
 import { Common } from '../common';
-import { Booking, BookingStatus, BookingSwap, AmsParameters, SpendMessageParams, RespendMessageParams } from '../types';
+import { Booking, BookingStatus, BookingSwap, AmsParameters, SpendMessageParams, RespendMessageParams, SendQuota, NoSendQuota } from '../types';
 import { BookingAcquisition, BookingLimits, BookingRateLimit } from './ratelimit';
 
 export type Options = {
@@ -46,7 +46,23 @@ export type SwapReference = {
     amount?: string
 }
 
-export class Result {
+export type BridgeSelection = {
+    hash: string,
+    chain: string,
+    feeRate: string,
+    supply: string | null,
+    master: string | null,
+    witnesses: string[],
+    routingPolicy: string | null
+}
+
+export type BridgeQuote = BridgeSelection & {
+    path: RouterPath[] | null,
+    sendQuota: SendQuota,
+    sendFee: string
+}
+
+class Result {
     static data(result: any, id?: string) {
         return { id: id || undefined, error: null, result: result };
     }
@@ -242,12 +258,13 @@ export namespace Router {
             Channel.register(server, 'get', '/asset/query', Asset, Asset.getQuery);
             Channel.register(server, 'get', '/asset', Asset, Asset.get);
         }
-        static async getPortfolio(args?: { base?: string }): Promise<{ prices: PriceDescriptors, descriptors: BlockchainInfo[], contracts: Contract[], rate: BigNumber | null }> {
-            const [prices, descriptors, contracts, rate] = await Promise.all([this.getPrices(), this.getDescriptors(), Exchange.getContracts(), Market.rateOf(args?.base)]);
+        static async getPortfolio(args?: { base?: string }): Promise<{ prices: PriceDescriptors, descriptors: BlockchainInfo[], contracts: Contract[], tip: number | null, rate: BigNumber | null }> {
+            const [prices, descriptors, contracts, tip, rate] = await Promise.all([this.getPrices(), this.getDescriptors(), Exchange.getContracts(), Exchange.getLatestBlock(), Market.rateOf(args?.base)]);
             return {
                 prices: prices,
                 descriptors: descriptors,
                 contracts: contracts,
+                tip: tip != null ? tip.blockNumber : null,
                 rate: rate
             };
         }
@@ -709,6 +726,10 @@ export namespace Router {
     }
 
     export class Swaps {
+        private static bridgeCache: Record<string, { time: number, value: BridgeQuote }> = { };
+        private static witnessCache: Record<string, { time: number, value: string[] }> = { };
+        private static readonly resolverTtl = 15_000;
+
         constructor(server: FastifyInstance) {
             Channel.register(server, 'get', '/swaps', Swaps, Swaps.getBooking);
             Channel.register(server, 'get', '/swaps/history', Swaps, Swaps.getHistory);
@@ -716,6 +737,7 @@ export namespace Router {
             Channel.register(server, 'post', '/swaps/spend', Swaps, Swaps.spend);
             Channel.register(server, 'post', '/swaps/preview', Swaps, Swaps.preview);
             Channel.register(server, 'post', '/swaps/respend', Swaps, Swaps.respend);
+            Channel.register(server, 'get', '/swaps/quote', Swaps, Swaps.getQuote);
         }
         private static sequencer(): Sequencer {
             const sequencer = Exchange.sequencer;
@@ -822,6 +844,52 @@ export namespace Router {
 
             message.writeBinaryStringOptimized(decoded.data);
         }
+        private static parseSendQuota(raw: unknown): SendQuota {
+            if (raw == null)
+                return NoSendQuota;
+
+            if (typeof raw != 'object' || Array.isArray(raw))
+                throw new Error('Fee quote must be an object');
+
+            const source = raw as Record<string, unknown>;
+            const signature = source.signature != null ? String(source.signature) : '';
+            if (signature.length < 1) {
+                const fee = Common.bn(source.feeRate);
+                if (fee != null && fee.gt(0))
+                    throw new Error('Fee quote signature is required when a custom send fee is set');
+
+                return NoSendQuota;
+            }
+
+            if (this.normalizeSignature(signature) == null)
+                throw new Error('Fee quote signature must be a 65-byte recoverable signature');
+
+            const blockNumber = Common.bn(source.blockNumber);
+            if (blockNumber == null || blockNumber.lt(0))
+                throw new Error('Fee quote block number is invalid');
+
+            const feeRate = Common.bn(source.feeRate);
+            if (feeRate == null || !feeRate.gt(0))
+                throw new Error('Fee quote fee must be a positive decimal');
+            return { signature: signature, blockNumber: blockNumber.toFixed(), feeRate: feeRate.toFixed() };
+        }
+        private static writeQuota(stream: Stream, quota: SendQuota, asArguments: boolean): void {
+            const signature = quota.signature.length > 0 ? ByteUtil.hexStringToUint8Array(quota.signature) : new Uint8Array(65);
+            if (asArguments)
+                stream.writeBinaryStringOptimized(signature);
+            else
+                stream.writeBinaryString(signature);
+            stream.writeInteger(new Uint256(quota.blockNumber));
+            stream.writeDecimal(new BigNumber(quota.feeRate), !asArguments);
+        }
+        private static encodeQuotaArguments(quota: SendQuota): string {
+            const stream = new Stream();
+            this.writeQuota(stream, quota, true);
+            return stream.encode();
+        }
+        private static writeQuotaMessage(message: Stream, quota: SendQuota): void {
+            this.writeQuota(message, quota, false);
+        }
         private static encodeSpendMessage(params: SpendMessageParams): Uint8Array {
             const message = new Stream();
             message.writeInteger(params.depositHash);
@@ -831,6 +899,7 @@ export namespace Router {
             this.writeAddress(message, params.contractAddress);
             this.writeAddress(message, params.sequencerAddress);
             message.writeString(params.routingAddress);
+            this.writeQuotaMessage(message, params.quota);
             message.writeInteger(params.tokenPath.length + params.feePath.length);
             for (let order of params.tokenPath.concat(params.feePath)) {
                 message.writeString(order.symbol);
@@ -853,6 +922,7 @@ export namespace Router {
             this.writeAddress(message, params.contractAddress);
             this.writeAddress(message, params.sequencerAddress);
             message.writeString(params.routingAddress);
+            this.writeQuotaMessage(message, params.quota);
             return message.data;
         }
         private static async constCall(contractAccount: string, method: string, args: unknown[]): Promise<unknown> {
@@ -887,24 +957,11 @@ export namespace Router {
             SchemaUtil.store(stream, { ...transaction, signature: signature }, new Transactions.Call());
             return stream;
         }
-        private static nonceCache: { address: string, value: Uint256, time: number } | null = null;
-        private static gasPriceCache: { value: BigNumber, time: number } | null = null;
         private static async sequencerNonce(): Promise<Uint256> {
-            const sequencer = this.sequencer();
-            if (this.nonceCache == null || this.nonceCache.address != sequencer.address || Date.now() - this.nonceCache.time > 60_000)
-                this.nonceCache = { address: sequencer.address, value: new Uint256((await RPC.getNextAccountNonce(sequencer.address))?.toString()), time: Date.now() };
-
-            return this.nonceCache.value;
+            return new Uint256((await RPC.getNextAccountNonce(this.sequencer().address))?.toString());
         }
         private static async sequencerGasPrice(): Promise<BigNumber> {
-            if (this.gasPriceCache == null || Date.now() - this.gasPriceCache.time > 15_000)
-                this.gasPriceCache = { value: new BigNumber((await RPC.getGasPrice(new AssetId(), 0.95))?.price.toString() || 0), time: Date.now() };
-
-            return this.gasPriceCache.value;
-        }
-        private static invalidateCaches(): void {
-            this.nonceCache = null;
-            this.gasPriceCache = null;
+            return new BigNumber((await RPC.getGasPrice(new AssetId(), 0.95))?.price.toString() || 0);
         }
         private static nextBlockSignal(): Promise<void> {
             return new Promise((resolve) => {
@@ -936,17 +993,9 @@ export namespace Router {
                 if (!gasLimit.gt(0))
                     throw new Error('failed to simulate transaction');
 
-                if (sequencer.simulation) {
-                    Log.info(`${options.describe} simulated (gas: ${gasLimit.toString()}): ${JSON.stringify(receipt, null, 2)}`);
-                    return null;
-                }
-
                 const transactionHash = await RPC.submitTransaction(build(gasLimit).encode());
                 if (!transactionHash)
                     throw new Error('failed to submit transaction');
-
-                if (this.nonceCache != null && this.nonceCache.address == sequencer.address)
-                    this.nonceCache = { address: sequencer.address, value: this.nonceCache.value.add(1), time: Date.now() };
 
                 const deadline = Date.now() + sequencer.confirmTimeout * 1_000;
                 while (true) {
@@ -968,7 +1017,6 @@ export namespace Router {
                 Log.info(`${options.describe} finalized (tx: ${transactionHash})`);
                 return transactionHash;
             } catch (exception) {
-                this.invalidateCaches();
                 Log.info('TX message:', simulation.encode());
                 throw exception;
             }
@@ -1028,6 +1076,7 @@ export namespace Router {
             if (signature == null)
                 throw new Error('Signature must be a 65-byte recoverable signature');
 
+            const quota = this.parseSendQuota(args.feeQuote);
             const message = this.encodeSpendMessage({
                 depositHash: depositHash,
                 bridgeHash: bridgeHash,
@@ -1037,7 +1086,8 @@ export namespace Router {
                 sequencerAddress: sequencer.address,
                 routingAddress: args.routingAddress,
                 tokenPath: tokenPath,
-                feePath: feePath
+                feePath: feePath,
+                quota: quota
             });
             const signer = this.recoverSigner(new Uint256(Hashing.hash256(message)), signature);
             const expected = this.normalizePublicKey(booking.publicKey);
@@ -1076,7 +1126,7 @@ export namespace Router {
                 booking: booking,
                 contract: contract,
                 signature: signature,
-                callArgs: [depositHash, bridgeHash, args.routingAddress, encodePath(tokenPath), encodePath(feePath), ByteUtil.hexStringToUint8Array(signature)]
+                callArgs: [depositHash, bridgeHash, args.routingAddress, encodePath(tokenPath), encodePath(feePath), this.encodeQuotaArguments(quota), ByteUtil.hexStringToUint8Array(signature)]
             };
         }
         static async getBooking(args: Record<string, any>): Promise<Booking> {
@@ -1140,6 +1190,156 @@ export namespace Router {
 
             return await Exchange.getBookings(Cursor.page(args.page || 0), keys.length > 0 ? keys : null, statuses.length > 0 ? statuses : null);
         }
+        private static recordOf(value: unknown): Record<string, unknown> | null {
+            return typeof value == 'object' && value != null && !Array.isArray(value) ? value as Record<string, unknown> : null;
+        }
+        private static arrayOf(value: unknown): unknown[] {
+            return Array.isArray(value) ? value : [];
+        }
+        private static textOf(value: unknown): string | null {
+            return typeof value == 'string' ? value : (typeof value == 'number' ? String(value) : null);
+        }
+        private static stringsOf(value: unknown): string[] {
+            return Swaps.arrayOf(value).filter((entry): entry is string => typeof entry == 'string' && entry.length > 0);
+        }
+        private static async witnessAddresses(chain: string): Promise<string[]> {
+            const cached = Swaps.witnessCache[chain];
+            if (cached != null && Date.now() - cached.time < Swaps.resolverTtl)
+                return cached.value;
+
+            const ams = await Exchange.getAmsContract();
+            const addresses: string[] = [];
+            for (const raw of Swaps.arrayOf(await RPC.getWitnessAccounts(ams?.account ?? '', 0, 64))) {
+                const row = Swaps.recordOf(raw);
+                if (Swaps.textOf(row?.['purpose']) != 'bridge')
+                    continue;
+                if (chain.length > 0 && Swaps.textOf(Swaps.recordOf(row?.['asset'])?.['chain']) != chain)
+                    continue;
+
+                for (const value of Swaps.stringsOf(row?.['addresses'])) {
+                    if (!addresses.includes(value))
+                        addresses.push(value);
+                }
+            }
+
+            Swaps.witnessCache[chain] = { time: Date.now(), value: addresses };
+            return addresses;
+        }
+        static async getQuote(args: { assetOut?: unknown, amount?: unknown, assetIn?: unknown, slippage?: unknown }): Promise<BridgeQuote> {
+            if (typeof args.assetOut != 'string' && typeof args.assetOut != 'number')
+                throw new Error('assetOut is required');
+
+            const asset = new AssetId(args.assetOut);
+            if (!asset.isValid())
+                throw new Error('assetOut is not a valid asset id');
+
+            const amount = args.amount != null ? Common.bn(args.amount) ?? null : null;
+            if (args.amount != null && !(amount != null && amount.gt(0)))
+                throw new Error('Amount must be a positive decimal');
+
+            const assetIn = typeof args.assetIn == 'string' && args.assetIn.length > 0 ? args.assetIn : null;
+            if (assetIn != null && (amount == null || args.slippage == null))
+                throw new Error('assetIn requires both amount and slippage to route');
+
+            const slippage = args.slippage != null ? Common.bn(args.slippage) ?? null : null;
+            if (args.slippage != null && !(slippage != null && slippage.gte(0) && slippage.lte(1)))
+                throw new Error('Slippage must be between [0; 1]');
+
+            const key = asset.id + ':' + (amount != null ? amount.toFixed() : '*') + ':' + (assetIn != null && amount != null && slippage != null ? assetIn + ':' + slippage.toFixed() : '-');
+            const cached = Swaps.bridgeCache[key];
+            if (cached != null && Date.now() - cached.time < Swaps.resolverTtl)
+                return cached.value;
+
+            const chain = asset.chain ?? '';
+            const [witnesses, descriptors] = await Promise.all([Swaps.witnessAddresses(chain), Blockchain.getBlockchains()]);
+            const routingPolicy = descriptors.find((descriptor) => descriptor.chain == chain)?.routingPolicy ?? null;
+
+            let path: RouterPath[] | null = null;
+            if (amount != null && amount.gt(0) && assetIn != null && slippage != null) {
+                const assetIdIn = await Exchange.getAssetIdByHash(new AssetId(assetIn), 'untrusted');
+                const assetIdOut = await Exchange.getAssetIdByHash(asset, 'untrusted');
+                path = assetIdIn != null && assetIdOut != null ? await Exchange.getRoutingPathsByAssetIds(assetIdIn, assetIdOut, amount, slippage, 6) : [];
+            }
+
+            const bestPath = path != null && path.length > 0 ? path[0] : null;
+            const bestLeg = bestPath != null && bestPath.length > 0 ? bestPath[bestPath.length - 1] : null;
+            const masters: Record<string, string | null> = { };
+            const candidates: { hash: string, chain: string, feeRate: BigNumber, supply: BigNumber | null, master: string | null }[] = [];
+            for (const raw of Swaps.arrayOf(await RPC.getBestBridgeInstancesByBalance(asset, 0, 8))) {
+                const row = Swaps.recordOf(raw);
+                const instance = Swaps.recordOf(row?.['instance']) ?? row;
+                if (instance == null)
+                    continue;
+
+                const hash = Swaps.textOf(instance['bridge_hash'] ?? instance['bridgeHash']);
+                if (hash == null)
+                    continue;
+
+                const instanceChain = Swaps.textOf(Swaps.recordOf(instance['asset'])?.['chain'] ?? instance['chain']) ?? chain;
+                const masterAddress = Swaps.textOf(instance['master']);
+                let master: string | null = null;
+                if (masterAddress != null) {
+                    if (masters[masterAddress] === undefined) {
+                        masters[masterAddress] = null;
+                        try {
+                            for (const witnessRaw of Swaps.arrayOf(await RPC.getWitnessAccountsByPurpose(masterAddress, 'bridge', 0, 32))) {
+                                const witness = Swaps.recordOf(witnessRaw);
+                                const witnessHash = Swaps.textOf(witness?.['bridge_hash']);
+                                const addresses = Swaps.stringsOf(witness?.['addresses']);
+                                if (Swaps.textOf(Swaps.recordOf(witness?.['asset'])?.['chain']) == instanceChain && (witnessHash == null || witnessHash === hash) && addresses.length > 0) {
+                                    masters[masterAddress] = addresses[0];
+                                    break;
+                                }
+                            }
+                        } catch (exception) {
+                            Log.error('relay', 'failed resolving bridge master (master:', masterAddress, '):', exception);
+                        }
+                    }
+                    master = masters[masterAddress];
+                }
+
+                const balance = Swaps.recordOf(row?.['balances'])?.[asset.id];
+                candidates.push({
+                    hash: hash,
+                    chain: instanceChain,
+                    feeRate: Common.bn(instance['fee_rate'] ?? instance['feeRate']) ?? new BigNumber(0),
+                    supply: Common.bn(Swaps.recordOf(balance)?.['supply'] ?? balance) ?? null,
+                    master: master
+                });
+            }
+            
+            const requirement = bestLeg != null ? (bestLeg.output.max.gt(0) ? bestLeg.output.max : bestLeg.output.min) : amount;
+            const funded = requirement != null && requirement.gt(0) ? candidates.filter((candidate) => candidate.supply != null && candidate.supply.gte(requirement)) : candidates;
+            const picked = funded.length > 0 ? funded[0] : candidates[0];
+            if (!picked)
+                throw new Error('Failed to find a route for this swap');
+
+            let sendQuota: SendQuota = NoSendQuota;
+            try {
+                const feeQuotes = await RPC.getFeeQuotes(asset);
+                const quoteIndex = Common.bn(feeQuotes?.index)?.toNumber() ?? -1;
+                const bestQuote = feeQuotes != null && quoteIndex >= 0 ? feeQuotes.quotes[quoteIndex] : null;
+                if (bestQuote != null && typeof bestQuote.signature == 'string' && bestQuote.signature.length > 0 && bestQuote.fee != null && bestQuote.fee.gt(0) && bestQuote.fee.lte(picked.feeRate))
+                    sendQuota = { signature: bestQuote.signature, blockNumber: bestQuote.expiry_block_number?.toFixed() ?? '0', feeRate: bestQuote.fee.toFixed() };
+            } catch (exception) {
+                Log.error('relay', `failed resolving send fee quote (asset: ${asset.id}):`, exception);
+            }
+
+            const quote: BridgeQuote = {
+                hash: picked.hash,
+                chain: picked.chain,
+                feeRate: picked.feeRate.toFixed(),
+                supply: picked.supply != null ? picked.supply.toFixed() : null,
+                master: picked.master,
+                witnesses: witnesses,
+                routingPolicy: routingPolicy,
+                path: path,
+                sendQuota: sendQuota,
+                sendFee: sendQuota.signature.length > 0 ? sendQuota.feeRate : picked.feeRate.toFixed()
+            };
+            Swaps.bridgeCache[key] = { time: Date.now(), value: quote };
+            return quote;
+        }
         static async book(args: { contract?: string, asset?: string | number, amount?: string | number, publicKey?: string }, _response?: FastifyReply, meta?: CallMeta): Promise<SwapReference> {
             const limit: BookingAcquisition = BookingRateLimit.acquireBooking(meta != null ? meta.ip : null);
             if (!limit.ok) {
@@ -1202,10 +1402,11 @@ export namespace Router {
                 args: [asset.toUint256(), amount, ByteUtil.hexStringToUint8Array(publicKey)],
                 describe: `book ${asset.id} ${amount.toString()} @ ${contract.account}`
             }));
+            BookingRateLimit.commitBooking(limit);
 
             return { transaction: transaction, amount: amount.toString() };
         }
-        static async spend(args: { depositHash?: string, bridgeHash?: string, routingAddress?: string, tokenPath?: unknown, feePath?: unknown, signature?: string }): Promise<SwapReference> {
+        static async spend(args: { depositHash?: string, bridgeHash?: string, routingAddress?: string, tokenPath?: unknown, feePath?: unknown, feeQuote?: unknown, signature?: string }): Promise<SwapReference> {
             const context = await this.spendContext(args);
             const depositHash = Common.u256(args.depositHash)!, contract = context.contract;
             const routing = String(args.routingAddress);
@@ -1239,7 +1440,7 @@ export namespace Router {
             await Exchange.setBookingRouting(context.booking.id, routing);
             return { transaction: transaction };
         }
-        static async preview(args: { depositHash?: string, bridgeHash?: string, routingAddress?: string, tokenPath?: unknown, feePath?: unknown, signature?: string }): Promise<{ successful: boolean, gas: string | null, outAsset: string | null, outAmount: string | null, error: string | null }> {
+        static async preview(args: { depositHash?: string, bridgeHash?: string, routingAddress?: string, tokenPath?: unknown, feePath?: unknown, feeQuote?: unknown, signature?: string }): Promise<{ successful: boolean, gas: string | null, outAsset: string | null, outAmount: string | null, error: string | null }> {
             const fail = (message: string) => ({ successful: false, gas: null, outAsset: null, outAmount: null, error: message });
             try {
                 const context = await this.spendContext(args);
@@ -1274,7 +1475,7 @@ export namespace Router {
                 return fail(String(exception?.message ?? exception));
             }
         }
-        static async respend(args: { depositHash?: string, broadcastHash?: string, bridgeHash?: string, routingAddress?: string, signature?: string }): Promise<SwapReference> {
+        static async respend(args: { depositHash?: string, broadcastHash?: string, bridgeHash?: string, routingAddress?: string, feeQuote?: unknown, signature?: string }): Promise<SwapReference> {
             const sequencer = this.sequencer();
             const depositHash = Common.u256(args.depositHash);
             if (depositHash == null)
@@ -1309,7 +1510,8 @@ export namespace Router {
             const signature = this.normalizeSignature(args.signature);
             if (signature == null)
                 throw new Error('Signature must be a 65-byte recoverable signature');
-
+            
+            const quota = this.parseSendQuota(args.feeQuote);
             const message = this.encodeRespendMessage({
                 depositHash: depositHash,
                 broadcastHash: broadcastHash,
@@ -1318,7 +1520,8 @@ export namespace Router {
                 amount: booking.outAmount.decimalPlaces(contract.parameters.depositPrecision ?? 6, BigNumber.ROUND_DOWN),
                 contractAddress: contract.account || '',
                 sequencerAddress: sequencer.address,
-                routingAddress: args.routingAddress
+                routingAddress: args.routingAddress,
+                quota: quota
             });
             const signer = this.recoverSigner(new Uint256(Hashing.hash256(message)), signature);
             const expected = this.normalizePublicKey(booking.publicKey);
@@ -1352,6 +1555,7 @@ export namespace Router {
                         broadcastHash,
                         bridgeHash,
                         routing,
+                        this.encodeQuotaArguments(quota),
                         ByteUtil.hexStringToUint8Array(signature)
                     ],
                     describe: `respend ${depositHash.toHex()} @ ${contract.account}`,

@@ -9,7 +9,9 @@ export type BookingLimits = {
 export type BookingAcquisition = {
     ok: boolean,
     scope: 'instance' | 'address' | null,
-    retryAfter: number
+    retryAfter: number,
+    time: number,
+    key: string | null
 }
 
 export class BookingRateLimit {
@@ -37,23 +39,27 @@ export class BookingRateLimit {
         const now = Date.now();
         this.instance = this.prune(this.instance, now);
         if (this.instance.length >= this.limits.bookingsPerMinute)
-            return { ok: false, scope: 'instance', retryAfter: this.retryAfter(this.instance, now) };
+            return { ok: false, scope: 'instance', retryAfter: this.retryAfter(this.instance, now), time: 0, key: null };
 
         const key = ip != null && ip.length > 0 ? this.fingerprint(ip) : null;
         const hits = key != null ? this.prune(this.addresses.get(key) || [], now) : [];
         if (key != null && hits.length >= this.limits.bookingsPerIpPerMinute) {
             this.addresses.set(key, hits);
             this.sweep(now);
-            return { ok: false, scope: 'address', retryAfter: this.retryAfter(hits, now) };
-        }
-
-        this.instance.push(now);
-        if (key != null) {
-            hits.push(now);
-            this.addresses.set(key, hits);
+            return { ok: false, scope: 'address', retryAfter: this.retryAfter(hits, now), time: 0, key: null };
         }
         this.sweep(now);
-        return { ok: true, scope: null, retryAfter: 0 };
+        return { ok: true, scope: null, retryAfter: 0, time: now, key: key };
+    }
+    static commitBooking(acquisition: BookingAcquisition): void {
+        if (!acquisition.ok || acquisition.time == 0)
+            return;
+        this.instance.push(acquisition.time);
+        if (acquisition.key != null) {
+            const hits = this.addresses.get(acquisition.key) ?? [];
+            hits.push(acquisition.time);
+            this.addresses.set(acquisition.key, hits);
+        }
     }
     private static retryAfter(hits: number[], now: number): number {
         if (hits.length == 0)

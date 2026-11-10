@@ -33,8 +33,11 @@
         [
             ["", { "$asset": ["ETH"] }, "1000", "0.001", "0.05", true]
         ],
-        { "$blob": "0xbadacb4bf0a7dd7b524db4217aa3a78ee11b3a60f632c8d9d10bbf69c108ec8057122633e5b4c906ad9ec3e5def037e331d6ac9c5d070ef5b3f2a1de94639db900" }
+        { "$blob": "0x2a0800" },
+        { "$blob": "0x9a5274c546c1378d59058f8c211df90567b976f4aa09550465943858800c24665397e17b7bef2006507c374aa88dd5f08602129da68f2d3037c4459ddc1b914700" }
     ],
+    ["block", "-1"],
+    ["call", "book_deposit", { "$asset": ["ETH", "USDT", "0xdAC17F958D2ee523a2206206994597C13D831ec7"] }, "5000", { "$blob": "0x0381aaadc8a5e83f4576df823cf22a5b1969cf704a0d5f6f68bd757410c9917aac" }],
     ["try", "call", "spend_deposit",
         46783905484937927252641697298875282640738056103046437190496647096544233777256,
         39287329603871521044089446498565968162583641481606160757927148334459949194829,
@@ -46,7 +49,8 @@
         [
             ["", { "$asset": ["ETH"] }, "1000", "0.001", "0.05", true]
         ],
-        { "$blob": "0x4f49308b596eca002c968f3a1ce11efc2d4796b87cf95e41698999017a569eae6a2f9ee2946d0d51eaa902fd5aeef16f33fa9395d965de2ee5fb37860349416701" }
+        { "$blob": "0x2a0800" },
+        { "$blob": "0xe08f9bd918341819068ad55c8d3c590db33638622c5cf294a8d1e1c7721323026e8b48157590adcf54cfea5a58b96eaf7d7ac5bb766b8a8f884d856a8f83d38601" }
     ],
     ["block", -2],
     ["call", "book_deposit", { "$asset": ["BTC"] }, "0.1", { "$blob": "0x0381aaadc8a5e83f4576df823cf22a5b1969cf704a0d5f6f68bd757410c9917aac" }],
@@ -71,6 +75,7 @@
         [
             ["", { "$asset": ["ETH"] }, "1000", "0.001", "0.05", true]
         ],
+        { "$blob": "0x2a0800" },
         { "$blob": "0x00" }
     ],
     ["call", "spend_deposit",
@@ -84,7 +89,8 @@
         [
             ["", { "$asset": ["ETH"] }, "1000", "0.000960568", "0.05", true]
         ],
-        { "$blob": "0xbadacb4bf0a7dd7b524db4217aa3a78ee11b3a60f632c8d9d10bbf69c108ec8057122633e5b4c906ad9ec3e5def037e331d6ac9c5d070ef5b3f2a1de94639db900" }
+        { "$blob": "0x2a0800" },
+        { "$blob": "0x9a5274c546c1378d59058f8c211df90567b976f4aa09550465943858800c24665397e17b7bef2006507c374aa88dd5f08602129da68f2d3037c4459ddc1b914700" }
     ],
     ["log"],
     { "cmd": ["call", "booking_alive", { "$asset": ["BTC"] }, "0.1"], "note": "booking consumed by the spend", "expect": { "contains": "false" } },
@@ -95,11 +101,12 @@
         47379183764595744809567775830349152889946784548663803031925639933788846667806,
         39287329603871521044089446498565968162583641481606160757927148334459949194829,
         "bc1qw5sz2b7dl8mkvcz5kw83dzbn3xhg8c7klqkkzh",
-        { "$blob": "0xe8f3b19a02fbd1477960fad80fa308e6879cdd7e371e8bc1cd92d797eaaea7614202f4cc31803043c8b908b3898b189a1be98c92125b7173c6f4d01d4271c57400" }
+        { "$blob": "0x2a0800" },
+        { "$blob": "0xecc02654be2c3d8315803e7caaecdfa37e6c3793baada9dfcd50809f5347fe79042d68093ebe26e3f18a43f90176ce317d13bf06f6eeda031387f06c9e208c9d01" }
     ],
     { "cmd": ["call", "deposit_spent", 33858336582242677103876590952323141828732928068020152863387286025527637439362], "note": "fresh ETH deposit unspent", "expect": { "contains": "false" } },
     ["block", "+7200"],
-    ["call", "repay_deposit", 33858336582242677103876590952323141828732928068020152863387286025527637439362],
+    ["call", "repay_deposit", 33858336582242677103876590952323141828732928068020152863387286025527637439362, 0],
     { "cmd": ["call", "deposit_spent", 33858336582242677103876590952323141828732928068020152863387286025527637439362], "note": "repay marks the deposit consumed", "expect": { "contains": "true" } },
     ["flags", "route"],
     ["asset", "ETH"],
@@ -107,5 +114,29 @@
     ["asset", "off"],
     ["flags", "off"],
     { "cmd": ["call", "reconstruct", { "dex_account": "tcrt1xn58mly6f7er0zs6swtetqgfqs36jaarq7yd7gc", "deployer_account": "tcrt1x25x782mml6cty0xg6hfmvukqgmp9fq09d9v9av", "fee_overflow": "0.01", "book_validity_blocks": "7200", "deposit_validity_blocks": "21600" }], "note": "reconstruct by the deployer succeeds", "expect": { "ok": true } },
-    { "cmd": ["call", "params_of"], "note": "params remain in effect", "expect": { "contains": "tcrt1x25x782mml6cty0xg6hfmvukqgmp9fq09d9v9av" } }
+    { "cmd": ["call", "params_of"], "note": "params remain in effect", "expect": { "contains": "tcrt1x25x782mml6cty0xg6hfmvukqgmp9fq09d9v9av" } },
+    ["block", "+0"],
+    ["flags", "withdraw_with_revert"],
+    { "cmd": ["call", "repay_deposit", 96877496942873015876696394126869920448919442633539214528453441993635363172651, 47379183764595744809567775830349152889946784548663803031925639933788846667806], "note": "reclaim requires a spent deposit record", "expect": { "error": "deposit transaction unspent" } },
+    ["call", "spend_deposit", 96877496942873015876696394126869920448919442633539214528453441993635363172651, 39287329603871521044089446498565968162583641481606160757927148334459949194829, "0x1111111111111111111111111111111111111111",
+        [],
+        [ ["", { "$asset": ["ETH"] }, "1000", "0.000960568", "0.05", true] ],
+        { "$blob": "0x2a0800" },
+        { "$blob": "0xfdc96f30ad7a5864a732dd561646bc1812fea1253f9c0f8859def212d504061b24cbe3703f95cff861be2a90cc9cabd6c43c00cbf418048cf11184d2400a343b00" }],
+    { "cmd": ["call", "deposit_spent", 96877496942873015876696394126869920448919442633539214528453441993635363172651], "note": "USDT deposit recorded as spent", "expect": { "contains": "true" } },
+    { "cmd": ["call", "booking_alive", { "$asset": ["ETH", "USDT", "0xdAC17F958D2ee523a2206206994597C13D831ec7"] }, "5000"], "note": "USDT booking consumed by the spend", "expect": { "contains": "false" } },
+    { "cmd": ["call", "repay_deposit", 96877496942873015876696394126869920448919442633539214528453441993635363172651, 47379183764595744809567775830349152889946784548663803031925639933788846667806], "note": "reclaim blocked until the respend time lock elapses", "expect": { "error": "withdrawal time lock has not expired yet" } },
+    { "cmd": ["balance", "tcrt1x25x782mml6cty0xg6hfmvukqgmp9fq09d9v9av", "ETH"], "note": "deployer ETH balance before reclaim", "expect": { "contains": "1.000011120998358293" } },
+    { "cmd": ["balance", "tcrt1x25x782mml6cty0xg6hfmvukqgmp9fq09d9v9av", "ETH", "USDT", "0xdAC17F958D2ee523a2206206994597C13D831ec7"], "note": "deployer USDT balance before reclaim", "expect": { "contains": "null" } },
+    ["block", "+21600"],
+    { "cmd": ["call", "repay_deposit", 96877496942873015876696394126869920448919442633539214528453441993635363172651, 47379183764595744809567775830349152889946784548663803031925639933788846667806], "note": "reclaim still blocked exactly at the time lock boundary", "expect": { "error": "withdrawal time lock has not expired yet" } },
+    ["block", "+21601"],
+    ["call", "repay_deposit", 96877496942873015876696394126869920448919442633539214528453441993635363172651, 47379183764595744809567775830349152889946784548663803031925639933788846667806],
+    { "cmd": ["balance", "tcrt1x25x782mml6cty0xg6hfmvukqgmp9fq09d9v9av", "ETH"], "note": "the 0.001 network fee the user paid is reclaimed on top of the swapped amount", "expect": { "contains": "1.001011120998358293" } },
+    { "cmd": ["balance", "tcrt1x25x782mml6cty0xg6hfmvukqgmp9fq09d9v9av", "ETH", "USDT", "0xdAC17F958D2ee523a2206206994597C13D831ec7"], "note": "the swapped amount is reclaimed to the deployer", "expect": { "contains": "4998.9914036" } },
+    { "cmd": ["call", "deposit_spent", 96877496942873015876696394126869920448919442633539214528453441993635363172651], "note": "reclaim marks the deposit consumed", "expect": { "contains": "true" } },
+    { "cmd": ["call", "repay_deposit", 96877496942873015876696394126869920448919442633539214528453441993635363172651, 47379183764595744809567775830349152889946784548663803031925639933788846667806], "note": "reclaimed deposit cannot be reclaimed again", "expect": { "error": "deposit cannot be reclaimed" } },
+    { "cmd": ["call", "repay_deposit", 96877496942873015876696394126869920448919442633539214528453441993635363172651, 0], "note": "normal repay blocked on the consumed deposit", "expect": { "error": "deposit transaction spent" } },
+    ["block", "+43201"],
+    { "cmd": ["call", "repay_deposit", 96877496942873015876696394126869920448919442633539214528453441993635363172651, 47379183764595744809567775830349152889946784548663803031925639933788846667806], "note": "reclaim dies once the deposit record retention elapses", "expect": { "error": "deposit transaction unspent" } }
 ]
