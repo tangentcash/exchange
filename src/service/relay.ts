@@ -1316,7 +1316,7 @@ export namespace Router {
 
             let sendQuota: SendQuota = NoSendQuota;
             try {
-                const feeQuotes = await RPC.getFeeQuotes(asset);
+                const feeQuotes = await RPC.estimateBridgeFee(asset);
                 const quoteIndex = Common.bn(feeQuotes?.index)?.toNumber() ?? -1;
                 const bestQuote = feeQuotes != null && quoteIndex >= 0 ? feeQuotes.quotes[quoteIndex] : null;
                 if (bestQuote != null && typeof bestQuote.signature == 'string' && bestQuote.signature.length > 0 && bestQuote.fee != null && bestQuote.fee.gt(0) && bestQuote.fee.lte(picked.feeRate))
