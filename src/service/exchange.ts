@@ -139,7 +139,7 @@ export class TimeCursor {
     maxTime: number = 0;
     page: number = 0;
 
-    static page(interval: number, number: number, count: number = 512): TimeCursor {
+    static page(interval: number, number: number, count: number = 1024): TimeCursor {
         const result = new TimeCursor();
         const time = new Date().getTime();
         result.interval = interval;
