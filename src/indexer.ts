@@ -55,6 +55,22 @@ async function main(): Promise<void> {
     try {
         Log.info('running blockchain boot check');
         const configured: Record<string, string> = blockchain.contracts || { };
+        const uapAccount = configured[ContractType.UAP];
+        if (typeof uapAccount == 'string' && uapAccount.length > 0) {
+            await Exchange.isolate(async (connection) => {
+                const accountId = await Exchange.getAccountIdByAddress(uapAccount, false, connection);
+                if (accountId == null)
+                    throw new Error(`cannot decode uap contract account ${uapAccount}`);
+
+                const result = await Exchange.setContract({ type: ContractType.UAP, accountId, deployerAccountId: null, blockNumber: null, parameters: { } }, connection);
+                if (result == null)
+                    throw new Error(`cannot register uap contract ${uapAccount}`);
+
+                await Exchange.setContractSynced(ContractType.UAP, connection);
+            });
+            Log.info(`uap contract registered (${uapAccount}, eventless: marked synced)`);
+        }
+
         const contracts = await Exchange.getContracts();
         for (let type in configured) {
             const account = configured[type];

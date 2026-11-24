@@ -2524,6 +2524,10 @@ export class Exchange {
             return null;
         }
     }
+    static async setContractSynced(type: ContractType, connection?: pq.TransactionSql): Promise<void> {
+        const sql = connection || this.connection;
+        await this.resultOf(sql`UPDATE contracts SET synced = TRUE WHERE type = ${type}`);
+    }
     static async setContractsSynced(connection?: pq.TransactionSql): Promise<void> {
         const sql = connection || this.connection;
         await this.resultOf(sql`UPDATE contracts SET synced = TRUE`);
