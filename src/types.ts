@@ -374,7 +374,8 @@ export type AttestationEvent = {
     txHash: Uint256,
     hashdata: string,
     asset: AssetId | null,
-    amount: BigNumber | null
+    amount: BigNumber | null,
+    success: boolean
 };
 
 export enum PseudoEvent {

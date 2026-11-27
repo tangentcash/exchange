@@ -352,6 +352,8 @@ export class Blockchain {
                     const proof = result.transaction['proof'];
                     if (result.transaction.type == 'attestate') {
                         const hashdata = String((proof != null && typeof proof == 'object' ? proof['hashdata'] ?? proof['hash_data'] ?? proof['transaction_id'] ?? proof['transactionId'] : null) ?? result.transaction['hashdata'] ?? result.transaction['hash_data'] ?? '');
+                        const proofSuccess = proof != null && typeof proof == 'object' ? proof['success'] : undefined;
+                        const offchainReverted = proofSuccess === false || proofSuccess === 0 || proofSuccess === 'false' || proofSuccess === '0';
                         let attestAsset: AssetId | null = null;
                         let attestAmount: BigNumber | null = null;
                         const rawAsset = result.transaction['asset'];
@@ -364,7 +366,7 @@ export class Blockchain {
                         }
                         const proofMemo = proof != null && typeof proof == 'object' && typeof proof['memo'] == 'string' ? proof['memo'] : '';
                         const depositRoutedToAms = amsAccount != null && proofMemo == amsAccount;
-                        if (attestAsset != null && proof != null && typeof proof == 'object' && Array.isArray(proof['outputs'])) {
+                        if (!offchainReverted && attestAsset != null && proof != null && typeof proof == 'object' && Array.isArray(proof['outputs'])) {
                             const outputs = proof['outputs'];
                             for (let k = 0; k < outputs.length; k++) {
                                 const output = outputs[k];
@@ -378,7 +380,7 @@ export class Blockchain {
                             }
                         }
                         if (txHash != null && hashdata.length > 0)
-                            attestates.push({ txHash: txHash, hashdata: hashdata, asset: attestAsset, amount: attestAmount });
+                            attestates.push({ txHash: txHash, hashdata: hashdata, asset: attestAsset, amount: attestAmount, success: !offchainReverted });
                     } else {
                         const withdrawHash = Common.u256(result.transaction['withdraw_hash'] ?? null);
                         if (txHash != null && withdrawHash != null) {

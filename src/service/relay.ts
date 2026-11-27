@@ -1247,8 +1247,12 @@ export namespace Router {
 
             const key = asset.id + ':' + (amount != null ? amount.toFixed() : '*') + ':' + (assetIn != null && amount != null && slippage != null ? assetIn + ':' + slippage.toFixed() : '-');
             const cached = Swaps.bridgeCache[key];
-            if (cached != null && Date.now() - cached.time < Swaps.resolverTtl)
-                return cached.value;
+            if (cached != null && Date.now() - cached.time < Swaps.resolverTtl) {
+                const bestCachedLeg = cached.value.path != null && cached.value.path.length > 0 && cached.value.path[0].length > 0 ? cached.value.path[0][cached.value.path[0].length - 1] : null;
+                const cachedReceived = bestCachedLeg != null ? (bestCachedLeg.output.max.gt(0) ? bestCachedLeg.output.max : bestCachedLeg.output.min) : amount;
+                const quota = await this.resolveSendQuota(asset, cachedReceived, new BigNumber(cached.value.feeRate));
+                return { ...cached.value, sendQuota: quota, sendFee: quota.signature.length > 0 ? quota.feeRate : cached.value.feeRate };
+            }
 
             const chain = asset.chain ?? '';
             const [witnesses, descriptors] = await Promise.all([Swaps.witnessAddresses(chain), Blockchain.getBlockchains()]);
@@ -1314,17 +1318,7 @@ export namespace Router {
             if (!picked)
                 throw new Error('Failed to find a route for this swap');
 
-            let sendQuota: SendQuota = NoSendQuota;
-            try {
-                const feeQuotes = await RPC.estimateBridgeFee(asset);
-                const quoteIndex = Common.bn(feeQuotes?.index)?.toNumber() ?? -1;
-                const bestQuote = feeQuotes != null && quoteIndex >= 0 ? feeQuotes.quotes[quoteIndex] : null;
-                if (bestQuote != null && typeof bestQuote.signature == 'string' && bestQuote.signature.length > 0 && bestQuote.fee != null && bestQuote.fee.gt(0) && bestQuote.fee.lte(picked.feeRate))
-                    sendQuota = { signature: bestQuote.signature, blockNumber: bestQuote.expiry_block_number?.toFixed() ?? '0', feeRate: bestQuote.fee.toFixed() };
-            } catch (exception) {
-                Log.error('relay', `failed resolving send fee quote (asset: ${asset.id}):`, exception);
-            }
-
+            const sendQuota = await this.resolveSendQuota(asset, requirement, picked.feeRate);
             const quote: BridgeQuote = {
                 hash: picked.hash,
                 chain: picked.chain,
@@ -1337,8 +1331,45 @@ export namespace Router {
                 sendQuota: sendQuota,
                 sendFee: sendQuota.signature.length > 0 ? sendQuota.feeRate : picked.feeRate.toFixed()
             };
-            Swaps.bridgeCache[key] = { time: Date.now(), value: quote };
+            Swaps.bridgeCache[key] = { time: Date.now(), value: { ...quote, sendQuota: NoSendQuota, sendFee: picked.feeRate.toFixed() } };
             return quote;
+        }
+        private static async resolveSendQuota(asset: AssetId, amount: BigNumber | null, maxFeeRate: BigNumber): Promise<SendQuota> {
+            // estimateBridgeFee is P2P based: the first call propagates the fee quote request across the network and subsequent
+            // calls harvest the collected responses; poll several rounds and keep the cheapest unexpired quote found
+            let best: SendQuota = NoSendQuota;
+            let previous: string | null = null;
+            for (let attempt = 0; attempt < 3; attempt++) {
+                if (attempt > 0)
+                    await new Promise<void>((resolve) => setTimeout(resolve, 1500));
+
+                let round: string | null = null;
+                try {
+                    const feeQuotes = await RPC.estimateBridgeFee(asset, amount?.toFixed() ?? null);
+                    const tip = feeQuotes?.tip ?? new BigNumber(0);
+                    const quotes = Array.isArray(feeQuotes?.quotes) ? feeQuotes.quotes : [];
+                    for (const quote of quotes) {
+                        if (typeof quote.signature != 'string' || quote.signature.length < 1 || quote.fee == null || !quote.fee.isFinite() || !quote.fee.gt(0) || quote.fee.gt(maxFeeRate))
+                            continue;
+
+                        if (quote.expiry_block_number == null || !quote.expiry_block_number.gt(tip))
+                            continue;
+
+                        round = quote.signature;
+                        if (best.signature.length < 1 || quote.fee.lt(new BigNumber(best.feeRate)))
+                            best = { signature: quote.signature, blockNumber: quote.expiry_block_number.toFixed(), feeRate: quote.fee.toFixed() };
+                    }
+                } catch (exception) {
+                    Log.error('relay', `failed resolving send fee quote (asset: ${asset.id}):`, exception);
+                }
+
+                if (round != null && round == previous)
+                    break;
+
+                previous = round ?? previous;
+            }
+
+            return best;
         }
         static async book(args: { contract?: string, asset?: string | number, amount?: string | number, publicKey?: string }, _response?: FastifyReply, meta?: CallMeta): Promise<SwapReference> {
             const limit: BookingAcquisition = BookingRateLimit.acquireBooking(meta != null ? meta.ip : null);

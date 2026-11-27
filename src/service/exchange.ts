@@ -1272,8 +1272,22 @@ export class Exchange {
                         }
                         case PseudoEvent.Attestation: {
                             const row = log.event.args[0] as AttestationEvent;
-                            Log.info(`exchange ${contract.account} ams attestation: ${row.txHash.toHex()} (hashdata: ${row.hashdata}) @ block ${block.number}`);
+                            Log.info(`exchange ${contract.account} ams attestation: ${row.txHash.toHex()} (hashdata: ${row.hashdata}${row.success === false ? ', off-chain reverted' : ''}) @ block ${block.number}`);
                             try {
+                                if (row.success === false) {
+                                    const message = `attested off-chain transaction reverted (off-chain: ${row.hashdata})`;
+                                    const failedBookings = await this.getBookingsByProofTransactionId(row.hashdata, connection);
+                                    for (let j = 0; j < failedBookings.length; j++) {
+                                        const booking = failedBookings[j];
+                                        if (booking.status == BookingStatus.FailingWithdrawal || !canTransition(booking.status, BookingStatus.FailingWithdrawal))
+                                            continue;
+
+                                        await this.setBookingRelayError(booking.id, message, connection);
+                                        await this.updateBookingStatus(booking.id, BookingStatus.FailingWithdrawal, connection);
+                                    }
+                                    break;
+                                }
+
                                 const bookings = await this.getBookingsByProofTransactionId(row.hashdata, connection);
                                 for (let j = 0; j < bookings.length; j++) {
                                     const booking = bookings[j];
@@ -4334,6 +4348,10 @@ export class Exchange {
     static async setBookingAttestate(bookingId: Uint256, attestateHash: Uint256, connection?: pq.TransactionSql): Promise<void> {
         const sql = connection || this.connection;
         await this.resultOf(sql`UPDATE bookings SET attestate_hash = ${attestateHash.toUint8Array()} WHERE id = ${bookingId.toString()}`);
+    }
+    static async setBookingRelayError(bookingId: Uint256, relayError: string, connection?: pq.TransactionSql): Promise<void> {
+        const sql = connection || this.connection;
+        await this.resultOf(sql`UPDATE bookings SET relay_error = ${relayError} WHERE id = ${bookingId.toString()}`);
     }
     private static async getBookingsByProofTransactionId(proofTransactionId: string, connection?: pq.TransactionSql): Promise<Booking[]> {
         const sql = connection || this.connection;
