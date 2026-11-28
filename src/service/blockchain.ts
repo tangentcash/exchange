@@ -354,65 +354,36 @@ export class Blockchain {
                         const hashdata = String((proof != null && typeof proof == 'object' ? proof['hashdata'] ?? proof['hash_data'] ?? proof['transaction_id'] ?? proof['transactionId'] : null) ?? result.transaction['hashdata'] ?? result.transaction['hash_data'] ?? '');
                         const proofSuccess = proof != null && typeof proof == 'object' ? proof['success'] : undefined;
                         const offchainReverted = proofSuccess === false || proofSuccess === 0 || proofSuccess === 'false' || proofSuccess === '0';
-                        let attestAsset: AssetId | null = null;
-                        const rawAsset = result.transaction['asset'];
-                        if (rawAsset != null && typeof rawAsset == 'object' && typeof rawAsset['id'] == 'string' && rawAsset['id'].length > 0) {
-                            try {
-                                attestAsset = new AssetId(rawAsset['id']);
-                            } catch {
-                                attestAsset = null;
-                            }
-                        }
                         const proofMemo = proof != null && typeof proof == 'object' && typeof proof['memo'] == 'string' ? proof['memo'] : '';
                         const depositRoutedToAms = amsAccount != null && proofMemo == amsAccount;
-                        const depositTotals: { asset: AssetId, amount: BigNumber }[] = [ ];
-                        if (!offchainReverted && proof != null && typeof proof == 'object' && Array.isArray(proof['outputs'])) {
-                            const registry = this.offchainAccounts.assets;
-                            const remember = (asset: AssetId, value: BigNumber) => {
-                                const existing = depositTotals.find((entry) => entry.asset.id == asset.id);
-                                if (existing != null)
-                                    existing.amount = existing.amount.plus(value);
-                                else
-                                    depositTotals.push({ asset: asset, amount: value });
-                            };
-                            const outputs = proof['outputs'];
-                            for (let k = 0; k < outputs.length; k++) {
-                                const output = outputs[k];
-                                if (output == null || typeof output != 'object')
-                                    continue;
-                                const link = output['link'];
-                                const address = link != null && typeof link == 'object' && typeof link['address'] == 'string' ? link['address'] : null;
-                                if (address == null || !(depositRecipients.has(address) || depositRoutedToAms))
-                                    continue;
-                                const value = Common.bn(output['value']);
-                                if (attestAsset != null && value != null && value.gt(0))
-                                    remember(attestAsset, value);
-                                if (Array.isArray(output['tokens'])) {
-                                    const chain = attestAsset?.chain ?? '';
-                                    for (let t = 0; t < output['tokens'].length; t++) {
-                                        const token = output['tokens'][t];
-                                        if (token == null || typeof token != 'object')
-                                            continue;
-                                        const tokenValue = Common.bn(token['value']);
-                                        if (tokenValue == null || !tokenValue.gt(0))
-                                            continue;
-                                        try {
-                                            const mapped = registry[address] ?? registry[address.toLowerCase()];
-                                            if (typeof mapped == 'string' && mapped.length > 0)
-                                                remember(new AssetId(mapped), tokenValue);
-                                            else if (chain.length > 0 && typeof token['symbol'] == 'string' && typeof token['contract_address'] == 'string')
-                                                remember(AssetId.fromHandle(chain, String(token['symbol']), String(token['contract_address'])), tokenValue);
-                                        } catch { }
-                                    }
+                        const depositRows: PreattestationEvent[] = [ ];
+                        if (txHash != null && hashdata.length > 0 && !offchainReverted && proof != null && typeof proof == 'object') {
+                            const payments = this.transactionPayments(proof, this.offchainAccounts.assets);
+                            if (payments != null) {
+                                for (let recipient in payments) {
+                                    if (!depositRecipients.has(recipient) && !depositRoutedToAms)
+                                        continue;
+
+                                    for (const row of this.preattestationEvents(payments[recipient], txHash, hashdata, null, 'mined'))
+                                        depositRows.push(row);
                                 }
                             }
                         }
                         if (txHash != null && hashdata.length > 0) {
-                            if (depositTotals.length > 0) {
-                                for (let d = 0; d < depositTotals.length; d++)
-                                    attestates.push({ txHash: txHash, hashdata: hashdata, asset: depositTotals[d].asset, amount: depositTotals[d].amount, success: !offchainReverted });
+                            const combined: { asset: AssetId, amount: BigNumber }[] = [ ];
+                            for (const row of depositRows) {
+                                const existing = combined.find((entry) => entry.asset.id == row.asset.id);
+                                if (existing != null)
+                                    existing.amount = existing.amount.plus(row.amount);
+                                else
+                                    combined.push({ asset: row.asset, amount: row.amount });
+                            }
+
+                            if (combined.length > 0) {
+                                for (const entry of combined)
+                                    attestates.push({ txHash: txHash, hashdata: hashdata, asset: entry.asset, amount: entry.amount, success: true });
                             } else {
-                                attestates.push({ txHash: txHash, hashdata: hashdata, asset: attestAsset, amount: null, success: !offchainReverted });
+                                attestates.push({ txHash: txHash, hashdata: hashdata, asset: null, amount: null, success: !offchainReverted });
                             }
                         }
                     } else {
