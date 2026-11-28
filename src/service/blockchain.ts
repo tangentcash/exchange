@@ -355,7 +355,6 @@ export class Blockchain {
                         const proofSuccess = proof != null && typeof proof == 'object' ? proof['success'] : undefined;
                         const offchainReverted = proofSuccess === false || proofSuccess === 0 || proofSuccess === 'false' || proofSuccess === '0';
                         let attestAsset: AssetId | null = null;
-                        let attestAmount: BigNumber | null = null;
                         const rawAsset = result.transaction['asset'];
                         if (rawAsset != null && typeof rawAsset == 'object' && typeof rawAsset['id'] == 'string' && rawAsset['id'].length > 0) {
                             try {
@@ -366,7 +365,16 @@ export class Blockchain {
                         }
                         const proofMemo = proof != null && typeof proof == 'object' && typeof proof['memo'] == 'string' ? proof['memo'] : '';
                         const depositRoutedToAms = amsAccount != null && proofMemo == amsAccount;
-                        if (!offchainReverted && attestAsset != null && proof != null && typeof proof == 'object' && Array.isArray(proof['outputs'])) {
+                        const depositTotals: { asset: AssetId, amount: BigNumber }[] = [ ];
+                        if (!offchainReverted && proof != null && typeof proof == 'object' && Array.isArray(proof['outputs'])) {
+                            const registry = this.offchainAccounts.assets;
+                            const remember = (asset: AssetId, value: BigNumber) => {
+                                const existing = depositTotals.find((entry) => entry.asset.id == asset.id);
+                                if (existing != null)
+                                    existing.amount = existing.amount.plus(value);
+                                else
+                                    depositTotals.push({ asset: asset, amount: value });
+                            };
                             const outputs = proof['outputs'];
                             for (let k = 0; k < outputs.length; k++) {
                                 const output = outputs[k];
@@ -374,13 +382,39 @@ export class Blockchain {
                                     continue;
                                 const link = output['link'];
                                 const address = link != null && typeof link == 'object' && typeof link['address'] == 'string' ? link['address'] : null;
-                                const value = output['value'] != null ? new BigNumber(output['value']) : null;
-                                if (address != null && (depositRecipients.has(address) || depositRoutedToAms) && value != null && !value.isNaN() && value.isGreaterThan(0))
-                                    attestAmount = (attestAmount ?? new BigNumber(0)).plus(value);
+                                if (address == null || !(depositRecipients.has(address) || depositRoutedToAms))
+                                    continue;
+                                const value = Common.bn(output['value']);
+                                if (attestAsset != null && value != null && value.gt(0))
+                                    remember(attestAsset, value);
+                                if (Array.isArray(output['tokens'])) {
+                                    const chain = attestAsset?.chain ?? '';
+                                    for (let t = 0; t < output['tokens'].length; t++) {
+                                        const token = output['tokens'][t];
+                                        if (token == null || typeof token != 'object')
+                                            continue;
+                                        const tokenValue = Common.bn(token['value']);
+                                        if (tokenValue == null || !tokenValue.gt(0))
+                                            continue;
+                                        try {
+                                            const mapped = registry[address] ?? registry[address.toLowerCase()];
+                                            if (typeof mapped == 'string' && mapped.length > 0)
+                                                remember(new AssetId(mapped), tokenValue);
+                                            else if (chain.length > 0 && typeof token['symbol'] == 'string' && typeof token['contract_address'] == 'string')
+                                                remember(AssetId.fromHandle(chain, String(token['symbol']), String(token['contract_address'])), tokenValue);
+                                        } catch { }
+                                    }
+                                }
                             }
                         }
-                        if (txHash != null && hashdata.length > 0)
-                            attestates.push({ txHash: txHash, hashdata: hashdata, asset: attestAsset, amount: attestAmount, success: !offchainReverted });
+                        if (txHash != null && hashdata.length > 0) {
+                            if (depositTotals.length > 0) {
+                                for (let d = 0; d < depositTotals.length; d++)
+                                    attestates.push({ txHash: txHash, hashdata: hashdata, asset: depositTotals[d].asset, amount: depositTotals[d].amount, success: !offchainReverted });
+                            } else {
+                                attestates.push({ txHash: txHash, hashdata: hashdata, asset: attestAsset, amount: null, success: !offchainReverted });
+                            }
+                        }
                     } else {
                         const withdrawHash = Common.u256(result.transaction['withdraw_hash'] ?? null);
                         if (txHash != null && withdrawHash != null) {
@@ -631,10 +665,24 @@ export class Blockchain {
                 const link = output != null && typeof output == 'object' ? output.link as Record<string, unknown> | null : null;
                 const address = link != null ? String(link.address ?? '') : '';
                 const asset = address.length > 0 ? (assets[address] ?? assets[address.toLowerCase()]) : undefined;
-                if (asset == null || output == null || output.value == null)
+                if (asset == null || output == null)
                     continue;
 
-                remember(address, { asset: asset, value: output.value });
+                let native = true;
+                try {
+                    native = new AssetId(asset).token == null;
+                } catch { }
+
+                if (native && output.value != null)
+                    remember(address, { asset: asset, value: output.value });
+
+                if (Array.isArray(output.tokens)) {
+                    for (let t = 0; t < output.tokens.length; t++) {
+                        const token = output.tokens[t] as Record<string, unknown> | null;
+                        if (token != null && typeof token == 'object' && token.value != null)
+                            remember(address, { asset: asset, value: token.value });
+                    }
+                }
             }
         }
 

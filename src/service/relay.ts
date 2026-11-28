@@ -1335,8 +1335,6 @@ export namespace Router {
             return quote;
         }
         private static async resolveSendQuota(asset: AssetId, amount: BigNumber | null, maxFeeRate: BigNumber): Promise<SendQuota> {
-            // estimateBridgeFee is P2P based: the first call propagates the fee quote request across the network and subsequent
-            // calls harvest the collected responses; poll several rounds and keep the cheapest unexpired quote found
             let best: SendQuota = NoSendQuota;
             let previous: string | null = null;
             for (let attempt = 0; attempt < 3; attempt++) {
